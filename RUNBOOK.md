@@ -345,70 +345,16 @@ sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
 
 ## 10. PyTorch all-reduce benchmark
 
-### Create the benchmark script (node A, then copy to B)
+### Copy the benchmark script (node A, then copy to B)
+
+The benchmark script lives at `torch_allreduce_bench.py` in the repo root.
+It includes optional **NCCL Flight Recorder** support (env-gated, zero
+overhead when off) that dumps per-rank collective metadata — call stacks,
+sizes, states, and nanosecond timestamps — as JSON. Useful for diagnosing
+hangs or comparing collective behavior between runc and gVisor.
 
 ```bash
-cat > /tmp/torch_allreduce_bench.py <<'PY'
-import os
-import torch
-import torch.distributed as dist
-
-WARMUP_ITERS, TRIALS = 5, 50
-N = 500000
-M = 2000
-
-def sync_all():
-    torch.cuda.synchronize()
-    dist.barrier()
-
-def timed_allreduce(mat, start_event, end_event, warmup_iters, iters):
-    sync_all()
-    for _ in range(warmup_iters):
-        dist.all_reduce(mat)
-    sync_all()
-    start_event.record()
-    for _ in range(iters):
-        dist.all_reduce(mat)
-    end_event.record()
-    sync_all()
-    duration = start_event.elapsed_time(end_event) / 1000
-    avg_duration = duration / iters
-    n = dist.get_world_size()
-    size = M * N * 4
-    algbw = torch.tensor([size / avg_duration]).cuda(local_rank)
-    dist.reduce(algbw, dst=0, op=dist.ReduceOp.SUM)
-    algbw /= n
-    return algbw.item()
-
-def run(local_rank):
-    is_global_rank_0 = dist.get_rank() == 0
-    mat = torch.rand(N, M, dtype=torch.float32).cuda(local_rank)
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    algbw = timed_allreduce(mat, start_event, end_event, warmup_iters=WARMUP_ITERS, iters=TRIALS)
-    n = dist.get_world_size()
-    busbw = algbw * (2 * (n - 1) / n)
-    if is_global_rank_0:
-        print(
-            f"The average bandwidth of all_reduce with a {M*N*4/1e9}GB payload ({TRIALS} trials, {n} ranks):\n",
-            f"algbw: {algbw/1e9:.3f} GBps ({algbw*8/1e9:.1f} Gbps)\n",
-            f"busbw: {busbw/1e9:.3f} GBps ({busbw*8/1e9:.1f} Gbps)\n",
-        )
-
-def init_processes(local_rank, fn, backend="nccl"):
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend, device_id=torch.device(f"cuda:{local_rank}"))
-    if dist.get_rank() == 0:
-        print("Starting benchmark...")
-    fn(local_rank)
-    sync_all()
-    dist.destroy_process_group()
-
-if __name__ == "__main__":
-    local_rank = int(os.environ["LOCAL_RANK"])
-    init_processes(local_rank=local_rank, fn=run)
-PY
-
+cp ~/gvisor/torch_allreduce_bench.py /tmp/torch_allreduce_bench.py
 scp /tmp/torch_allreduce_bench.py modal@${NODE_B_IP}:/tmp/torch_allreduce_bench.py
 ```
 
@@ -498,6 +444,47 @@ sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
     --nnodes=2 --nproc_per_node=8 --node_rank=0 \
     --master_addr=$NODE_A_IP --master_port=29531 \
     /tmp/torch_allreduce_bench.py
+```
+
+### 10c. NCCL Flight Recorder (optional)
+
+To capture Flight Recorder dumps, re-run any §10 benchmark with these
+extra flags on **every** `docker run` command (both nodes):
+
+```
+  -e TORCH_NCCL_TRACE_BUFFER_SIZE=2000 \
+  -e TORCH_NCCL_DUMP_ON_TIMEOUT=1 \
+  -e FR_DUMP=1 -e FR_DIR=/tmp/fr_dumps \
+  -v /tmp/fr_dumps:/tmp/fr_dumps \
+```
+
+Create the host directory first (`sudo mkdir -p /tmp/fr_dumps` on both
+nodes). `TORCH_NCCL_TRACE_BUFFER_SIZE` enables the c10d ring buffer;
+`TORCH_NCCL_DUMP_ON_TIMEOUT` auto-dumps if a collective times out;
+`FR_DUMP=1` tells the script to also dump on successful completion.
+
+Each rank writes `rank<N>_gpu<G>.json` into `/tmp/fr_dumps/` — one file
+per rank, per node. Each file contains:
+
+- **`entries`** — every NCCL collective (all_reduce, barrier, reduce)
+  with `profiling_name`, `input_sizes`, `output_sizes`, `state`,
+  `time_created_ns`, `time_discovered_completed_ns`, and full Python
+  call stacks (`frames`).
+- **`pg_config`** — process group membership.
+- **`pg_status`** — last-seen sequence IDs.
+
+Inspect a dump:
+
+```bash
+python3 -c "
+import json, sys
+data = json.load(open(sys.argv[1]))
+for e in data['entries']:
+    ns = e.get('time_discovered_completed_ns') or 0
+    cr = e.get('time_created_ns', 0)
+    dt_ms = (ns - cr) / 1e6 if ns else '?'
+    print(f\"{e['collective_seq_id']:3d}  {e['profiling_name']:30s}  {e['state']:12s}  {dt_ms} ms\")
+" /tmp/fr_dumps/rank0_gpu0.json
 ```
 
 ---
