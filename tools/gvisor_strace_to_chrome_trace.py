@@ -39,11 +39,12 @@ _GLOG_HEAD = re.compile(
 
 # Message body: taskname E syscall(args)  /  taskname X syscall(args) = ret
 # Split E vs X so ret may contain parentheses.
+_STRACE_PREFIX = r"(?:\[\s*\d+:\s*\d+\]\s+)?"
 _STRACE_E = re.compile(
-    r"^(?P<task>\S+)\s+E\s+(?P<sc>[a-zA-Z0-9_]+)\((?P<args>.*)\)\s*$"
+    rf"^{_STRACE_PREFIX}(?P<task>\S+)\s+E\s+(?P<sc>[a-zA-Z0-9_]+)\((?P<args>.*)\)\s*$"
 )
 _STRACE_X = re.compile(
-    r"^(?P<task>\S+)\s+X\s+(?P<sc>[a-zA-Z0-9_]+)\((?P<args>.*)\)\s*=\s*(?P<ret>.+)$"
+    rf"^{_STRACE_PREFIX}(?P<task>\S+)\s+X\s+(?P<sc>[a-zA-Z0-9_]+)\((?P<args>.*)\)\s*=\s*(?P<ret>.+)$"
 )
 
 def _extract_duration_from_ret(ret: str) -> int | None:
