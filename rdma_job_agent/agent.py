@@ -221,6 +221,54 @@ def _runsc_prep_logs() -> None:
     subprocess.run(["sudo", "mkdir", "-p", "/tmp/runsc-rdma/logs"], check=True)
 
 
+def _repo_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+
+
+def _run_capture(argv: list[str], *, cwd: str | None = None) -> dict[str, Any]:
+    proc = subprocess.run(
+        argv,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    return {
+        "command": shlex.join(argv),
+        "cwd": cwd,
+        "exit_code": proc.returncode,
+        "output": proc.stdout,
+    }
+
+
+def _deploy_runsc_runtime() -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise PermissionError("deploy_runsc requires the agent to run as root (start agent.py with sudo)")
+
+    repo_root = _repo_root()
+    steps: list[dict[str, Any]] = []
+    cmds: list[tuple[list[str], str | None]] = [
+        (["git", "pull"], repo_root),
+        (["make", "copy", "TARGETS=runsc", "DESTINATION=/tmp"], repo_root),
+        (["rm", "-f", "/usr/local/bin/runsc-rdma"], None),
+        (["cp", "/tmp/runsc", "/usr/local/bin/runsc-rdma"], None),
+        (["chmod", "+x", "/usr/local/bin/runsc-rdma"], None),
+        (["/usr/local/bin/runsc-rdma", "--version"], None),
+    ]
+    for argv, cwd in cmds:
+        step = _run_capture(argv, cwd=cwd)
+        steps.append(step)
+        if step["exit_code"] != 0:
+            return {
+                "ok": False,
+                "repo_root": repo_root,
+                "failed_command": step["command"],
+                "steps": steps,
+            }
+    return {"ok": True, "repo_root": repo_root, "steps": steps}
+
+
 def _evict_completed_jobs_locked() -> None:
     assert _JOB_LOCK.locked()
     terminal = [
@@ -416,6 +464,16 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, body)
             return
 
+        if path == "/v1/admin/deploy_runsc":
+            try:
+                result = _deploy_runsc_runtime()
+            except PermissionError as ex:
+                self._json(403, {"error": str(ex)})
+                return
+            code = 200 if result.get("ok") else 500
+            self._json(code, result)
+            return
+
         m_cancel = re.match(r"^/v1/jobs/([a-f0-9-]+)/cancel$", path)
         if m_cancel:
             jid = m_cancel.group(1)
@@ -551,7 +609,8 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"rdma_job_agent listening on http://{args.host}:{args.port}", file=sys.stderr)
     print(
-        "POST /v1/jobs (JSON); POST /v1/nccl_topo; POST /v1/jobs/<id>/cancel; "
+        "POST /v1/jobs (JSON); POST /v1/nccl_topo; POST /v1/admin/deploy_runsc; "
+        "POST /v1/jobs/<id>/cancel; "
         "GET /v1/jobs; GET /v1/jobs/<id>; GET /health",
         file=sys.stderr,
     )
