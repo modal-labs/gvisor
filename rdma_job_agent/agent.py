@@ -29,6 +29,7 @@ import argparse
 import errno
 import json
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -225,10 +226,14 @@ def _repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 
 
-def _run_capture(argv: list[str], *, cwd: str | None = None) -> dict[str, Any]:
+def _run_capture(
+    argv: list[str], *, cwd: str | None = None, env: dict[str, str] | None = None
+) -> dict[str, Any]:
     proc = subprocess.run(
         argv,
         cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -242,22 +247,39 @@ def _run_capture(argv: list[str], *, cwd: str | None = None) -> dict[str, Any]:
     }
 
 
+def _git_pull_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o StrictHostKeyChecking=accept-new")
+
+    sudo_user = os.environ.get("SUDO_USER", "").strip()
+    if sudo_user:
+        try:
+            pw = pwd.getpwnam(sudo_user)
+        except KeyError:
+            return env
+        env["HOME"] = pw.pw_dir
+        env["USER"] = sudo_user
+        env["LOGNAME"] = sudo_user
+    return env
+
+
 def _deploy_runsc_runtime() -> dict[str, Any]:
     if os.geteuid() != 0:
         raise PermissionError("deploy_runsc requires the agent to run as root (start agent.py with sudo)")
 
     repo_root = _repo_root()
     steps: list[dict[str, Any]] = []
-    cmds: list[tuple[list[str], str | None]] = [
-        (["git", "pull"], repo_root),
-        (["make", "copy", "TARGETS=runsc", "DESTINATION=/tmp"], repo_root),
-        (["rm", "-f", "/usr/local/bin/runsc-rdma"], None),
-        (["cp", "/tmp/runsc", "/usr/local/bin/runsc-rdma"], None),
-        (["chmod", "+x", "/usr/local/bin/runsc-rdma"], None),
-        (["/usr/local/bin/runsc-rdma", "--version"], None),
+    cmds: list[tuple[list[str], str | None, dict[str, str] | None]] = [
+        (["git", "pull"], repo_root, _git_pull_env()),
+        (["make", "copy", "TARGETS=runsc", "DESTINATION=/tmp"], repo_root, None),
+        (["rm", "-f", "/usr/local/bin/runsc-rdma"], None, None),
+        (["cp", "/tmp/runsc", "/usr/local/bin/runsc-rdma"], None, None),
+        (["chmod", "+x", "/usr/local/bin/runsc-rdma"], None, None),
+        (["/usr/local/bin/runsc-rdma", "--version"], None, None),
     ]
-    for argv, cwd in cmds:
-        step = _run_capture(argv, cwd=cwd)
+    for argv, cwd, env in cmds:
+        step = _run_capture(argv, cwd=cwd, env=env)
         steps.append(step)
         if step["exit_code"] != 0:
             return {
