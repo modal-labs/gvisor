@@ -121,6 +121,7 @@ d.setdefault('runtimes', {})['runsc-rdma'] = {
     'runtimeArgs': [
         '--debug',
         '--debug-log=/tmp/runsc-rdma/logs/',
+        '--strace',
         '--rdmaproxy',
         '--nvproxy',
         '--network=host',

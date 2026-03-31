@@ -274,6 +274,7 @@ def _configure_runsc_docker_runtime() -> dict[str, Any]:
         "runtimeArgs": [
             "--debug",
             "--debug-log=/tmp/runsc-rdma/logs/",
+            "--strace",
             "--rdmaproxy",
             "--nvproxy",
             "--nvproxy-allowed-driver-capabilities=compute,utility,video",

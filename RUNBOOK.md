@@ -36,7 +36,7 @@ cfg = json.loads(raw) if raw else {}
 cfg.setdefault('runtimes', {})['runsc-rdma'] = {
     'path': '/usr/local/bin/runsc-rdma',
     'runtimeArgs': [
-        '--debug', '--debug-log=/tmp/runsc-rdma/logs/',
+        '--debug', '--debug-log=/tmp/runsc-rdma/logs/', '--strace',
         '--rdmaproxy', '--nvproxy',
         '--nvproxy-allowed-driver-capabilities=compute,utility,video',
         '--network=host', '--rdma-expected-ipoib=-1',

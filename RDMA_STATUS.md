@@ -292,6 +292,7 @@ checks exact `struct net_device *` pointer identity.
       "runtimeArgs": [
         "--debug",
         "--debug-log=/tmp/runsc-rdma/logs/",
+        "--strace",
         "--rdmaproxy",
         "--nvproxy",
         "--network=host",
