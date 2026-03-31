@@ -249,12 +249,13 @@ p.write_text(json.dumps(cfg, indent=2) + '\n')
 sudo systemctl restart docker && sleep 2
 ```
 
-Load NVIDIA peermem, pull the PyTorch image:
+Load NVIDIA peermem, pull the PyTorch image, and build the NCCL bench image:
 
 ```bash
 sudo modprobe nvidia-peermem
 export PYTORCH_IMAGE="nvcr.io/nvidia/pytorch:24.07-py3"
 sudo docker pull $PYTORCH_IMAGE
+sudo docker build -f Dockerfile.nccl -t nccl-test .
 ```
 
 #### 3. Environment exports (both nodes)
@@ -299,17 +300,17 @@ sudo docker run --runtime=runc --rm --gpus all $DEVS \
 
 #### 6. Start the job agent (node B only)
 
-Export `NCCL_IB_HCA` on B before starting so torch job defaults pick it up.
-The agent runs `sudo docker` — treat it as root-equivalent.
+Export `NCCL_IB_HCA` on B before starting so NCCL/PyTorch jobs inherit it by
+default. The agent runs `sudo docker` — treat it as root-equivalent.
 
 ```bash
 cd ~/gvisor/rdma_job_agent
 python3 agent.py --host 0.0.0.0 --port 8756
 ```
 
-#### 7. Run multi-node PyTorch test
+#### 7. Run default multi-node NCCL bench
 
-From **node A**, verify the agent, push topology to B, then run the test:
+From **node A**, verify the agent, push topology to B, then run the benchmark:
 
 ```bash
 # Health check
@@ -321,8 +322,11 @@ curl -sS -X POST --data-binary @/tmp/nccl_topo.xml \
   "http://${NODE_B_IP}:8756/v1/nccl_topo"
 
 # POST rank 1 to B's agent
-POST_BODY="$(jq -n --arg ma "$NODE_A_IP" --argjson mp "29541" \
-  '{kind:"torch",master_addr:$ma,master_port:$mp}')"
+POST_BODY="$(jq -n \
+  --arg ma "$NODE_A_IP" \
+  --arg ib "$NCCL_IB_HCA" \
+  --argjson mp "29501" \
+  '{kind:"nccl",runtime:"runsc-rdma",rank:1,nranks:2,ngpus:8,master_addr:$ma,master_port:$mp,env:{"NCCL_DEBUG":"INFO","NCCL_SOCKET_IFNAME":"eth0","NCCL_IB_HCA":$ib,"NCCL_NET_GDR_LEVEL":"3","NCCL_DMABUF_ENABLE":"0"}}')"
 curl -sS -X POST "http://${NODE_B_IP}:8756/v1/jobs" \
   -H 'Content-Type: application/json' -d "$POST_BODY" | jq .
 
@@ -337,17 +341,48 @@ sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
   -e NCCL_DMABUF_ENABLE=0 \
   -e NCCL_IB_GID_INDEX=0 \
   -e NCCL_TOPO_FILE=/topo.xml \
-  -v /tmp/torch_allreduce_bench.py:/tmp/torch_allreduce_bench.py:ro \
-  "$PYTORCH_IMAGE" torchrun \
-    --nnodes=2 --nproc_per_node=8 --node_rank=0 \
-    --master_addr="${NODE_A_IP}" --master_port=29541 \
-    /tmp/torch_allreduce_bench.py
+  -e RANK=0 \
+  -e NRANKS=2 \
+  -e NGPUS=8 \
+  -e MASTER_ADDR="${NODE_A_IP}" \
+  -e MASTER_PORT=29501 \
+  nccl-test /usr/local/bin/nccl_multinode_bench
 
 # Poll rank 1 status on B
 curl -sS "http://${NODE_B_IP}:8756/v1/jobs/<uuid-from-POST>" | jq .
 ```
 
-**One-shot script alternative:** automates the POST → sleep → rank-0 →
+Expected healthy signal: a full NCCL bandwidth table, with large-message bus
+bandwidth around the previously observed multinode baseline.
+
+#### 8. Optional follow-up: multi-node PyTorch test
+
+After the NCCL bench passes, use PyTorch as a higher-level follow-up:
+
+```bash
+POST_BODY="$(jq -n --arg ma "$NODE_A_IP" --argjson mp "29541" \
+  '{kind:"torch",master_addr:$ma,master_port:$mp}')"
+curl -sS -X POST "http://${NODE_B_IP}:8756/v1/jobs" \
+  -H 'Content-Type: application/json' -d "$POST_BODY" | jq .
+
+sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
+  --ulimit memlock=-1:-1 --shm-size=1g --network=host \
+  -v /tmp/nccl_topo.xml:/topo.xml:ro \
+  -e NCCL_DEBUG=WARN \
+  -e NCCL_SOCKET_IFNAME=eth0 \
+  -e NCCL_IB_HCA=$NCCL_IB_HCA \
+  -e NCCL_NET_GDR_LEVEL=3 \
+  -e NCCL_DMABUF_ENABLE=0 \
+  -e NCCL_IB_GID_INDEX=0 \
+  -e NCCL_TOPO_FILE=/topo.xml \
+  -v /tmp/torch_allreduce_bench.py:/tmp/torch_allreduce_bench.py:ro \
+  "$PYTORCH_IMAGE" torchrun \
+  --nnodes=2 --nproc_per_node=8 --node_rank=0 \
+  --master_addr="${NODE_A_IP}" --master_port=29541 \
+  /tmp/torch_allreduce_bench.py
+```
+
+**One-shot PyTorch script alternative:** automates the POST → sleep → rank-0 →
 poll sequence:
 
 ```bash
