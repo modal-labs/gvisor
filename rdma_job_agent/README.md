@@ -11,7 +11,7 @@ side runs with a normal **`docker run`** on A (see `RUNBOOK.md`).
 1. **POST** a job to the agent on **B** with `"async": true`, `node_rank: 1`,
    `master_addr` = node A’s IP.
 2. **Start rank 0 on node A** with `docker run` + `torchrun --node_rank=0`
-   (same `MASTER_PORT`, image, and env as the agent would use).
+   (same **`master_port`** as rank 1 — **29541** in `RUNBOOK.md` / `run_torch_pair_node_a.sh`, image, and env).
 
 ## Security
 
@@ -33,9 +33,11 @@ python3 agent.py --host 127.0.0.1 --port 8756
 
 Requires `sudo docker` to work non-interactively for that user (e.g. sudoers).
 
-Optional: `export DOCKER_CPUS=<n>` before starting the agent to set `docker run --cpus` for spawned jobs (default: all CPUs Docker reports on the host).
-
 Optional: `export RDMA_TOPO_PATH=/tmp/nccl_topo.xml` to change where `POST /v1/nccl_topo` writes.
+
+Spawned `docker run` commands do not pass `--cpus`; CPU use follows Docker’s cgroup (same as omitting `--cpus` on the CLI).
+
+**Torch defaults (short POST bodies):** If you `export NCCL_IB_HCA=…` (and optionally `NCCL_SOCKET_IFNAME`, `RDMA_PYTORCH_IMAGE`, `RDMA_JOB_RUNTIME`) on **B** before starting the agent, a minimal job only needs `kind` and `master_addr` (`master_port` defaults to **29541**). The agent fills in `runtime` (default `runsc-rdma`), `async: true`, `nnodes: 2`, `node_rank: 1`, `nproc_per_node: 8`, image and script paths, and a standard `env` block (merged with any `env` you send in JSON).
 
 ### Push topology from node A to B (instead of `scp`)
 
@@ -49,6 +51,17 @@ curl -sS -X POST --data-binary @/tmp/nccl_topo.xml \
 If you see `Operation not permitted` replacing `/tmp/nccl_topo.xml` on **B**, that path is often **root-owned** (e.g. left over from `sudo docker`). On B: `sudo rm -f /tmp/nccl_topo.xml`, then POST again (or `sudo chown "$USER" /tmp/nccl_topo.xml`).
 
 Use SSH port-forward (`-L 8756:127.0.0.1:8756`) if B’s agent binds to loopback only.
+
+## One-shot node A (automation-friendly)
+
+From **node A**, after §2 env and with the agent listening on B, one script runs POST → sleep → rank-0 `docker run` → poll (same as `RUNBOOK.md` §6):
+
+```bash
+export NODE_A_IP=... NODE_B_IP=... NCCL_IB_HCA=...
+bash ~/gvisor/rdma_job_agent/run_torch_pair_node_a.sh
+```
+
+Optional: `PYTORCH_IMAGE`, `DEVS` (if unset, `DEVS` is built from `/dev/infiniband/uverbs*`). Torch jobs use **`master_port` 29541** in the one-shot script and runbook.
 
 ## API
 
@@ -84,11 +97,18 @@ Common fields:
 
 **PyTorch** (`kind: "torch"`):
 
-- **`nnodes`**, **`node_rank`**, **`master_addr`**, **`master_port`** (required).
-- **`nproc_per_node`** (default 8), **`image`** (default `nvcr.io/nvidia/pytorch:24.07-py3`).
-- **`script_host_path`**: host path mounted as `/tmp/torch_allreduce_bench.py`
-  (default `/tmp/torch_allreduce_bench.py`).
-- **`topo_host_path`**, **`env`**: same idea as NCCL.
+- **`master_addr`** (required). **`master_port`** defaults to **29541** if omitted. **`nnodes`**, **`node_rank`** optional if you use defaults below.
+- Defaults applied when omitted: **`runtime`** `runsc-rdma` (override with `RDMA_JOB_RUNTIME` on the agent host), **`async`** `true`, **`nnodes`** `2`, **`node_rank`** `1`, **`nproc_per_node`** `8`, **`image`** `nvcr.io/nvidia/pytorch:24.07-py3` (override with `RDMA_PYTORCH_IMAGE`), **`script_host_path`** `/tmp/torch_allreduce_bench.py`, **`topo_host_path`** `/tmp/nccl_topo.xml`.
+- **`env`**: merged with defaults (`NCCL_DEBUG`, `NCCL_SOCKET_IFNAME`, `NCCL_NET_GDR_LEVEL`, `NCCL_DMABUF_ENABLE`, and **`NCCL_IB_HCA` from the agent process environment** if set). Your JSON `env` keys override.
+
+Minimal example from node A (agent on B has `NCCL_IB_HCA` exported):
+
+```bash
+curl -sS -X POST "http://${NODE_B_IP}:8756/v1/jobs" \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg ma "$NODE_A_IP" --argjson mp "29541" \
+      '{kind:"torch",master_addr:$ma,master_port:$mp}')"
+```
 
 ### Example: NCCL rank 1 on B (async), then rank 0 on A
 
@@ -117,8 +137,8 @@ curl -sS -X POST http://127.0.0.1:8756/v1/jobs \
   }'
 ```
 
-Then on **node A**, run the rank-0 `docker run` + `torchrun` (same `MASTER_PORT`
-and env) — see **`RUNBOOK.md`** section 6.
+Then on **node A**, run the rank-0 `docker run` + `torchrun` (same **`master_port`**
+**29541** and env) — see **`RUNBOOK.md`** section 6.
 
 Poll B:
 

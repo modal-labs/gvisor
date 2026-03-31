@@ -7,6 +7,7 @@
         "--debug-log=/tmp/runsc-rdma/logs/",
         "--rdmaproxy",
         "--nvproxy",
+        "--nvproxy-allowed-driver-capabilities=compute,utility,video",
         "--network=host",
         "--rdma-expected-ipoib=-1"
       ]

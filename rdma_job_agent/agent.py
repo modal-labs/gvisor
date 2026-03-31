@@ -64,28 +64,11 @@ def _dev_flags() -> list[str]:
     return [f"--device={d}" for d in devs]
 
 
-def _docker_cpus() -> int:
-    """CPUs for `docker run --cpus=`. Override with env DOCKER_CPUS (integer >= 1); default is all CPUs Docker reports."""
-    raw = os.environ.get("DOCKER_CPUS", "").strip()
-    if raw:
-        try:
-            n = int(raw)
-            if n >= 1:
-                return n
-        except ValueError:
-            pass
-    try:
-        out = subprocess.check_output(
-            ["sudo", "docker", "info", "--format", "{{.NCPU}}"],
-            text=True,
-        ).strip()
-        return max(1, int(out))
-    except (subprocess.CalledProcessError, ValueError):
-        return 1
-
-
 def _docker_run_base(body: dict[str, Any]) -> tuple[list[str], str]:
-    """Shared `docker run` prefix: runtime, GPUs, IB devices, cpus, ulimit, shm, network, optional topo bind for runsc-rdma."""
+    """Shared `docker run` prefix: runtime, GPUs, IB devices, ulimit, shm, network, optional topo bind for runsc-rdma.
+
+    No `--cpus`: containers use whatever CPU set Docker’s cgroup allows (avoids nproc vs docker.info mismatch).
+    """
     runtime = str(body.get("runtime", "runc"))
     topo_host = str(body.get("topo_host_path", "/tmp/nccl_topo.xml"))
     parts: list[str] = [
@@ -100,7 +83,6 @@ def _docker_run_base(body: dict[str, Any]) -> tuple[list[str], str]:
     parts.extend(_dev_flags())
     parts.extend(
         [
-            f"--cpus={_docker_cpus()}",
             "--ulimit",
             "memlock=-1:-1",
             "--shm-size=1g",
@@ -139,6 +121,44 @@ def build_nccl_command(body: dict[str, Any]) -> list[str]:
 
     parts.extend([image, bench])
     return parts
+
+
+def _merge_torch_defaults(body: dict[str, Any]) -> None:
+    """Fill omitted torch fields so POST bodies can be minimal (master_addr only).
+
+    Defaults match the usual gVisor RDMA two-node PyTorch bench. Override any field in
+    the JSON body; use env on the agent host for image/runtime/NCCL (see README).
+    """
+    body.setdefault("master_port", 29541)
+    body.setdefault(
+        "runtime",
+        os.environ.get("RDMA_JOB_RUNTIME", "runsc-rdma"),
+    )
+    body.setdefault("async", True)
+    body.setdefault("nnodes", 2)
+    body.setdefault("node_rank", 1)
+    body.setdefault("nproc_per_node", 8)
+    body.setdefault(
+        "image",
+        os.environ.get("RDMA_PYTORCH_IMAGE", "nvcr.io/nvidia/pytorch:24.07-py3"),
+    )
+    body.setdefault("script_host_path", "/tmp/torch_allreduce_bench.py")
+    body.setdefault("topo_host_path", "/tmp/nccl_topo.xml")
+
+    merged_env: dict[str, str] = {
+        "NCCL_DEBUG": "WARN",
+        "NCCL_SOCKET_IFNAME": os.environ.get("NCCL_SOCKET_IFNAME", "eth0"),
+        "NCCL_NET_GDR_LEVEL": "3",
+        "NCCL_DMABUF_ENABLE": "0",
+    }
+    ib = os.environ.get("NCCL_IB_HCA", "").strip()
+    if ib:
+        merged_env["NCCL_IB_HCA"] = ib
+
+    user_env = body.get("env")
+    if isinstance(user_env, dict):
+        merged_env.update({str(k): str(v) for k, v in user_env.items()})
+    body["env"] = merged_env
 
 
 def build_torch_command(body: dict[str, Any]) -> list[str]:
@@ -259,6 +279,11 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(n) if n else b"{}"
         return json.loads(raw.decode("utf-8") or "{}")
 
+    def _norm_path(self) -> str:
+        """Path without query string; trailing slash stripped (except root)."""
+        p = self.path.split("?", 1)[0].rstrip("/")
+        return p if p else "/"
+
     def _json(self, code: int, obj: dict[str, Any]) -> None:
         b = json.dumps(obj).encode("utf-8")
         self.send_response(code)
@@ -268,10 +293,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        path = self._norm_path()
+        if path == "/health":
             self._json(200, {"ok": True})
             return
-        if self.path == "/v1/jobs":
+        if path == "/v1/jobs":
             with _JOB_LOCK:
                 brief = [
                     {"id": jid, "state": j.get("state"), "kind": j.get("kind")}
@@ -279,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
                 ]
             self._json(200, {"jobs": brief})
             return
-        m = re.match(r"^/v1/jobs/([a-f0-9-]+)$", self.path)
+        m = re.match(r"^/v1/jobs/([a-f0-9-]+)$", path)
         if m:
             jid = m.group(1)
             with _JOB_LOCK:
@@ -293,7 +319,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path == "/v1/nccl_topo":
+        path = self._norm_path()
+        if path == "/v1/nccl_topo":
             n = int(self.headers.get("Content-Length", "0"))
             if n <= 0:
                 self._json(400, {"error": "Content-Length required"})
@@ -305,19 +332,19 @@ class Handler(BaseHTTPRequestHandler):
             if len(data) != n:
                 self._json(400, {"error": "short read"})
                 return
-            path = _nccl_topo_host_path()
-            parent = os.path.dirname(path)
+            topo_path = _nccl_topo_host_path()
+            parent = os.path.dirname(topo_path)
             if parent:
                 try:
                     os.makedirs(parent, exist_ok=True)
                 except OSError as ex:
                     self._json(500, {"error": str(ex)})
                     return
-            tmp = path + ".tmp"
+            tmp = topo_path + ".tmp"
             try:
                 with open(tmp, "wb") as f:
                     f.write(data)
-                os.replace(tmp, path)
+                os.replace(tmp, topo_path)
             except OSError as ex:
                 try:
                     os.unlink(tmp)
@@ -326,15 +353,15 @@ class Handler(BaseHTTPRequestHandler):
                 err = str(ex)
                 if getattr(ex, "errno", None) in (errno.EACCES, errno.EPERM):
                     err += (
-                        f" If {path} already exists and is root-owned (e.g. created by "
-                        f"sudo docker), run: sudo rm -f {path}  or  sudo chown $USER {path}"
+                        f" If {topo_path} already exists and is root-owned (e.g. created by "
+                        f"sudo docker), run: sudo rm -f {topo_path}  or  sudo chown $USER {topo_path}"
                     )
                 self._json(500, {"error": err})
                 return
-            self._json(200, {"ok": True, "path": path, "bytes": len(data)})
+            self._json(200, {"ok": True, "path": topo_path, "bytes": len(data)})
             return
 
-        m_cancel = re.match(r"^/v1/jobs/([a-f0-9-]+)/cancel$", self.path)
+        m_cancel = re.match(r"^/v1/jobs/([a-f0-9-]+)/cancel$", path)
         if m_cancel:
             jid = m_cancel.group(1)
             with _JOB_LOCK:
@@ -363,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "job_id": jid, "signal": "SIGTERM"})
             return
 
-        if self.path != "/v1/jobs":
+        if path != "/v1/jobs":
             self._json(404, {"error": "not found"})
             return
         try:
@@ -377,10 +404,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": 'kind must be "nccl" or "torch"'})
             return
 
+        if kind == "torch" and not str(body.get("master_addr", "")).strip():
+            self._json(
+                400,
+                {
+                    "error": "torch job requires non-empty master_addr (set NODE_A_IP on A before building POST body)",
+                },
+            )
+            return
+
         try:
             if kind == "nccl":
                 argv = build_nccl_command(body)
             else:
+                _merge_torch_defaults(body)
                 argv = build_torch_command(body)
         except (KeyError, TypeError, ValueError) as ex:
             self._json(400, {"error": str(ex)})

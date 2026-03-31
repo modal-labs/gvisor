@@ -10,7 +10,7 @@ Two nodes, mlx5, Docker, sudo, L3 for NCCL. Commented lines = node / one-off onl
 | `daemon.json` + `nvidia-peermem` + PyTorch image pull | Same Docker + GPU/IB stack |
 | `/tmp/nccl_topo.xml` | Copy from A for `runsc-rdma` (same file both sides) |
 | `/tmp/torch_allreduce_bench.py` | Same bench |
-| Exports (`NODE_A_IP`, `NODE_B_IP`, `NCCL_IB_HCA`, `DOCKER_CPUS`, …) | Same NCCL view of the job |
+| Exports (`NODE_A_IP`, `NODE_B_IP`, `NCCL_IB_HCA`, …) | Same NCCL view of the job |
 | `rdma_job_agent` on **B only** | Rank **1** via `POST`; rank **0** on A is plain `docker run` (no agent on A) |
 
 **Skip on B** if A does the work: clone, `make copy` (B only receives the binary), topo generation on A (B only receives `/tmp/nccl_topo.xml`).
@@ -32,12 +32,18 @@ sudo jq '(.runtimes //= {}) | .runtimes["runsc-rdma"] = {
   "path": "/usr/local/bin/runsc-rdma",
   "runtimeArgs": [
     "--debug", "--debug-log=/tmp/runsc-rdma/logs/",
-    "--rdmaproxy", "--nvproxy", "--network=host", "--rdma-expected-ipoib=-1"
+    "--rdmaproxy", "--nvproxy",
+    "--nvproxy-allowed-driver-capabilities=compute,utility,video",
+    "--network=host", "--rdma-expected-ipoib=-1"
   ]
 }' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.tmp >/dev/null \
   && sudo mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
 sudo systemctl restart docker && sleep 2
 sudo modprobe nvidia-peermem
+
+# If `runsc-rdma` was never configured, a merge-only jq can create `runtimeArgs` without `"path"` → Docker reports
+# “unknown or invalid runtime name”. Re-run the full `jq` assignment above (lines 31–40), or merge only when
+# `sudo jq '.runtimes["runsc-rdma"].path' /etc/docker/daemon.json` already prints the runsc binary path.
 
 export PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:24.07-py3
 sudo docker login nvcr.io
@@ -45,10 +51,25 @@ sudo docker pull "$PYTORCH_IMAGE"
 
 export NODE_A_IP=<a> NODE_B_IP=<b>
 export NCCL_IB_HCA=mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11
-export DOCKER_CPUS=112
 export DEVS=$(ls /dev/infiniband/uverbs* | sed 's/^/--device=/' | tr '\n' ' ')
-export DOCKER_RUN="--rm --gpus all $DEVS --cpus=$DOCKER_CPUS --ulimit memlock=-1:-1 --shm-size=1g --network=host"
+# No `--cpus` here: use Docker’s cgroup CPU set (see Modal note below).
+export DOCKER_RUN="--rm --gpus all $DEVS --ulimit memlock=-1:-1 --shm-size=1g --network=host"
 ```
+
+**Modal workers — Docker stuck at 12 CPUs:** The host has more CPUs (`nproc` e.g. 112), but `systemctl show system.slice -p AllowedCPUs` is **`0-11`**. `dockerd` lives in **`system.slice`**, so it inherits that **cpuset** (`docker info` → `CPUs: 12`; `docker run --cpus=100` fails). Workloads are meant to use **`modal-containers.slice`**, which has **`12-111`**. Move Docker into that slice, reload, restart:
+
+```bash
+sudo mkdir -p /etc/systemd/system/docker.service.d
+sudo tee /etc/systemd/system/docker.service.d/50-modal-slice.conf <<'EOF'
+[Service]
+Slice=modal-containers.slice
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+sudo docker info | grep '^ CPUs:'
+```
+
+Container runs omit `--cpus`; the effective limit is whatever CPUs Docker’s slice allows (`sudo docker info` → **CPUs:**, about **100** after moving Docker to `modal-containers.slice`).
 
 ```bash
 # --- 3) Both nodes ---
@@ -77,55 +98,27 @@ sudo docker run --runtime=runc --rm --gpus all $DOCKER_RUN \
 ```
 
 ```bash
-# --- 5) Node B only: agent (DOCKER_CPUS exported on B). A does not run the agent. ---
+# --- 5) Node B only: agent. A does not run the agent. ---
 cd ~/gvisor/rdma_job_agent
 python3 agent.py --host 0.0.0.0 --port 8756
 ```
 
 ```bash
 # --- 6) Node A: POST rank 1 on B, then rank 0 locally (runsc-rdma). ---
-# Uses §2 exports ($PYTORCH_IMAGE, $NCCL_IB_HCA, $DEVS, $DOCKER_CPUS). Edit only IPs:
-# NODE_B_IP in curl URLs, NODE_A_IP in jq --arg ma and in rank-0 --master_addr.
-# Run each statement separately (do not paste `export` into the middle of `jq`).
-export MASTER_PORT=29541
-
-PAYLOAD="$(
-  jq -n \
-    --arg img "${PYTORCH_IMAGE:-nvcr.io/nvidia/pytorch:24.07-py3}" \
-    --arg ma 'NODE_A_IP' \
-    --arg hca "$NCCL_IB_HCA" \
-    --argjson mp "$MASTER_PORT" \
-    --arg rt 'runsc-rdma' \
-    '{
-      kind: "torch",
-      runtime: $rt,
-      async: true,
-      nnodes: 2,
-      node_rank: 1,
-      nproc_per_node: 8,
-      master_addr: $ma,
-      master_port: $mp,
-      image: $img,
-      script_host_path: "/tmp/torch_allreduce_bench.py",
-      topo_host_path: "/tmp/nccl_topo.xml",
-      env: {
-        NCCL_DEBUG: "WARN",
-        NCCL_SOCKET_IFNAME: "eth0",
-        NCCL_IB_HCA: $hca,
-        NCCL_NET_GDR_LEVEL: "3",
-        NCCL_DMABUF_ENABLE: "0"
-      }
-    }'
-)"
-
-R1=$(curl -sS -X POST "http://NODE_B_IP:8756/v1/jobs" \
-  -H 'Content-Type: application/json' \
-  -d "$PAYLOAD" | jq -r .job_id)
+# One composable command (same sequence as below; good for automation / agents):
+#   export NODE_A_IP=... NODE_B_IP=... NCCL_IB_HCA=...   # plus §2 as needed (PYTORCH_IMAGE, DEVS)
+#   bash ~/gvisor/rdma_job_agent/run_torch_pair_node_a.sh
+#
+# Agent on B applies torch defaults; export NCCL_IB_HCA on B before agent.py — see rdma_job_agent/README.md.
+# Manual equivalent (POST → sleep → rank-0 docker → poll). Master port fixed at 29541 (change in both POST and torchrun if needed):
+POST_BODY="$(jq -n --arg ma "$NODE_A_IP" --argjson mp "29541" '{kind:"torch",master_addr:$ma,master_port:$mp}')"
+R1=$(curl -sS -X POST "http://${NODE_B_IP}:8756/v1/jobs" -H 'Content-Type: application/json' -d "$POST_BODY" | jq -r .job_id)
+# No jq for POST_BODY (IPv4): POST_BODY='{"kind":"torch","master_addr":"'"$NODE_A_IP"'","master_port":29541}'
 sleep 2
 
 sudo rm -rf /tmp/runsc-rdma/logs && sudo mkdir -p /tmp/runsc-rdma/logs
 sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
-  --cpus="$DOCKER_CPUS" --ulimit memlock=-1:-1 --shm-size=1g --network=host \
+  --ulimit memlock=-1:-1 --shm-size=1g --network=host \
   -v /tmp/nccl_topo.xml:/topo.xml:ro \
   -e NCCL_DEBUG=WARN \
   -e NCCL_SOCKET_IFNAME=eth0 \
@@ -137,10 +130,57 @@ sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
   -v /tmp/torch_allreduce_bench.py:/tmp/torch_allreduce_bench.py:ro \
   "$PYTORCH_IMAGE" torchrun \
     --nnodes=2 --nproc_per_node=8 --node_rank=0 \
-    --master_addr=NODE_A_IP --master_port=$MASTER_PORT \
+    --master_addr="${NODE_A_IP}" --master_port=29541 \
     /tmp/torch_allreduce_bench.py
 
-curl -sS "http://NODE_B_IP:8756/v1/jobs/$R1" | jq .
+curl -sS "http://${NODE_B_IP}:8756/v1/jobs/$R1" | jq .
 
 # runc: --arg rt 'runc'; rank-0 docker: --runtime=runc, drop topo mount + NCCL_TOPO_FILE + NCCL_IB_GID_INDEX
+```
+
+---
+
+## Optional: syscall timeline (gVisor strace → Perfetto)
+
+gVisor **`--strace`** logs **guest** syscalls to the same **`--debug-log`** tree as `--debug` (not Linux `ptrace` on `runsc`). Use it for a **timeline** by converting logs to Chrome Trace JSON and opening them in **Perfetto** (or any Chrome-trace viewer).
+
+### 1. Enable strace on `runsc-rdma`
+
+Add to **`runtimes.runsc-rdma.runtimeArgs`** in `/etc/docker/daemon.json` (same array as §2), then **`sudo systemctl restart docker`**:
+
+- **`--strace`** — trace syscalls (verbose; omit filters only for short runs).
+- Optionally **`--strace-syscalls=ioctl,mmap,munmap,openat,close,...`** — comma list (see `runsc --help`).
+
+Example (merge manually or extend the §2 `jq` so these two strings appear in `runtimeArgs`):
+
+```json
+"--strace",
+"--strace-syscalls=ioctl,mmap,munmap,openat,close"
+```
+
+### 2. Capture logs
+
+Run your workload (§6). Strace lines go into files under **`--debug-log`** (e.g. `/tmp/runsc-rdma/logs/`). Names look like **`runsc.log.<timestamp>.<command>.txt`**.
+
+### 3. Convert to Chrome trace JSON
+
+From the gVisor repo (or any path with **`tools/gvisor_strace_to_chrome_trace.py`**):
+
+```bash
+LOG="$(ls -t /tmp/runsc-rdma/logs/runsc.log.*.txt 2>/dev/null | head -1)"
+test -n "$LOG" && python3 ~/gvisor/tools/gvisor_strace_to_chrome_trace.py "$LOG" -o /tmp/strace.json
+```
+
+Glog lines omit the year in the date prefix; pass **`--year YYYY`** if needed (default: current UTC year). For **`--debug-log-format=json`**, the same script accepts JSON lines.
+
+### 4. View
+
+Open **`https://ui.perfetto.dev`** → **Open trace file** → choose **`/tmp/strace.json`**.
+
+(Eclipse Trace Compass may import Chrome-style JSON depending on build; Perfetto is the path we test.)
+
+### 5. Tests
+
+```bash
+cd ~/gvisor/tools && python3 gvisor_strace_to_chrome_trace_test.py -v
 ```
