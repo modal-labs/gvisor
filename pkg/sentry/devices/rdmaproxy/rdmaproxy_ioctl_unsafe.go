@@ -48,6 +48,11 @@ func ioctlInHostNetns(fd int32, cmd uint32, arg unsafe.Pointer) (uintptr, unix.E
 		return n, errno
 	}
 
+	if netnsFDsSameInode(hostNetnsFD, containerNetnsFD) {
+		n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(arg))
+		return n, errno
+	}
+
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -73,9 +78,79 @@ func ioctlDirect(fd int32, cmd uint32, arg unsafe.Pointer) (uintptr, unix.Errno)
 	return n, errno
 }
 
-// Legacy write command for MODIFY_QP — the only INVOKE_WRITE that
-// needs host netns (GID resolution during QP state transitions).
-const ibUserVerbsCmdModifyQP = 10
+// writeInHostNetns runs write(2) on the uverbs fd in the host network namespace.
+// Legacy ibv_modify_qp uses the write() command path (IB_USER_VERBS_CMD_MODIFY_QP);
+// it needs the same netns as ioctl MODIFY_QP for RoCE GID resolution.
+func writeInHostNetns(fd int32, p []byte) (uintptr, unix.Errno) {
+	if len(p) == 0 {
+		return 0, 0
+	}
+	if hostNetnsFD < 0 || containerNetnsFD < 0 {
+		n, _, errno := unix.RawSyscall(unix.SYS_WRITE,
+			uintptr(fd),
+			uintptr(unsafe.Pointer(&p[0])),
+			uintptr(len(p)))
+		return n, errno
+	}
+
+	if netnsFDsSameInode(hostNetnsFD, containerNetnsFD) {
+		n, _, errno := unix.RawSyscall(unix.SYS_WRITE,
+			uintptr(fd),
+			uintptr(unsafe.Pointer(&p[0])),
+			uintptr(len(p)))
+		return n, errno
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := unix.Setns(int(hostNetnsFD), unix.CLONE_NEWNET); err != nil {
+		log.Warningf("rdmaproxy: setns to host netns (write): %v, falling back", err)
+		n, _, errno := unix.RawSyscall(unix.SYS_WRITE,
+			uintptr(fd),
+			uintptr(unsafe.Pointer(&p[0])),
+			uintptr(len(p)))
+		return n, errno
+	}
+
+	n, _, errno := unix.RawSyscall(unix.SYS_WRITE,
+		uintptr(fd),
+		uintptr(unsafe.Pointer(&p[0])),
+		uintptr(len(p)))
+
+	if restoreErr := unix.Setns(int(containerNetnsFD), unix.CLONE_NEWNET); restoreErr != nil {
+		log.Warningf("rdmaproxy: restore container netns (write): %v", restoreErr)
+	}
+
+	return n, errno
+}
+
+// Legacy write / INVOKE_WRITE command for MODIFY_QP (enum ib_uverbs_write_cmds).
+// Needs host netns for RoCE GID resolution during QP state transitions.
+const ibUserVerbsCmdModifyQP = 26
+
+// uverbsWriteCmdBase strips IB_USER_VERBS_CMD_FLAG_EXTENDED (0x80000000) from
+// UVERBS_ATTR_WRITE_CMD values (see ib_user_verbs.h).
+func uverbsWriteCmdBase(w uint64) uint32 {
+	return uint32(w & 0x7fffffff)
+}
+
+// netnsFDsSameInode returns true if two /proc/.../ns/net fds refer to the same
+// namespace (same inode). Used to skip setns when the sandbox already shares
+// the host network namespace (e.g. Docker --network=host).
+func netnsFDsSameInode(a, b int32) bool {
+	if a < 0 || b < 0 {
+		return false
+	}
+	var sa, sb unix.Stat_t
+	if unix.Fstat(int(a), &sa) != nil {
+		return false
+	}
+	if unix.Fstat(int(b), &sb) != nil {
+		return false
+	}
+	return sa.Ino == sb.Ino && sa.Dev == sb.Dev
+}
 
 // ioctlNeedsHostNetns returns true if the ioctl requires the host
 // network namespace. Only QP MODIFY operations need it (for GID
@@ -90,7 +165,7 @@ func ioctlNeedsHostNetns(action ioctlAction, objectID uint16, writeCmdVal uint64
 		return false
 	}
 	// INVOKE_WRITE with MODIFY_QP needs netns.
-	if objectID == uverbsObjectDevice && writeCmdVal == ibUserVerbsCmdModifyQP {
+	if objectID == uverbsObjectDevice && uverbsWriteCmdBase(writeCmdVal) == ibUserVerbsCmdModifyQP {
 		return true
 	}
 	// QP object operations other than create/destroy (i.e. MODIFY) need netns.
@@ -545,6 +620,10 @@ func (fd *uverbsFD) classifyIoctl(buf []byte, numAttrs int, objectID, methodID u
 			return actionCQDestroy, writeCmdVal
 		case ibUserVerbsCmdDestroyQP:
 			return actionQPDestroy, writeCmdVal
+		default:
+			// Preserve writeCmdVal for ioctlNeedsHostNetns (e.g. MODIFY_QP with
+			// IB_USER_VERBS_CMD_FLAG_EXTENDED). Previously we returned (actionNone, 0).
+			return actionNone, writeCmdVal
 		}
 	}
 	return actionNone, 0
@@ -1047,10 +1126,16 @@ func (fd *uverbsFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.
 	}
 
 	// Forward write to host fd.
-	n, _, errno := unix.RawSyscall(unix.SYS_WRITE,
-		uintptr(fd.hostFD),
-		uintptr(unsafe.Pointer(&data[0])),
-		uintptr(size))
+	var n uintptr
+	var errno unix.Errno
+	if !isExtended && cmdBase == ibUserVerbsCmdModifyQP {
+		n, errno = writeInHostNetns(fd.hostFD, data)
+	} else {
+		n, _, errno = unix.RawSyscall(unix.SYS_WRITE,
+			uintptr(fd.hostFD),
+			uintptr(unsafe.Pointer(&data[0])),
+			uintptr(size))
+	}
 	if errno != 0 {
 		log.Warningf("rdmaproxy: Write to host: n=%d errno=%d (%v)", n, errno, errno)
 		return 0, errno

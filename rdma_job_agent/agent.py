@@ -49,8 +49,30 @@ _MAX_NCCL_TOPO_BYTES = 10 * 1024 * 1024
 _MAX_COMPLETED_JOBS = 50
 
 
+def _default_topo_host_path() -> str:
+    """Default NCCL topology path on the agent host.
+
+    Uses ~/.cache/... instead of /tmp so uploads are not blocked by sticky-bit
+    /tmp when a root-owned /tmp/nccl_topo.xml exists (e.g. from sudo docker).
+    """
+    return os.path.join(
+        os.path.expanduser("~"), ".cache", "rdma_job_agent", "nccl_topo.xml"
+    )
+
+
 def _nccl_topo_host_path() -> str:
-    return os.environ.get("RDMA_TOPO_PATH", "/tmp/nccl_topo.xml")
+    return os.environ.get("RDMA_TOPO_PATH", _default_topo_host_path())
+
+
+def _atomic_write_nccl_topo(topo_path: str, data: bytes) -> None:
+    """Write data to topo_path via temp file + replace."""
+    parent = os.path.dirname(topo_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = topo_path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, topo_path)
 
 
 def _dev_flags() -> list[str]:
@@ -70,7 +92,7 @@ def _docker_run_base(body: dict[str, Any]) -> tuple[list[str], str]:
     No `--cpus`: containers use whatever CPU set Docker’s cgroup allows (avoids nproc vs docker.info mismatch).
     """
     runtime = str(body.get("runtime", "runc"))
-    topo_host = str(body.get("topo_host_path", "/tmp/nccl_topo.xml"))
+    topo_host = str(body.get("topo_host_path", _default_topo_host_path()))
     parts: list[str] = [
         "sudo",
         "docker",
@@ -143,7 +165,7 @@ def _merge_torch_defaults(body: dict[str, Any]) -> None:
         os.environ.get("RDMA_PYTORCH_IMAGE", "nvcr.io/nvidia/pytorch:24.07-py3"),
     )
     body.setdefault("script_host_path", "/tmp/torch_allreduce_bench.py")
-    body.setdefault("topo_host_path", "/tmp/nccl_topo.xml")
+    body.setdefault("topo_host_path", _default_topo_host_path())
 
     merged_env: dict[str, str] = {
         "NCCL_DEBUG": "WARN",
@@ -346,33 +368,52 @@ class Handler(BaseHTTPRequestHandler):
             if len(data) != n:
                 self._json(400, {"error": "short read"})
                 return
-            topo_path = _nccl_topo_host_path()
-            parent = os.path.dirname(topo_path)
-            if parent:
-                try:
-                    os.makedirs(parent, exist_ok=True)
-                except OSError as ex:
-                    self._json(500, {"error": str(ex)})
-                    return
-            tmp = topo_path + ".tmp"
+            primary = _nccl_topo_host_path()
+            fallback = _default_topo_host_path()
+            topo_path = primary
+            used_fallback = False
             try:
-                with open(tmp, "wb") as f:
-                    f.write(data)
-                os.replace(tmp, topo_path)
+                _atomic_write_nccl_topo(topo_path, data)
             except OSError as ex:
                 try:
+                    tmp = topo_path + ".tmp"
                     os.unlink(tmp)
                 except OSError:
                     pass
-                err = str(ex)
-                if getattr(ex, "errno", None) in (errno.EACCES, errno.EPERM):
-                    err += (
-                        f" If {topo_path} already exists and is root-owned (e.g. created by "
-                        f"sudo docker), run: sudo rm -f {topo_path}  or  sudo chown $USER {topo_path}"
-                    )
-                self._json(500, {"error": err})
-                return
-            self._json(200, {"ok": True, "path": topo_path, "bytes": len(data)})
+                if (
+                    getattr(ex, "errno", None) in (errno.EACCES, errno.EPERM)
+                    and os.path.abspath(fallback) != os.path.abspath(primary)
+                ):
+                    try:
+                        _atomic_write_nccl_topo(fallback, data)
+                        topo_path = fallback
+                        used_fallback = True
+                    except OSError as ex2:
+                        err = str(ex2)
+                        if getattr(ex2, "errno", None) in (errno.EACCES, errno.EPERM):
+                            err += (
+                                f" If {fallback} is not writable, or {primary} is root-owned "
+                                f"(e.g. sudo docker), run: sudo rm -f {primary} {primary}.tmp"
+                            )
+                        self._json(500, {"error": err})
+                        return
+                else:
+                    err = str(ex)
+                    if getattr(ex, "errno", None) in (errno.EACCES, errno.EPERM):
+                        err += (
+                            f" If {topo_path} already exists and is root-owned (e.g. created by "
+                            f"sudo docker), run: sudo rm -f {topo_path}  or  sudo chown $USER {topo_path}"
+                        )
+                    self._json(500, {"error": err})
+                    return
+            body: dict[str, Any] = {"ok": True, "path": topo_path, "bytes": len(data)}
+            if used_fallback:
+                body["used_fallback_from"] = primary
+                body["note"] = (
+                    "Wrote to default cache path because RDMA_TOPO_PATH (or primary) was not "
+                    "writable; runsc-rdma jobs use topo_host_path default matching this path."
+                )
+            self._json(200, body)
             return
 
         m_cancel = re.match(r"^/v1/jobs/([a-f0-9-]+)/cancel$", path)
