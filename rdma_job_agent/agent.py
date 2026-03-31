@@ -340,6 +340,38 @@ def _deploy_runsc_runtime(progress_cb: Any | None = None) -> dict[str, Any]:
     return {"ok": True, "repo_root": repo_root, "steps": steps}
 
 
+def _build_nccl_test_image(progress_cb: Any | None = None) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise PermissionError("build_nccl_test requires the agent to run as root (start agent.py with sudo)")
+
+    repo_root = _repo_root()
+    steps: list[dict[str, Any]] = []
+    cmds: list[tuple[list[str], str | None, dict[str, str] | None]] = [
+        (["docker", "build", "-f", "Dockerfile.nccl", "-t", "nccl-test", "."], repo_root, None),
+        (["docker", "image", "inspect", "nccl-test"], None, None),
+    ]
+    for argv, cwd, env in cmds:
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "current_step": shlex.join(argv),
+                    "output": "".join(
+                        f"$ {step['command']}\n{step['output']}\n" for step in steps
+                    ),
+                }
+            )
+        step = _run_capture(argv, cwd=cwd, env=env)
+        steps.append(step)
+        if step["exit_code"] != 0:
+            return {
+                "ok": False,
+                "repo_root": repo_root,
+                "failed_command": step["command"],
+                "steps": steps,
+            }
+    return {"ok": True, "repo_root": repo_root, "steps": steps}
+
+
 def _run_deploy_job(job_id: str) -> None:
     def progress(update: dict[str, Any]) -> None:
         with _JOB_LOCK:
@@ -381,6 +413,51 @@ def _run_deploy_job(job_id: str) -> None:
             job["state"] = "error"
             job["exit_code"] = 1
             job["error"] = result.get("failed_command", "deploy_runsc failed")
+            job["failed_command"] = result.get("failed_command")
+        _evict_completed_jobs_locked()
+
+
+def _run_build_nccl_test_job(job_id: str) -> None:
+    def progress(update: dict[str, Any]) -> None:
+        with _JOB_LOCK:
+            job = _JOBS.get(job_id)
+            if job is None:
+                return
+            job.update(update)
+
+    with _JOB_LOCK:
+        _JOBS[job_id]["state"] = "running"
+        _JOBS[job_id]["started_unix"] = time.time()
+
+    try:
+        result = _build_nccl_test_image(progress_cb=progress)
+    except Exception as ex:  # pylint: disable=broad-except
+        with _JOB_LOCK:
+            job = _JOBS.get(job_id)
+            if job is not None:
+                job["state"] = "error"
+                job["error"] = str(ex)
+                job["finished_unix"] = time.time()
+                _evict_completed_jobs_locked()
+        return
+
+    output = "".join(f"$ {step['command']}\n{step['output']}\n" for step in result["steps"])
+    with _JOB_LOCK:
+        job = _JOBS.get(job_id)
+        if job is None:
+            return
+        job["repo_root"] = result["repo_root"]
+        job["steps"] = result["steps"]
+        job["output"] = output
+        job["finished_unix"] = time.time()
+        job.pop("current_step", None)
+        if result.get("ok"):
+            job["state"] = "done"
+            job["exit_code"] = 0
+        else:
+            job["state"] = "error"
+            job["exit_code"] = 1
+            job["error"] = result.get("failed_command", "build_nccl_test failed")
             job["failed_command"] = result.get("failed_command")
         _evict_completed_jobs_locked()
 
@@ -616,6 +693,42 @@ class Handler(BaseHTTPRequestHandler):
             self._json(code, result)
             return
 
+        if path == "/v1/admin/build_nccl_test":
+            try:
+                body = self._read_json()
+            except json.JSONDecodeError:
+                body = {}
+            async_flag = bool(body.get("async", True))
+            job_id = str(uuid.uuid4())
+            with _JOB_LOCK:
+                _JOBS[job_id] = {
+                    "id": job_id,
+                    "kind": "build_nccl_test",
+                    "state": "queued",
+                    "command": "build_nccl_test",
+                }
+            if async_flag:
+                def work() -> None:
+                    _run_build_nccl_test_job(job_id)
+
+                threading.Thread(target=work, daemon=True).start()
+                self._json(202, {"job_id": job_id, "async": True, "kind": "build_nccl_test"})
+                return
+            try:
+                _run_build_nccl_test_job(job_id)
+            except PermissionError as ex:
+                self._json(403, {"error": str(ex)})
+                return
+            with _JOB_LOCK:
+                raw = _JOBS.get(job_id)
+                result = _job_public_view(dict(raw)) if raw else None
+            if not result:
+                self._json(500, {"error": "build job disappeared"})
+                return
+            code = 200 if result.get("state") == "done" else 500
+            self._json(code, result)
+            return
+
         m_cancel = re.match(r"^/v1/jobs/([a-f0-9-]+)/cancel$", path)
         if m_cancel:
             jid = m_cancel.group(1)
@@ -752,6 +865,7 @@ def main() -> None:
     print(f"rdma_job_agent listening on http://{args.host}:{args.port}", file=sys.stderr)
     print(
         "POST /v1/jobs (JSON); POST /v1/nccl_topo; POST /v1/admin/deploy_runsc; "
+        "POST /v1/admin/build_nccl_test; "
         "POST /v1/jobs/<id>/cancel; "
         "GET /v1/jobs; GET /v1/jobs/<id>; GET /health",
         file=sys.stderr,
