@@ -2,18 +2,19 @@
 
 Two nodes, mlx5, Docker, sudo, L3 for NCCL. Commented lines = node / one-off only.
 
-**A dev / B peer:** A runs clone, `make copy`, topo generation, and drives `curl`. B only needs what’s in the table — copy **`runsc`** and **`/tmp/nccl_topo.xml`** from A when they change; no clone / `make` / `nccl-test` on B unless you want B self-contained.
+**A dev / B peer:** A runs clone, `make copy`, topo generation, and drives `curl`. **B must apply §2 on the host** (install **`runsc-rdma`**, **`/etc/docker/daemon.json`** runtimes block, **`systemctl restart docker`**, **`nvidia-peermem`**, image pull) — the job agent runs **`docker run --runtime=runsc-rdma`** **on B**; if B only has a loose **`/tmp/runsc`** copy but never registered the runtime, jobs fail with **`unknown or invalid runtime name`**. Also copy **`/tmp/nccl_topo.xml`** (and bench script) from A when they change. No clone / `make` / `nccl-test` on B unless you want B self-contained.
 
 | Need on B | Why |
 |-----------|-----|
-| `runsc` / `runsc-rdma` from what A built | Same runtime under test |
+| **Full §2** (`runsc-rdma` binary, `daemon.json`, Docker restart, optional Modal slice) | Agent spawns rank-1 **`docker run`** on **B**; same runtime registration as A |
+| `runsc` / `runsc-rdma` from what A built | Same binary under test |
 | `daemon.json` + `nvidia-peermem` + PyTorch image pull | Same Docker + GPU/IB stack |
 | `/tmp/nccl_topo.xml` | Copy from A for `runsc-rdma` (same file both sides) |
 | `/tmp/torch_allreduce_bench.py` | Same bench |
 | Exports (`NODE_A_IP`, `NODE_B_IP`, `NCCL_IB_HCA`, …) | Same NCCL view of the job |
 | `rdma_job_agent` on **B only** | Rank **1** via `POST`; rank **0** on A is plain `docker run` (no agent on A) |
 
-**Skip on B** if A does the work: clone, `make copy` (B only receives the binary), topo generation on A (B only receives `/tmp/nccl_topo.xml`).
+**Skip on B** only for clone / `make` / topo generation: A can **`scp /tmp/runsc`** (or built artifact) and **`scp`** **`daemon_json_mirror.json`** to B, then on B install the binary to **`/usr/local/bin/runsc-rdma`**, merge **`daemon.json`**, **`restart docker`**, and run **`modprobe` / image pull** — B cannot skip registering **`runsc-rdma`** in Docker.
 
 ```bash
 # --- 1) Node A: clone, build, copy /tmp/runsc to B ---
@@ -99,6 +100,9 @@ sudo docker run --runtime=runc --rm --gpus all $DOCKER_RUN \
 
 ```bash
 # --- 5) Node B only: agent. A does not run the agent. ---
+# Preconditions on B: §2 completed (runsc-rdma in `docker info`), same as node A — or POST jobs exit 125 with
+# "unknown or invalid runtime name: runsc-rdma" in GET /v1/jobs/<id> output.
+# Quick check: sudo docker info --format '{{json .Runtimes}}' | jq 'keys' | grep runsc-rdma
 cd ~/gvisor/rdma_job_agent
 python3 agent.py --host 0.0.0.0 --port 8756
 ```
@@ -140,6 +144,15 @@ curl -sS "http://${NODE_B_IP}:8756/v1/jobs/$R1" | jq .
 # runc: --arg rt 'runc'; rank-0 docker: --runtime=runc, drop topo mount + NCCL_TOPO_FILE + NCCL_IB_GID_INDEX
 ```
 
+### Troubleshooting
+
+| Symptom | What to check |
+|---------|----------------|
+| **`GET /v1/jobs/null`** or hint about **null** `job_id` | On A: **`export NODE_A_IP`** before building **`POST_BODY`**; **`curl POST \| jq .`** for **`400`** **`error`**. |
+| Agent job **`exit_code` 125**, **`output`** contains **`unknown or invalid runtime name: runsc-rdma`** | On **B**: full §2 — **`/usr/local/bin/runsc-rdma`**, **`/etc/docker/daemon.json`** **`runtimes["runsc-rdma"]`**, **`systemctl restart docker`**. Empty **`daemon.json`** breaks all custom runtimes. |
+| **`POST /v1/jobs` 400** / empty **`master_addr`** | **`NODE_A_IP`** unset when **`jq -n --arg ma "$NODE_A_IP"`** ran. |
+| **`Connection refused`** to **`NODE_B_IP:8756`** | Agent not running; or **`--host 127.0.0.1`** on B — use **`0.0.0.0`** or SSH **`-L`**. |
+
 ---
 
 ## Optional: syscall timeline (gVisor strace → Perfetto)
@@ -148,7 +161,7 @@ gVisor **`--strace`** logs **guest** syscalls to the same **`--debug-log`** tree
 
 ### 1. Enable strace on `runsc-rdma`
 
-Add to **`runtimes.runsc-rdma.runtimeArgs`** in `/etc/docker/daemon.json` (same array as §2), then **`sudo systemctl restart docker`**:
+Add to **`runtimes["runsc-rdma"].runtimeArgs`** in `/etc/docker/daemon.json` (same array as §2), then **`sudo systemctl restart docker`**:
 
 - **`--strace`** — trace syscalls (verbose; omit filters only for short runs).
 - Optionally **`--strace-syscalls=ioctl,mmap,munmap,openat,close,...`** — comma list (see `runsc --help`).
