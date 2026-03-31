@@ -1,0 +1,50 @@
+{
+  "traceEvents": [
+    {
+      "name": "ioctl",
+      "cat": "strace",
+      "ph": "X",
+      "ts": 0.0,
+      "dur": 100.0,
+      "pid": 1,
+      "tid": 35352994,
+      "args": {
+        "task": "worker-1",
+        "args": "9",
+        "ret": "0 (0x0) (100\u00b5s)"
+      }
+    },
+    {
+      "name": "read",
+      "cat": "strace",
+      "ph": "X",
+      "ts": 199.0,
+      "dur": 50.0,
+      "pid": 1,
+      "tid": 35352994,
+      "args": {
+        "task": "worker-1",
+        "args": "4, 0x7fff0000, 4096",
+        "ret": "4096 (0x1000) (50\u00b5s)"
+      }
+    },
+    {
+      "name": "futex",
+      "cat": "strace",
+      "ph": "X",
+      "ts": 299.0,
+      "dur": 300.0,
+      "pid": 1,
+      "tid": 35352995,
+      "args": {
+        "task": "worker-2",
+        "args": "0xdead, FUTEX_WAIT",
+        "ret": "0 (0x0) (300\u00b5s)"
+      }
+    }
+  ],
+  "metadata": {
+    "source": "gvisor_strace_to_chrome_trace.py",
+    "note": "ts and dur use Chrome convention (microseconds)."
+  }
+}

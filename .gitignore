@@ -9,3 +9,6 @@
 /repo.key
 # Generate webhook admission.
 /test/kubernetes/gvisor-injection-admission-webhook.yaml
+
+# Local NCCL topology dumps (RUNBOOK / RDMA dev; generated via NCCL_TOPO_DUMP_FILE).
+nccl_topo.xml

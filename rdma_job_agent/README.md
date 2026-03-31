@@ -46,6 +46,8 @@ curl -sS -X POST --data-binary @/tmp/nccl_topo.xml \
   "http://${NODE_B_IP}:8756/v1/nccl_topo"
 ```
 
+If you see `Operation not permitted` replacing `/tmp/nccl_topo.xml` on **B**, that path is often **root-owned** (e.g. left over from `sudo docker`). On B: `sudo rm -f /tmp/nccl_topo.xml`, then POST again (or `sudo chown "$USER" /tmp/nccl_topo.xml`).
+
 Use SSH port-forward (`-L 8756:127.0.0.1:8756`) if B’s agent binds to loopback only.
 
 ## API

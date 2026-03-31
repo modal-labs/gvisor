@@ -26,6 +26,7 @@ unauthenticated job execution on an untrusted network.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -318,7 +319,17 @@ class Handler(BaseHTTPRequestHandler):
                     f.write(data)
                 os.replace(tmp, path)
             except OSError as ex:
-                self._json(500, {"error": str(ex)})
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                err = str(ex)
+                if getattr(ex, "errno", None) in (errno.EACCES, errno.EPERM):
+                    err += (
+                        f" If {path} already exists and is root-owned (e.g. created by "
+                        f"sudo docker), run: sudo rm -f {path}  or  sudo chown $USER {path}"
+                    )
+                self._json(500, {"error": err})
                 return
             self._json(200, {"ok": True, "path": path, "bytes": len(data)})
             return

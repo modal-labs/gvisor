@@ -61,12 +61,14 @@ cp ~/gvisor/torch_allreduce_bench.py /tmp/torch_allreduce_bench.py
 # gVisor/runsc iteration — no need to rerun this docker command each build.
 # NCCL writes the file when it initializes if NCCL_TOPO_DUMP_FILE is set. Use runc here
 # (full sysfs); gVisor hides PCI — dumps under runsc are wrong. Stop after the XML exists.
+# Bind-mount host /tmp so the dump is on the host (otherwise it only exists in the
+# container and disappears with --rm).
 sudo docker run --runtime=runc --rm --gpus all $DOCKER_RUN \
   -e NCCL_DEBUG=WARN -e NCCL_SOCKET_IFNAME=eth0 -e NCCL_IB_HCA=$NCCL_IB_HCA \
   -e NCCL_NET_GDR_LEVEL=3 -e NCCL_DMABUF_ENABLE=0 \
   -e NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo.xml \
-  -v /tmp/torch_allreduce_bench.py:/tmp/torch_allreduce_bench.py:ro \
-  "$PYTORCH_IMAGE" torchrun --nnodes=1 --nproc_per_node=8 \
+  -v /tmp:/tmp \
+  "nvcr.io/nvidia/pytorch:24.07-py3" torchrun --nnodes=1 --nproc_per_node=8 \
   --master_addr=127.0.0.1 --master_port=29599 \
   /tmp/torch_allreduce_bench.py
 # Copy topo to B: `scp /tmp/nccl_topo.xml modal@${NODE_B_IP}:/tmp/nccl_topo.xml`
@@ -82,27 +84,43 @@ python3 agent.py --host 0.0.0.0 --port 8756
 
 ```bash
 # --- 6) Node A: POST rank 1 on B, then rank 0 locally (runsc-rdma). ---
-# Allow A→B:8756 (security group / firewall) so curl reaches B’s agent.
+# Uses §2 exports ($PYTORCH_IMAGE, $NCCL_IB_HCA, $DEVS, $DOCKER_CPUS). Edit only IPs:
+# NODE_B_IP in curl URLs, NODE_A_IP in jq --arg ma and in rank-0 --master_addr.
+# Run each statement separately (do not paste `export` into the middle of `jq`).
 export MASTER_PORT=29541
-export AGENT_B=http://${NODE_B_IP}:8756
 
-body_rank1() {
-  local rt="${1:-runsc-rdma}"
+PAYLOAD="$(
   jq -n \
-    --arg img "$PYTORCH_IMAGE" \
-    --arg ma "$NODE_A_IP" \
+    --arg img "${PYTORCH_IMAGE:-nvcr.io/nvidia/pytorch:24.07-py3}" \
+    --arg ma 'NODE_A_IP' \
     --arg hca "$NCCL_IB_HCA" \
     --argjson mp "$MASTER_PORT" \
-    --arg rt "$rt" \
-    '{kind:"torch",runtime:$rt,async:true,nnodes:2,node_rank:1,nproc_per_node:8,
-      master_addr:$ma, master_port:$mp, image:$img,
-      script_host_path:"/tmp/torch_allreduce_bench.py", topo_host_path:"/tmp/nccl_topo.xml",
-      env:{NCCL_DEBUG:"WARN",NCCL_SOCKET_IFNAME:"eth0",NCCL_IB_HCA:$hca,
-           NCCL_NET_GDR_LEVEL:"3",NCCL_DMABUF_ENABLE:"0"}}'
-}
+    --arg rt 'runsc-rdma' \
+    '{
+      kind: "torch",
+      runtime: $rt,
+      async: true,
+      nnodes: 2,
+      node_rank: 1,
+      nproc_per_node: 8,
+      master_addr: $ma,
+      master_port: $mp,
+      image: $img,
+      script_host_path: "/tmp/torch_allreduce_bench.py",
+      topo_host_path: "/tmp/nccl_topo.xml",
+      env: {
+        NCCL_DEBUG: "WARN",
+        NCCL_SOCKET_IFNAME: "eth0",
+        NCCL_IB_HCA: $hca,
+        NCCL_NET_GDR_LEVEL: "3",
+        NCCL_DMABUF_ENABLE: "0"
+      }
+    }'
+)"
 
-R1=$(curl -sS -X POST "$AGENT_B/v1/jobs" -H 'Content-Type: application/json' \
-  -d "$(body_rank1)" | jq -r .job_id)
+R1=$(curl -sS -X POST "http://NODE_B_IP:8756/v1/jobs" \
+  -H 'Content-Type: application/json' \
+  -d "$PAYLOAD" | jq -r .job_id)
 sleep 2
 
 sudo rm -rf /tmp/runsc-rdma/logs && sudo mkdir -p /tmp/runsc-rdma/logs
@@ -119,11 +137,10 @@ sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
   -v /tmp/torch_allreduce_bench.py:/tmp/torch_allreduce_bench.py:ro \
   "$PYTORCH_IMAGE" torchrun \
     --nnodes=2 --nproc_per_node=8 --node_rank=0 \
-    --master_addr=$NODE_A_IP --master_port=$MASTER_PORT \
+    --master_addr=NODE_A_IP --master_port=$MASTER_PORT \
     /tmp/torch_allreduce_bench.py
 
-curl -sS "$AGENT_B/v1/jobs/$R1" | jq .
+curl -sS "http://NODE_B_IP:8756/v1/jobs/$R1" | jq .
 
-# runc: `body_rank1 runc` and use --runtime=runc on the docker run; drop -v topo,
-# NCCL_TOPO_FILE, NCCL_IB_GID_INDEX for rank 0.
+# runc: --arg rt 'runc'; rank-0 docker: --runtime=runc, drop topo mount + NCCL_TOPO_FILE + NCCL_IB_GID_INDEX
 ```
