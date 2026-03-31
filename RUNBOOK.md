@@ -112,7 +112,9 @@ python3 agent.py --host 0.0.0.0 --port 8756
 # Agent on B applies torch defaults; export NCCL_IB_HCA on B before agent.py — see rdma_job_agent/README.md.
 # Manual equivalent (POST → sleep → rank-0 docker → poll). Master port fixed at 29541 (change in both POST and torchrun if needed):
 POST_BODY="$(jq -n --arg ma "$NODE_A_IP" --argjson mp "29541" '{kind:"torch",master_addr:$ma,master_port:$mp}')"
-R1=$(curl -sS -X POST "http://${NODE_B_IP}:8756/v1/jobs" -H 'Content-Type: application/json' -d "$POST_BODY" | jq -r .job_id)
+POST_JSON="$(curl -sS -X POST "http://${NODE_B_IP}:8756/v1/jobs" -H 'Content-Type: application/json' -d "$POST_BODY")"
+R1="$(echo "$POST_JSON" | jq -r .job_id)"
+# If R1 is empty/null, POST failed: echo "$POST_JSON" | jq .
 # No jq for POST_BODY (IPv4): POST_BODY='{"kind":"torch","master_addr":"'"$NODE_A_IP"'","master_port":29541}'
 sleep 2
 

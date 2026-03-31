@@ -316,6 +316,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, snap)
             return
+        m_bad = re.match(r"^/v1/jobs/([^/]+)$", path)
+        if m_bad and m_bad.group(1) in ("null", "undefined"):
+            self._json(
+                400,
+                {
+                    "error": "invalid job id path",
+                    "hint": (
+                        "POST /v1/jobs did not return job_id; jq -r .job_id became null. "
+                        "curl POST with same body and jq . for error. On A: export NODE_A_IP "
+                        "before building POST_BODY."
+                    ),
+                },
+            )
+            return
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:

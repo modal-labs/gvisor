@@ -34,11 +34,13 @@ POST_BODY="$(jq -n \
   --arg ma "$NODE_A_IP" \
   --argjson mp "29541" \
   '{kind:"torch",master_addr:$ma,master_port:$mp}')"
-R1="$(curl -sS -X POST "http://${NODE_B_IP}:8756/v1/jobs" \
+POST_JSON="$(curl -sS -X POST "http://${NODE_B_IP}:8756/v1/jobs" \
   -H 'Content-Type: application/json' \
-  -d "$POST_BODY" | jq -r .job_id)"
+  -d "$POST_BODY")"
+R1="$(echo "$POST_JSON" | jq -r .job_id)"
 if [[ -z "$R1" || "$R1" == "null" ]]; then
-  echo "run_torch_pair_node_a: no job_id from POST (is the agent up on ${NODE_B_IP}:8756?)" >&2
+  echo "run_torch_pair_node_a: POST did not return job_id. Response:" >&2
+  echo "$POST_JSON" | jq . >&2 || echo "$POST_JSON" >&2
   exit 1
 fi
 
