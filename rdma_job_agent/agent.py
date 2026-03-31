@@ -29,6 +29,7 @@ import argparse
 import errno
 import json
 import os
+import pathlib
 import pwd
 import re
 import shlex
@@ -264,6 +265,31 @@ def _git_pull_env() -> dict[str, str]:
     return env
 
 
+def _configure_runsc_docker_runtime() -> dict[str, Any]:
+    daemon_json = pathlib.Path("/etc/docker/daemon.json")
+    raw = daemon_json.read_text().strip() if daemon_json.exists() else ""
+    cfg = json.loads(raw) if raw else {}
+    cfg.setdefault("runtimes", {})["runsc-rdma"] = {
+        "path": "/usr/local/bin/runsc-rdma",
+        "runtimeArgs": [
+            "--debug",
+            "--debug-log=/tmp/runsc-rdma/logs/",
+            "--rdmaproxy",
+            "--nvproxy",
+            "--nvproxy-allowed-driver-capabilities=compute,utility,video",
+            "--network=host",
+            "--rdma-expected-ipoib=-1",
+        ],
+    }
+    daemon_json.write_text(json.dumps(cfg, indent=2) + "\n")
+    return {
+        "command": "configure docker runtime runsc-rdma",
+        "cwd": None,
+        "exit_code": 0,
+        "output": f"updated {daemon_json}\n",
+    }
+
+
 def _deploy_runsc_runtime(progress_cb: Any | None = None) -> dict[str, Any]:
     if os.geteuid() != 0:
         raise PermissionError("deploy_runsc requires the agent to run as root (start agent.py with sudo)")
@@ -276,9 +302,23 @@ def _deploy_runsc_runtime(progress_cb: Any | None = None) -> dict[str, Any]:
         (["rm", "-f", "/usr/local/bin/runsc-rdma"], None, None),
         (["cp", "/tmp/runsc", "/usr/local/bin/runsc-rdma"], None, None),
         (["chmod", "+x", "/usr/local/bin/runsc-rdma"], None, None),
+        (["systemctl", "restart", "docker"], None, None),
+        (["modprobe", "nvidia-peermem"], None, None),
         (["/usr/local/bin/runsc-rdma", "--version"], None, None),
     ]
     for argv, cwd, env in cmds:
+        if argv == ["systemctl", "restart", "docker"]:
+            step = _configure_runsc_docker_runtime()
+            steps.append(step)
+            if progress_cb is not None:
+                progress_cb(
+                    {
+                        "current_step": step["command"],
+                        "output": "".join(
+                            f"$ {prior['command']}\n{prior['output']}\n" for prior in steps
+                        ),
+                    }
+                )
         if progress_cb is not None:
             progress_cb(
                 {
