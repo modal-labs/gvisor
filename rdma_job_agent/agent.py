@@ -132,7 +132,7 @@ def _merge_torch_defaults(body: dict[str, Any]) -> None:
     body.setdefault("master_port", 29541)
     body.setdefault(
         "runtime",
-        os.environ.get("RDMA_JOB_RUNTIME", "runsc-rdma"),
+        os.environ.get("RDMA_JOB_RUNTIME", "runc"),
     )
     body.setdefault("async", True)
     body.setdefault("nnodes", 2)

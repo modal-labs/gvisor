@@ -28,23 +28,24 @@ sudo pkill -f "runsc-rdma" 2>/dev/null || true; sleep 1
 sudo rm -f /usr/local/bin/runsc-rdma
 sudo cp /tmp/runsc /usr/local/bin/runsc-rdma && sudo chmod +x /usr/local/bin/runsc-rdma
 
-sudo test -f /etc/docker/daemon.json || echo '{}' | sudo tee /etc/docker/daemon.json >/dev/null
-sudo jq '(.runtimes //= {}) | .runtimes["runsc-rdma"] = {
-  "path": "/usr/local/bin/runsc-rdma",
-  "runtimeArgs": [
-    "--debug", "--debug-log=/tmp/runsc-rdma/logs/",
-    "--rdmaproxy", "--nvproxy",
-    "--nvproxy-allowed-driver-capabilities=compute,utility,video",
-    "--network=host", "--rdma-expected-ipoib=-1"
-  ]
-}' /etc/docker/daemon.json | sudo tee /etc/docker/daemon.json.tmp >/dev/null \
-  && sudo mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+sudo python3 -c "
+import json, pathlib
+p = pathlib.Path('/etc/docker/daemon.json')
+raw = p.read_text().strip() if p.exists() else ''
+cfg = json.loads(raw) if raw else {}
+cfg.setdefault('runtimes', {})['runsc-rdma'] = {
+    'path': '/usr/local/bin/runsc-rdma',
+    'runtimeArgs': [
+        '--debug', '--debug-log=/tmp/runsc-rdma/logs/',
+        '--rdmaproxy', '--nvproxy',
+        '--nvproxy-allowed-driver-capabilities=compute,utility,video',
+        '--network=host', '--rdma-expected-ipoib=-1',
+    ],
+}
+p.write_text(json.dumps(cfg, indent=2) + '\n')
+"
 sudo systemctl restart docker && sleep 2
 sudo modprobe nvidia-peermem
-
-# If `runsc-rdma` was never configured, a merge-only jq can create `runtimeArgs` without `"path"` → Docker reports
-# “unknown or invalid runtime name”. Re-run the full `jq` assignment above (lines 31–40), or merge only when
-# `sudo jq '.runtimes["runsc-rdma"].path' /etc/docker/daemon.json` already prints the runsc binary path.
 
 export PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:24.07-py3
 sudo docker login nvcr.io
@@ -166,7 +167,7 @@ Add to **`runtimes["runsc-rdma"].runtimeArgs`** in `/etc/docker/daemon.json` (sa
 - **`--strace`** — trace syscalls (verbose; omit filters only for short runs).
 - Optionally **`--strace-syscalls=ioctl,mmap,munmap,openat,close,...`** — comma list (see `runsc --help`).
 
-Example (merge manually or extend the §2 `jq` so these two strings appear in `runtimeArgs`):
+Example (merge manually or extend the §2 python snippet so these two strings appear in `runtimeArgs`):
 
 ```json
 "--strace",
