@@ -805,7 +805,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         runtime = str(body.get("runtime", "runc"))
-        async_flag = bool(body.get("async", False))
+        async_flag = bool(body.get("async", True))
         job_id = str(uuid.uuid4())
         display = shlex.join(argv)
         with _JOB_LOCK:
