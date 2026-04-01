@@ -88,6 +88,8 @@ Common fields:
   Modal workers to force jobs into `modal-containers.slice` so they inherit the
   100-CPU cpuset instead of the default 12-CPU `system.slice` scope. You can
   also set `RDMA_JOB_CGROUP_PARENT` in the agent environment to apply a default.
+- **`cpuset_cpus`**: optional Docker `--cpuset-cpus` value, e.g. `12-23` or
+  `12-59`, for controlled CPU-scaling experiments inside a chosen cgroup parent.
 
 **NCCL** (`kind: "nccl"`):
 

@@ -94,13 +94,15 @@ def _docker_run_base(body: dict[str, Any]) -> tuple[list[str], str]:
     No `--cpus`: containers use whatever CPU set Docker’s cgroup allows
     (avoids nproc vs docker.info mismatch). Callers may optionally set
     `cgroup_parent` in the job body or `RDMA_JOB_CGROUP_PARENT` in the
-    agent environment to place the container under a specific systemd slice.
+    agent environment to place the container under a specific systemd slice,
+    and may set `cpuset_cpus` to further restrict the visible CPUs.
     """
     runtime = str(body.get("runtime", "runc"))
     topo_host = str(body.get("topo_host_path", _default_topo_host_path()))
     cgroup_parent = str(
         body.get("cgroup_parent", os.environ.get("RDMA_JOB_CGROUP_PARENT", ""))
     ).strip()
+    cpuset_cpus = str(body.get("cpuset_cpus", "")).strip()
     parts: list[str] = [
         "sudo",
         "docker",
@@ -121,6 +123,8 @@ def _docker_run_base(body: dict[str, Any]) -> tuple[list[str], str]:
     )
     if cgroup_parent:
         parts.append(f"--cgroup-parent={cgroup_parent}")
+    if cpuset_cpus:
+        parts.append(f"--cpuset-cpus={cpuset_cpus}")
     if runtime == "runsc-rdma":
         parts.extend(["-v", f"{topo_host}:/topo.xml:ro"])
     return parts, runtime
