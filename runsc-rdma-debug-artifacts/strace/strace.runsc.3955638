@@ -1,0 +1,21 @@
+14:54:38.228741 ppoll([{fd=10, events=POLLHUP|POLLRDHUP}], 1, NULL, NULL, 0) = 1 ([{fd=10, revents=POLLHUP|POLLRDHUP}]) <13.097379>
+14:54:51.326148 shutdown(10, SHUT_RDWR) = 0 <0.000012>
+14:54:51.326176 write(32, "\1\0\0\0\0\0\0\0", 8) = 8 <0.000017>
+14:54:51.326207 close(32)               = 0 <0.000015>
+14:54:51.326247 close(10)               = 0 <0.000022>
+14:54:51.326291 futex(0xc000500158, FUTEX_WAKE_PRIVATE, 1) = 1 <0.000015>
+14:54:51.326326 close(33)               = 0 <0.000022>
+14:54:51.326364 futex(0xc000500158, FUTEX_WAKE_PRIVATE, 1) = 1 <0.000010>
+14:54:51.326395 close(-1)               = -1 EBADF (Bad file descriptor) <0.000008>
+14:54:51.326415 close(-1)               = -1 EBADF (Bad file descriptor) <0.000008>
+14:54:51.326443 close(-1)               = -1 EBADF (Bad file descriptor) <0.000009>
+14:54:51.326462 close(-1)               = -1 EBADF (Bad file descriptor) <0.000007>
+14:54:51.326482 close(-1)               = -1 EBADF (Bad file descriptor) <0.000009>
+14:54:51.326509 close(-1)               = -1 EBADF (Bad file descriptor) <0.000010>
+14:54:51.326536 close(-1)               = -1 EBADF (Bad file descriptor) <0.000006>
+14:54:51.326553 close(-1)               = -1 EBADF (Bad file descriptor) <0.000005>
+14:54:51.326568 close(-1)               = -1 EBADF (Bad file descriptor) <0.000005>
+14:54:51.326583 close(-1)               = -1 EBADF (Bad file descriptor) <0.000006>
+14:54:51.326630 write(4, "I0401 14:54:51.326598       1 cl"..., 65) = 65 <0.000014>
+14:54:51.326658 exit_group(0)           = ?
+14:54:51.328722 +++ exited with 0 +++

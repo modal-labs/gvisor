@@ -117,10 +117,14 @@ int main(int argc, char **argv) {
         CHECK_CUDA(cudaMemset(sbuf[g], 1, max_bytes));
     }
 
+    int prewarm_iters = atoi(getenv("PREWARM_ITERS") ? : "50");
+    int warmup = atoi(getenv("WARMUP_ITERS") ? : "5");
+    int iters = atoi(getenv("ITERS") ? : "20");
+
     if (rank == 0)
         printf("[rank 0] pre-warming at %zu bytes to establish all channels...\n",
                max_bytes);
-    for (int i = 0; i < 50; i++)
+    for (int i = 0; i < prewarm_iters; i++)
         run_allreduce(comms, streams, sbuf, rbuf,
                       max_bytes / sizeof(float), ngpus);
     if (rank == 0)
@@ -132,11 +136,13 @@ int main(int argc, char **argv) {
         1<<23, 1<<24, 1<<25, 1<<26, 1<<27,
     };
     int nsizes = sizeof(sizes) / sizeof(sizes[0]);
-    int warmup = 5, iters = 20;
 
-    if (rank == 0)
+    if (rank == 0) {
+        printf("prewarm_iters=%d  warmup_iters=%d  iters=%d\n",
+               prewarm_iters, warmup, iters);
         printf("%12s  %10s  %11s  %11s\n",
                "size(B)", "time(us)", "algbw(GB/s)", "busbw(GB/s)");
+    }
 
     for (int s = 0; s < nsizes; s++) {
         size_t bytes = sizes[s];

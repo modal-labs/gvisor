@@ -84,6 +84,10 @@ Common fields:
 - **`runtime`**: `"runc"` or `"runsc-rdma"`.
 - **`async`**: if `true`, returns `202` immediately; poll `GET /v1/jobs/<id>` for
   `state` (`queued` → `running` → `done`) and `output`.
+- **`cgroup_parent`**: optional Docker `--cgroup-parent` value. Useful on
+  Modal workers to force jobs into `modal-containers.slice` so they inherit the
+  100-CPU cpuset instead of the default 12-CPU `system.slice` scope. You can
+  also set `RDMA_JOB_CGROUP_PARENT` in the agent environment to apply a default.
 
 **NCCL** (`kind: "nccl"`):
 
