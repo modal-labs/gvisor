@@ -124,6 +124,25 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
     return;
   }
 
+  // Stub-side fast-path for clock_nanosleep with trivial duration.
+  // NCCL proxy threads call clock_nanosleep(0, 0, {0, 1000}, NULL) as a
+  // polling backoff. For any relative sleep <= 100us we return immediately.
+  // ARM64 syscall args: x0=clockid, x1=flags, x2=request, x3=remain.
+  if (signo == SIGSYS && siginfo->si_syscall == __NR_clock_nanosleep) {
+    long flags = ucontext->uc_mcontext.regs[1];
+    if (flags == 0) {
+      long *req = (long *)ucontext->uc_mcontext.regs[2];
+      if (req != NULL) {
+        long sec = req[0];
+        long nsec = req[1];
+        if (sec == 0 && nsec >= 0 && nsec <= 100000) {
+          ucontext->uc_mcontext.regs[0] = 0;
+          return;
+        }
+      }
+    }
+  }
+
   ctx->signo = signo;
 
   gregs_to_ptregs(ucontext, &ctx->ptregs);
