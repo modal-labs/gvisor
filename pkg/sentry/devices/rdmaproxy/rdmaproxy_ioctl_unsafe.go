@@ -74,7 +74,7 @@ func ioctlInHostNetns(fd int32, cmd uint32, arg unsafe.Pointer) (uintptr, unix.E
 // ioctlDirect executes an ioctl without network namespace switching.
 // Used for operations that don't need the host netns (MR, CQ, QP ops).
 func ioctlDirect(fd int32, cmd uint32, arg unsafe.Pointer) (uintptr, unix.Errno) {
-	n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(arg))
+	n, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(arg))
 	return n, errno
 }
 
