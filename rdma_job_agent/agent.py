@@ -307,8 +307,10 @@ def _deploy_runsc_runtime(progress_cb: Any | None = None) -> dict[str, Any]:
 
     repo_root = _repo_root()
     steps: list[dict[str, Any]] = []
+    git_env = _git_pull_env()
     cmds: list[tuple[list[str], str | None, dict[str, str] | None]] = [
-        (["git", "pull"], repo_root, _git_pull_env()),
+        (["git", "fetch", "origin"], repo_root, git_env),
+        (["git", "reset", "--hard", "origin/alessio/development"], repo_root, git_env),
         (["make", "copy", "TARGETS=runsc", "DESTINATION=/tmp"], repo_root, None),
         (["rm", "-f", "/usr/local/bin/runsc-rdma"], None, None),
         (["cp", "/tmp/runsc", "/usr/local/bin/runsc-rdma"], None, None),
