@@ -241,35 +241,6 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
     return;
   }
 
-  // Stub-side fast-path for clock_nanosleep with trivial duration.
-  // NCCL proxy threads call clock_nanosleep(0, 0, {0, 1000}, NULL) ~24K/sec
-  // as a polling backoff. The sentry round-trip (~5µs) exceeds the requested
-  // 1µs sleep. For any relative sleep ≤ 100µs we return immediately.
-  if (signo == SIGSYS && siginfo->si_syscall == __NR_clock_nanosleep) {
-    long flags = ucontext->uc_mcontext.gregs[REG_RSI];
-    if (flags == 0) {
-      long *req = (long *)ucontext->uc_mcontext.gregs[REG_RDX];
-      if (req != NULL) {
-        long sec, nsec;
-        atomic_store(&sysmsg->fault_jump, 3);
-        asm volatile("movq (%1), %0\n"
-                     : "=a"(sec)
-                     : "b"(&req[0])
-                     : "cc", "memory");
-        atomic_store(&sysmsg->fault_jump, 3);
-        asm volatile("movq (%1), %0\n"
-                     : "=a"(nsec)
-                     : "b"(&req[1])
-                     : "cc", "memory");
-        atomic_store(&sysmsg->fault_jump, 0);
-        if (sec == 0 && nsec >= 0 && nsec <= 100000) {
-          ucontext->uc_mcontext.gregs[REG_RAX] = 0;
-          return;
-        }
-      }
-    }
-  }
-
   fs_base = get_fsbase();
 
   ctx->signo = signo;
@@ -405,34 +376,6 @@ void __syshandler() {
     ctx->ptregs.rax = 0;
     atomic_store(&sysmsg->state, THREAD_STATE_NONE);
     return;
-  }
-
-  // Stub-side fast-path for clock_nanosleep via the patched-syscall path.
-  // Same rationale as the SIGSYS fast-path in __export_sighandler.
-  if (ctx->ptregs.rax == __NR_clock_nanosleep) {
-    long flags = ctx->ptregs.rsi;
-    if (flags == 0) {
-      long *req = (long *)ctx->ptregs.rdx;
-      if (req != NULL) {
-        long sec, nsec;
-        atomic_store(&sysmsg->fault_jump, 3);
-        asm volatile("movq (%1), %0\n"
-                     : "=a"(sec)
-                     : "b"(&req[0])
-                     : "cc", "memory");
-        atomic_store(&sysmsg->fault_jump, 3);
-        asm volatile("movq (%1), %0\n"
-                     : "=a"(nsec)
-                     : "b"(&req[1])
-                     : "cc", "memory");
-        atomic_store(&sysmsg->fault_jump, 0);
-        if (sec == 0 && nsec >= 0 && nsec <= 100000) {
-          ctx->ptregs.rax = 0;
-          atomic_store(&sysmsg->state, THREAD_STATE_NONE);
-          return;
-        }
-      }
-    }
   }
 
   enum context_state ctx_state = CONTEXT_STATE_SYSCALL_TRAP;
