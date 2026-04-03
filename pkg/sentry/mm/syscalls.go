@@ -40,12 +40,23 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 		return linuxerr.EFAULT
 	}
 
-	// Don't bother trying existingPMAsLocked; in most cases, if we did have
-	// existing pmas, we wouldn't have faulted.
+	// Fast path: if the PMA already exists with the right permissions,
+	// re-establish the platform mapping under a read lock only. This is
+	// common after MProtect removes platform mappings (unmapASLocked)
+	// without destroying the underlying PMAs. Skips both mappingMu and
+	// the activeMu write lock, avoiding the two largest sources of MM
+	// mutex contention under GPU/RDMA workloads.
+	mm.activeMu.RLock()
+	if pseg := mm.existingPMAsLocked(ar, at, false /* ignorePermissions */, false /* needInternalMappings */); pseg.Ok() {
+		err := mm.mapASLocked(ctx, pseg, ar, memmap.PlatformEffectDefault)
+		mm.activeMu.RUnlock()
+		return err
+	}
+	mm.activeMu.RUnlock()
 
-	// Ensure that we have a usable vma. Here and below, since we are only
-	// asking for a single page, there is no possibility of partial success,
-	// and any error is immediately fatal.
+	// Slow path: ensure that we have a usable vma. Here and below, since
+	// we are only asking for a single page, there is no possibility of
+	// partial success, and any error is immediately fatal.
 	mm.mappingMu.RLock()
 	vseg, _, err := mm.getVMAsLocked(ctx, ar, at, false)
 	if err != nil {
