@@ -22,12 +22,14 @@ import (
 	"sync"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
@@ -237,3 +239,87 @@ func MayRegisterDevicePath(path string) bool {
 
 // ErrNotUverbsDevice is returned when the device path doesn't match.
 var ErrNotUverbsDevice = linuxerr.ENODEV
+
+// globalAsyncFDs maps sandbox FD → host FD for all proxied async event FDs.
+// Used to rewrite inline FD attrs in subsequent ioctls (e.g. CQ CREATE's
+// EVENT_FD attr) before forwarding to the host kernel. Global because the
+// application may reference an async event FD from any device context.
+var (
+	globalAsyncFDsMu sync.Mutex
+	globalAsyncFDs   = make(map[int32]int32)
+)
+
+// asyncEventFD wraps a host FD for RDMA async event delivery.
+// The kernel creates this FD via UVERBS_METHOD_ASYNC_EVENT_ALLOC;
+// rdma-core reads async events from it via read(2).
+type asyncEventFD struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.DentryMetadataFileDescriptionImpl
+	vfs.NoLockFD
+
+	hostFD int32
+	queue  waiter.Queue
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *asyncEventFD) Release(ctx context.Context) {
+	fdnotifier.RemoveFD(fd.hostFD)
+	unix.Close(int(fd.hostFD))
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+func (fd *asyncEventFD) EventRegister(e *waiter.Entry) error {
+	fd.queue.EventRegister(e)
+	if err := fdnotifier.UpdateFD(fd.hostFD); err != nil {
+		fd.queue.EventUnregister(e)
+		return err
+	}
+	return nil
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+func (fd *asyncEventFD) EventUnregister(e *waiter.Entry) {
+	fd.queue.EventUnregister(e)
+	if err := fdnotifier.UpdateFD(fd.hostFD); err != nil {
+		panic(fmt.Sprint("UpdateFD:", err))
+	}
+}
+
+// Readiness implements waiter.Waitable.Readiness.
+func (fd *asyncEventFD) Readiness(mask waiter.EventMask) waiter.EventMask {
+	return fdnotifier.NonBlockingPoll(fd.hostFD, mask)
+}
+
+// newAsyncEventFD wraps a host async-event FD in a sentry FileDescription
+// and installs it in the task's FD table. Returns the sandbox FD number.
+func newAsyncEventFD(t *kernel.Task, hostFD int) (int32, error) {
+	vfsObj := t.Kernel().VFS()
+	vd := vfsObj.NewAnonVirtualDentry("[rdma-async-event]")
+	defer vd.DecRef(t)
+
+	if err := unix.SetNonblock(hostFD, true); err != nil {
+		return -1, fmt.Errorf("SetNonblock: %w", err)
+	}
+
+	afd := &asyncEventFD{
+		hostFD: int32(hostFD),
+	}
+	if err := fdnotifier.AddFD(afd.hostFD, &afd.queue); err != nil {
+		return -1, err
+	}
+	if err := afd.vfsfd.Init(afd, linux.O_RDONLY, t.Credentials(), vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
+		UseDentryMetadata: true,
+		DenyPRead:         true,
+		DenyPWrite:        true,
+	}); err != nil {
+		fdnotifier.RemoveFD(afd.hostFD)
+		return -1, err
+	}
+	sentryFD, err := t.NewFDFrom(0, &afd.vfsfd, kernel.FDFlags{CloseOnExec: true})
+	if err != nil {
+		afd.vfsfd.DecRef(t)
+		return -1, err
+	}
+	return sentryFD, nil
+}

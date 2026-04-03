@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -36,6 +37,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // ioctlInHostNetns executes an ioctl in the host's network namespace.
@@ -218,10 +220,17 @@ const (
 
 // UVERBS object types (from include/uapi/rdma/ib_user_ioctl_cmds.h).
 const (
-	uverbsObjectDevice = 0
-	uverbsObjectCQ     = 3
-	uverbsObjectQP     = 4
-	uverbsObjectMR     = 7
+	uverbsObjectDevice     = 0
+	uverbsObjectCQ         = 3
+	uverbsObjectQP         = 4
+	uverbsObjectMR         = 7
+	uverbsObjectAsyncEvent = 16
+)
+
+// UVERBS_OBJECT_ASYNC_EVENT method and attr IDs.
+const (
+	uverbsMethodAsyncEventAlloc  = 0
+	uverbsAttrAsyncEventAllocFD  = 0
 )
 
 // UVERBS method IDs.
@@ -426,6 +435,30 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 		}
 	}
 
+	// Rewrite inline FD attrs that reference proxied async event FDs.
+	// The application sees sentry FD numbers, but the host kernel needs
+	// the original host FDs (e.g. CQ CREATE's EVENT_FD attr).
+	globalAsyncFDsMu.Lock()
+	hasAsyncFDs := len(globalAsyncFDs) > 0
+	globalAsyncFDsMu.Unlock()
+	if hasAsyncFDs {
+		for i := 0; i < int(numAttrs); i++ {
+			off := ibUverbsIoctlHdrSize + i*ibUverbsAttrSize
+			attrLen := binary.LittleEndian.Uint16(buf[off+2 : off+4])
+			if attrLen != 0 {
+				continue
+			}
+			sentryVal := int32(binary.LittleEndian.Uint64(buf[off+8 : off+16]))
+			globalAsyncFDsMu.Lock()
+			hostVal, ok := globalAsyncFDs[sentryVal]
+			globalAsyncFDsMu.Unlock()
+			if ok {
+				binary.LittleEndian.PutUint64(buf[off+8:off+16], uint64(hostVal))
+				log.Debugf("rdmaproxy: rewrote inline FD attr[%d] sentry=%d → host=%d", i, sentryVal, hostVal)
+			}
+		}
+	}
+
 	// Classify and prepare DMA page mirroring before forwarding.
 	action, writeCmdVal := fd.classifyIoctl(buf, int(numAttrs), objectID, methodID)
 
@@ -562,6 +595,17 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 				} else {
 					fd.mu.Unlock()
 				}
+			}
+		}
+
+		// Proxy the async event FD returned by ASYNC_EVENT_ALLOC.
+		// The kernel created this FD in the sentry's host process;
+		// we must wrap it so the sandbox can read() async events.
+		if objectID == uverbsObjectAsyncEvent && methodID == uverbsMethodAsyncEventAlloc {
+			if sentryFD, err := fd.proxyAsyncEventFD(t, buf, int(numAttrs)); err != nil {
+				log.Warningf("rdmaproxy: async event FD proxy: %v", err)
+			} else if sentryFD >= 0 {
+				log.Infof("rdmaproxy: installed async event FD → sandbox fd %d", sentryFD)
 			}
 		}
 	}
@@ -1039,6 +1083,35 @@ func (fd *uverbsFD) extractCQQPDestroyHandle(buf []byte, numAttrs int, objectID 
 	return 0
 }
 
+// proxyAsyncEventFD extracts the host FD from a successful
+// ASYNC_EVENT_ALLOC response, wraps it in a sentry FileDescription,
+// installs it in the task's FD table, and rewrites the ioctl buffer
+// so the sandbox receives the proxy FD number.
+func (fd *uverbsFD) proxyAsyncEventFD(t *kernel.Task, buf []byte, numAttrs int) (int32, error) {
+	for i := 0; i < numAttrs; i++ {
+		off := ibUverbsIoctlHdrSize + i*ibUverbsAttrSize
+		attrID := binary.LittleEndian.Uint16(buf[off : off+2])
+		if attrID != uverbsAttrAsyncEventAllocFD {
+			continue
+		}
+		hostFD := int(binary.LittleEndian.Uint64(buf[off+8 : off+16]))
+		if hostFD < 0 {
+			return -1, fmt.Errorf("kernel returned invalid async event fd %d", hostFD)
+		}
+		sentryFD, err := newAsyncEventFD(t, hostFD)
+		if err != nil {
+			unix.Close(hostFD)
+			return -1, fmt.Errorf("newAsyncEventFD: %w", err)
+		}
+		globalAsyncFDsMu.Lock()
+		globalAsyncFDs[sentryFD] = int32(hostFD)
+		globalAsyncFDsMu.Unlock()
+		binary.LittleEndian.PutUint64(buf[off+8:off+16], uint64(sentryFD))
+		return sentryFD, nil
+	}
+	return -1, fmt.Errorf("ASYNC_EVENT_ALLOC response missing FD attr")
+}
+
 // Write implements vfs.FileDescriptionImpl.Write.
 // This handles the legacy uverbs write() command interface where rdma-core
 // sends commands like ALLOC_PD, REG_MR, DEREG_MR via write() on the fd.
@@ -1320,6 +1393,31 @@ func (fd *uverbsFD) prepareLegacyCQQPCreate(t *kernel.Task, data []byte, cmdBase
 func (fd *uverbsFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
 	globalReadCount.Add(1)
 
+	buf := make([]byte, dst.NumBytes())
+	n, _, errno := unix.RawSyscall(unix.SYS_READ,
+		uintptr(fd.hostFD),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)))
+	if errno != 0 {
+		if errno == unix.EAGAIN || errno == unix.EWOULDBLOCK {
+			return 0, linuxerr.ErrWouldBlock
+		}
+		return 0, errno
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	written, err := dst.CopyOut(ctx, buf[:n])
+	return int64(written), err
+}
+
+// Read implements vfs.FileDescriptionImpl.Read for asyncEventFD.
+// Uses fdnotifier to check readiness before reading, so we never
+// issue a blocking read() syscall on the host FD.
+func (fd *asyncEventFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	if fdnotifier.NonBlockingPoll(fd.hostFD, waiter.ReadableEvents) == 0 {
+		return 0, linuxerr.ErrWouldBlock
+	}
 	buf := make([]byte, dst.NumBytes())
 	n, _, errno := unix.RawSyscall(unix.SYS_READ,
 		uintptr(fd.hostFD),

@@ -1,0 +1,4 @@
+export NODE_A_IP=172.29.13.202
+export NODE_B_IP=172.29.5.7
+export NCCL_IB_HCA=mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11
+export DEVS="$(ls /dev/infiniband/uverbs* | sed 's/^/--device=/' | tr '\n' ' ')"
