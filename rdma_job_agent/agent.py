@@ -284,6 +284,7 @@ def _configure_runsc_docker_runtime() -> dict[str, Any]:
     cfg.setdefault("runtimes", {})["runsc-rdma"] = {
         "path": "/usr/local/bin/runsc-rdma",
         "runtimeArgs": [
+            "--debug",
             "--debug-log=/tmp/runsc-rdma/logs/",
             "--rdmaproxy",
             "--nvproxy",
