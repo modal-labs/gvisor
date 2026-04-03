@@ -256,6 +256,49 @@ func uvmMMInitialize(ui *uvmIoctlState) (uintptr, error) {
 	return n, nil
 }
 
+func uvmPageableMemAccess(ui *uvmIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.UVM_PAGEABLE_MEM_ACCESS_PARAMS
+	if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+	n, err := uvmIoctlInvoke(ui, &ioctlParams)
+	if err != nil {
+		return n, err
+	}
+	// On ARM64, ATS (Address Translation Services) cannot work under
+	// gvisor because the sandboxed application's virtual addresses do not
+	// correspond to the sentry's host page tables. If we report pageable
+	// memory access as available, libcuda will try to use ATS and crash.
+	// Force it to false so libcuda falls back to explicit GPU memory
+	// allocation, which gvisor handles correctly.
+	if runtime.GOARCH == "arm64" {
+		ioctlParams.PageableMemAccess = 0
+	}
+	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+func uvmPageableMemAccessOnGPU(ui *uvmIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.UVM_PAGEABLE_MEM_ACCESS_ON_GPU_PARAMS
+	if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+	n, err := uvmIoctlInvoke(ui, &ioctlParams)
+	if err != nil {
+		return n, err
+	}
+	// See comment in uvmPageableMemAccess.
+	if runtime.GOARCH == "arm64" {
+		ioctlParams.PageableMemAccess = 0
+	}
+	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 func uvmIoctlHasFrontendFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Params]](ui *uvmIoctlState) (uintptr, error) {
 	var ioctlParamsValue Params
 	ioctlParams := PtrParams(&ioctlParamsValue)
