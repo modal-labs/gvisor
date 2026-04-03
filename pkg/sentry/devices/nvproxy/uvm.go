@@ -16,6 +16,7 @@ package nvproxy
 
 import (
 	"fmt"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
@@ -191,9 +192,29 @@ func uvmInitialize(ui *uvmIoctlState) (uintptr, error) {
 		return 0, err
 	}
 	origFlags := ioctlParams.Flags
-	// This is necessary to share the host UVM FD between sentry and
-	// application processes.
-	ioctlParams.Flags = ioctlParams.Flags | nvgpu.UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE
+	// On x86, MULTI_PROCESS_SHARING_MODE is set so the host UVM FD can be
+	// shared between sentry and application processes.
+	//
+	// On ARM64, this flag must NOT be forced. Setting it causes
+	// uvm_va_space_mm_enabled() to return false in the NVIDIA UVM driver
+	// (kernel-open/nvidia-uvm/uvm_va_space_mm.c), which disables mm
+	// tracking. Without mm tracking, ATS (Address Translation Services) and
+	// HMM are both disabled (see uvm_ats_init() in uvm_ats.c and the
+	// uvm_enable_va_space_mm MODULE_PARM_DESC which states: "This will also
+	// disable pageable memory access via either ATS or HMM.").
+	//
+	// On coherent memory platforms like GH200 (Grace Hopper), ATS is the
+	// default path for system-allocated memory (malloc) access via
+	// NVLink-C2C. Disabling it causes CUDA initialization to fail with a
+	// NULL pointer dereference when the GPU cannot access CPU page tables.
+	//
+	// Since gvisor's sentry is the only host process using each UVM FD (the
+	// sandboxed "application processes" are goroutines within the sentry),
+	// MULTI_PROCESS_SHARING_MODE is not required on ARM64 — all UVM ioctls
+	// originate from the same mm_struct.
+	if runtime.GOARCH != "arm64" {
+		ioctlParams.Flags = ioctlParams.Flags | nvgpu.UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE
+	}
 	n, err := uvmIoctlInvoke(ui, &ioctlParams)
 	// Only expose the MULTI_PROCESS_SHARING_MODE flag if it was already present.
 	ioctlParams.Flags &^= ^origFlags & nvgpu.UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE
