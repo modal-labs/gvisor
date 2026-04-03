@@ -340,6 +340,53 @@ func uvmIoctlHasFrontendFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Param
 	return n, nil
 }
 
+func uvmRegisterGPU(ui *uvmIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.UVM_REGISTER_GPU_PARAMS
+	if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+
+	origFD := ioctlParams.GetFrontendFD()
+	if origFD < 0 {
+		n, err := uvmIoctlInvoke(ui, &ioctlParams)
+		if err != nil {
+			return n, err
+		}
+		if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
+			return n, err
+		}
+		return n, nil
+	}
+
+	ctlFileGeneric, _ := ui.t.FDTable().Get(origFD)
+	if ctlFileGeneric == nil {
+		return 0, linuxerr.EINVAL
+	}
+	defer ctlFileGeneric.DecRef(ui.ctx)
+	ctlFile, ok := ctlFileGeneric.Impl().(*frontendFD)
+	if !ok {
+		return 0, linuxerr.EINVAL
+	}
+
+	ioctlParams.SetFrontendFD(ctlFile.hostFD)
+	// On ARM64, override NumaEnabled to 0 because gvisor doesn't expose
+	// GPU NUMA topology. libcuda's NUMA bitmap is never allocated, so
+	// passing NumaEnabled=1 causes a NULL pointer dereference.
+	if runtime.GOARCH == "arm64" && ioctlParams.NumaEnabled != 0 {
+		ioctlParams.NumaEnabled = 0
+		ioctlParams.NumaNodeID = -1
+	}
+	n, err := uvmIoctlInvoke(ui, &ioctlParams)
+	ioctlParams.SetFrontendFD(origFD)
+	if err != nil {
+		return n, err
+	}
+	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 func uvmFailWithStatus[Params any, PtrParams hasStatusPtr[Params]](ui *uvmIoctlState, ioctlParams PtrParams, status uint32) error {
 	return failWithStatus(ui.ctx, ui.t, ui.ioctlParamsAddr, ioctlParams, status)
 }

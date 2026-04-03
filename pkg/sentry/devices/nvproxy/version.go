@@ -203,7 +203,7 @@ func Init() {
 					nvgpu.UVM_SET_RANGE_GROUP:                uvmHandler(uvmIoctlSimple[nvgpu.UVM_SET_RANGE_GROUP_PARAMS], compUtil),
 					nvgpu.UVM_MAP_EXTERNAL_ALLOCATION:        uvmHandler(uvmIoctlHasFrontendFD[nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS], compUtil),
 					nvgpu.UVM_FREE:                           uvmHandler(uvmIoctlSimple[nvgpu.UVM_FREE_PARAMS], compUtil),
-					nvgpu.UVM_REGISTER_GPU:                   uvmHandler(uvmIoctlHasFrontendFD[nvgpu.UVM_REGISTER_GPU_PARAMS], compUtil),
+					nvgpu.UVM_REGISTER_GPU:                   uvmHandler(uvmRegisterGPU, compUtil),
 					nvgpu.UVM_UNREGISTER_GPU:                 uvmHandler(uvmIoctlSimple[nvgpu.UVM_UNREGISTER_GPU_PARAMS], compUtil),
 					nvgpu.UVM_PAGEABLE_MEM_ACCESS:            uvmHandler(uvmPageableMemAccess, compUtil),
 					nvgpu.UVM_SET_PREFERRED_LOCATION:         uvmHandler(uvmIoctlSimple[nvgpu.UVM_SET_PREFERRED_LOCATION_PARAMS], compUtil),
