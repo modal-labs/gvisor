@@ -440,17 +440,18 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 		}
 	}
 
-	// Rewrite the CQ EVENT_FD attr if this is a CQ CREATE ioctl.
-	// Only UVERBS_ATTR_CREATE_CQ_EVENT_FD carries an actual file
-	// descriptor; other inline (len=0) attrs are kernel object handles
-	// (PD, CQ, SRQ) that must NOT be rewritten.
-	if objectID == uverbsObjectCQ {
+	// Rewrite inline FD attrs that reference proxied async event FDs.
+	// The application sees sentry FD numbers, but the host kernel needs
+	// the original host FDs (e.g. CQ CREATE's EVENT_FD attr).
+	// Log every rewrite at WARNING level to identify which attrs need
+	// translation (temporary diagnostic).
+	globalAsyncFDsMu.Lock()
+	hasAsyncFDs := len(globalAsyncFDs) > 0
+	globalAsyncFDsMu.Unlock()
+	if hasAsyncFDs {
 		for i := 0; i < int(numAttrs); i++ {
 			off := ibUverbsIoctlHdrSize + i*ibUverbsAttrSize
 			attrID := binary.LittleEndian.Uint16(buf[off : off+2])
-			if attrID != uverbsAttrCreateCQEventFD {
-				continue
-			}
 			attrLen := binary.LittleEndian.Uint16(buf[off+2 : off+4])
 			if attrLen != 0 {
 				continue
@@ -461,9 +462,8 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 			globalAsyncFDsMu.Unlock()
 			if ok {
 				binary.LittleEndian.PutUint64(buf[off+8:off+16], uint64(hostVal))
-				log.Debugf("rdmaproxy: rewrote CQ EVENT_FD attr[%d] sentry=%d → host=%d", i, sentryVal, hostVal)
+				log.Warningf("rdmaproxy: REWRITE obj=0x%04x method=%d attr[%d] id=0x%04x sentry=%d → host=%d", objectID, methodID, i, attrID, sentryVal, hostVal)
 			}
-			break
 		}
 	}
 
