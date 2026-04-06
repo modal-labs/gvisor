@@ -6,9 +6,10 @@ cd gvisor
 git checkout alessio/development
 ```
 
-Raise the locked-memory limit
+Load nvidia_peermem for GPUDirect RDMA and raise the locked-memory limit
 
 ```bash
+sudo modprobe nvidia_peermem
 sudo prlimit --pid=$$ --memlock=unlimited:unlimited
 ```
 
