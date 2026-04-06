@@ -84,6 +84,32 @@ sudo docker run --runtime=runc --rm --gpus all $DEVS \
   /tmp/torch_allreduce_bench.py
 ```
 
+### Run MNIST training (single-node, no agent needed)
+
+```bash
+bash rdma_job_agent/run_mnist_train.sh
+```
+
+### Run MNIST training (multi-node, no agent needed)
+
+Run the same script on each node. On Node B (start first):
+
+```bash
+MASTER_ADDR=$NODE_A_IP NODE_RANK=1 bash rdma_job_agent/run_mnist_train.sh
+```
+
+On Node A:
+
+```bash
+MASTER_ADDR=$NODE_A_IP NODE_RANK=0 bash rdma_job_agent/run_mnist_train.sh
+```
+
+Use `RUNTIME=runc` to skip runsc-rdma. See the script header for all optional env vars.
+
+---
+
+### Multi-node via agent
+
 ### On Node A
 
 Export Node A’s IP after running `ip -4 addr show` and selecting the entry with `eth0`/ `ens7`

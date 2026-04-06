@@ -15,7 +15,7 @@
 #
 # Optional env:
 #   MASTER_PORT   - rendezvous port (default: 29500)
-#   RUNTIME       - Docker runtime (default: runsc-rdma)
+#   RUNTIME       - Docker runtime (default: runc)
 #   NUM_GPUS      - GPUs per node (default: all, detected via nvidia-smi)
 #   PYTORCH_IMAGE - base image (default: nvcr.io/nvidia/pytorch:26.03-py3)
 #   NCCL_IB_HCA   - IB HCA filter (default: hardcoded list)
@@ -27,7 +27,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-RUNTIME="${RUNTIME:-runsc-rdma}"
+RUNTIME="${RUNTIME:-runc}"
 PYTORCH_IMAGE="${PYTORCH_IMAGE:-nvcr.io/nvidia/pytorch:26.03-py3}"
 if [[ -n "${MASTER_ADDR:-}" ]]; then
   NNODES="${NNODES:-2}"
