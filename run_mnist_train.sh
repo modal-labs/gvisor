@@ -2,52 +2,52 @@
 # DDP MNIST training over 2 nodes via torchrun (bare metal).
 #
 # Usage:
-#   MASTER_ADDR=<node0 IP> bash run_mnist_train.sh
+#   MASTER_ADDR=<node0 IP> NODE_RANK=0 bash run_mnist_train.sh   # on master
+#   MASTER_ADDR=<node0 IP> NODE_RANK=1 bash run_mnist_train.sh   # on worker
 #
-# Optional env: NODE_RANK, MASTER_PORT, NUM_GPUS, NCCL_DEBUG
+# Optional env: MASTER_PORT, NUM_GPUS, NCCL_DEBUG
 
 set -eu
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR is required}"
+NODE_RANK="${NODE_RANK:?NODE_RANK is required (0 on master, 1 on worker)}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
-if [[ -z "${NUM_GPUS:-}" ]]; then
-  NUM_GPUS="$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)"
-  if [[ "$NUM_GPUS" -eq 0 ]]; then
-    echo "No GPUs detected; set NUM_GPUS manually." >&2
-    exit 1
-  fi
-fi
+NUM_GPUS="${NUM_GPUS:-8}"
 
-# Auto-detect node rank from local IPs.
-if [[ -z "${NODE_RANK:-}" ]]; then
-  if ip -o -4 addr show 2>/dev/null | grep -qw "$MASTER_ADDR"; then
-    NODE_RANK=0
-  else
-    NODE_RANK=1
-  fi
-  echo "Auto-detected NODE_RANK=$NODE_RANK"
-fi
-
-# Auto-detect IB HCAs, excluding IPoIB-only devices (ibs* interfaces).
+# Auto-detect IB HCAs. Exclude IPoIB-only interfaces and mlx devices whose
+# active port is Ethernet-only (for example, RoCE/Ethernet ports that NCCL
+# should not use for this setup).
 if [[ -z "${NCCL_IB_HCA:-}" ]] && command -v ibdev2netdev &>/dev/null; then
-  NCCL_IB_HCA="$(ibdev2netdev 2>/dev/null | awk '$5 !~ /^ibs/ {print $1}' | paste -sd, - || true)"
-fi
-
-# Auto-detect socket interface for NCCL OOB.
-if [[ -z "${NCCL_SOCKET_IFNAME:-}" ]]; then
-  NCCL_SOCKET_IFNAME="$(ip -o link show 2>/dev/null | awk -F': ' '$2 != "lo" {print $2; exit}' || true)"
+  hc_as=()
+  while IFS= read -r dev; do
+    [[ -n "$dev" ]] || continue
+    if command -v ibv_devinfo >/dev/null 2>&1; then
+      if ! ibv_devinfo -d "$dev" 2>/dev/null | awk '
+        /state:[[:space:]]+PORT_ACTIVE/ { active=1 }
+        /link_layer:[[:space:]]+InfiniBand/ { ib=1 }
+        END { exit !(active && ib) }'
+      then
+        continue
+      fi
+    fi
+    hc_as+=("$dev")
+  done < <(ibdev2netdev 2>/dev/null | awk '$5 !~ /^ibs/ {print $1}')
+  if [[ "${#hc_as[@]}" -gt 0 ]]; then
+    NCCL_IB_HCA="$(IFS=,; echo "${hc_as[*]}")"
+  fi
 fi
 
 export MASTER_ADDR MASTER_PORT NCCL_DEBUG
 export NCCL_IB_HCA="${NCCL_IB_HCA:-}"
-export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-3}"
-export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
+# Force NCCL/Gloo to use the data-plane interface, not tailscale0.
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens7,eth0}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-ens7,eth0}"
 
-echo "=== MNIST DDP: gpus=$NUM_GPUS rank=$NODE_RANK master=$MASTER_ADDR:$MASTER_PORT hca=${NCCL_IB_HCA:-auto} ifname=$NCCL_SOCKET_IFNAME ==="
+echo "=== MNIST DDP: gpus=$NUM_GPUS rank=$NODE_RANK master=$MASTER_ADDR:$MASTER_PORT hca=${NCCL_IB_HCA:-auto} ==="
 
 exec torchrun \
   --nproc_per_node="$NUM_GPUS" \
