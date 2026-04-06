@@ -12,13 +12,6 @@ Raise the locked-memory limit
 sudo prlimit --pid=$$ --memlock=unlimited:unlimited
 ```
 
-On Node A
-
-```bash
-git config user.name "atoniolo76"
-git config user.email "alessio@modal.com"
-```
-
 Build gVisor binary
 
 ```bash
@@ -27,17 +20,20 @@ sudo chmod +x /usr/local/bin/runsc
 ```
 
 Install Torch
+
 ```bash
 sudo apt install python3-pip
 pip3 install torch torchvision
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-On Node A
+On Node A only
+
 ```bash
 export MASTER_ADDR=$(ip -4 addr show | grep -e "ens7" -e "eth0" | grep inet | awk '{ print $2 }' | awk -F'/' '{ print $1}')
 echo "export MASTER_ADDR=$MASTER_ADDR"
 ```
+
 **Copy and paste this command on Node B.**
 
 Export the correct NCCL IB devices used.
@@ -47,5 +43,6 @@ export NCCL_IB_HCA=mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12
 ```
 
 ```bash
-NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET NCCL_SOCKET_IFNAME=ens7 GLOO_SOCKET_IFNAME=ens7 NCCL_IB_HCA="$NCCL_IB_HCA" NCCL_IB_GID_INDEX=0 NCCL_NET_GDR_LEVEL=3 NCCL_DMABUF_ENABLE=0 torchrun --nproc_per_node=8 --nnodes=2 --master_addr="$MASTER_ADDR" --master_port=29500 --node_rank=0 ./torch_mnist_train.py
+NCCL_SOCKET_IFNAME=ens7 GLOO_SOCKET_IFNAME=ens7 NCCL_IB_HCA="$NCCL_IB_HCA" NCCL_IB_GID_INDEX=0 NCCL_NET_GDR_LEVEL=3 NCCL_DMABUF_ENABLE=0 torchrun --nproc_per_node=8 --nnodes=2 --master_addr="$MASTER_ADDR" --master_port=29500 --node_rank=0 ./torch_mnist_train.py
 ```
+
