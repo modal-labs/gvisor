@@ -181,25 +181,21 @@ TORCHRUN_ARGS=(
 echo "=== MNIST DDP: runtime=$RUNTIME gpus=$NUM_GPUS nnodes=$NNODES rank=$NODE_RANK ($NODE_RANK_SOURCE) master=$MASTER_ADDR:$MASTER_PORT ==="
 
 if [[ "$RUNTIME" == "torchrun" ]]; then
-  export MASTER_ADDR MASTER_PORT
-  export NCCL_IB_HCA
-  export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-3}"
-  export NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME
-  export NCCL_DEBUG
-  if [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]]; then
-    export NCCL_DEBUG_SUBSYS
-  fi
-  if [[ -n "${NCCL_ASYNC_ERROR_HANDLING:-}" ]]; then
-    export NCCL_ASYNC_ERROR_HANDLING
-  fi
-  if [[ -n "${NCCL_BLOCKING_WAIT:-}" ]]; then
-    export NCCL_BLOCKING_WAIT
-  fi
-  if [[ -n "${TORCH_DISTRIBUTED_DEBUG:-}" ]]; then
-    export TORCH_DISTRIBUTED_DEBUG
-  fi
+  SUDO_ENV=(
+    "MASTER_ADDR=$MASTER_ADDR" "MASTER_PORT=$MASTER_PORT"
+    "NCCL_IB_HCA=$NCCL_IB_HCA"
+    "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-3}"
+    "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME"
+    "GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME"
+    "NCCL_DEBUG=$NCCL_DEBUG"
+  )
+  [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && SUDO_ENV+=("NCCL_DEBUG_SUBSYS=$NCCL_DEBUG_SUBSYS")
+  [[ -n "${NCCL_ASYNC_ERROR_HANDLING:-}" ]] && SUDO_ENV+=("NCCL_ASYNC_ERROR_HANDLING=$NCCL_ASYNC_ERROR_HANDLING")
+  [[ -n "${NCCL_BLOCKING_WAIT:-}" ]] && SUDO_ENV+=("NCCL_BLOCKING_WAIT=$NCCL_BLOCKING_WAIT")
+  [[ -n "${TORCH_DISTRIBUTED_DEBUG:-}" ]] && SUDO_ENV+=("TORCH_DISTRIBUTED_DEBUG=$TORCH_DISTRIBUTED_DEBUG")
 
-  torchrun "${TORCHRUN_ARGS[@]}" ./torch_mnist_train.py
+  # sudo gives us unlimited memlock (RDMA verbs pin pages for CQs/MRs).
+  sudo env "${SUDO_ENV[@]}" torchrun "${TORCHRUN_ARGS[@]}" ./torch_mnist_train.py
 else
   sudo docker run --runtime="$RUNTIME" --rm --gpus all ${DEVS} \
     --ulimit memlock=-1:-1 --shm-size=1g --network=host \
