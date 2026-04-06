@@ -18,8 +18,8 @@
 #   RUNTIME       - "torchrun" (default) or Docker runtime name (e.g. runc, runsc-rdma)
 #   NUM_GPUS      - GPUs per node (default: all, detected via nvidia-smi)
 #   PYTORCH_IMAGE - base image (default: nvcr.io/nvidia/pytorch:26.03-py3)
-#   NCCL_IB_HCA   - IB HCA filter (default: hardcoded list)
-#   DEVS          - IB device flags (default: auto-detected)
+#   NCCL_IB_HCA   - IB HCA filter (default: auto-detected via ibdev2netdev)
+#   DEVS          - IB device flags (default: auto-detected from /dev/infiniband/uverbs*)
 #   NCCL_DEBUG    - NCCL log level (default: WARN)
 #   MASTER_ADDR_IFACE_REGEX         - interfaces to consider for local IP detection (default: ens7|eth0|gpu)
 #   MASTER_ADDR_EXCLUDE_IFACE_REGEX - interfaces to exclude from local IP detection (default: ibs)
@@ -63,6 +63,18 @@ detect_local_ipv4s() {
     | sort -u
 }
 
+detect_nccl_ib_hca() {
+  # Best-effort: build a comma-separated mlx5 list via ibdev2netdev.
+  # Example output:
+  #   mlx5_10,mlx5_11,mlx5_12,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9
+  if command -v ibdev2netdev >/dev/null 2>&1; then
+    ibdev2netdev \
+      | awk '!/ibs/ && $1 ~ /(ib|rdma|gpu)/ {print $1}' \
+      | paste -sd, - \
+      | sed 's/,$//'
+  fi
+}
+
 NODE_RANK_SOURCE=""
 if [[ -n "${NODE_RANK:-}" ]]; then
   : # use NODE_RANK as-is
@@ -95,6 +107,21 @@ elif [[ "$NNODES" -gt 1 ]]; then
 else
   NODE_RANK=0
   NODE_RANK_SOURCE="default"
+fi
+
+# Always require MASTER_ADDR for multi-node; keep it explicit to avoid
+# accidental split-brain rendezvous.
+if [[ "$NNODES" -gt 1 && -z "${MASTER_ADDR:-}" ]]; then
+  echo "MASTER_ADDR is required when NNODES > 1." >&2
+  exit 2
+fi
+
+# Auto-detect NCCL_IB_HCA if omitted.
+if [[ -z "${NCCL_IB_HCA:-}" ]]; then
+  NCCL_IB_HCA="$(detect_nccl_ib_hca || true)"
+fi
+if [[ -z "${NCCL_IB_HCA:-}" ]]; then
+  NCCL_IB_HCA="mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11"
 fi
 
 if [[ -z "${NUM_GPUS:-}" ]]; then

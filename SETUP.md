@@ -23,12 +23,8 @@ sudo cp /tmp/runsc /usr/local/bin/runsc-rdma
 sudo chmod +x /usr/local/bin/runsc-rdma
 ```
 
-Export the necessary environment variables
-
-```bash
-export NCCL_IB_HCA="$(ibdev2netdev | grep -v "ibs" | awk '/ib|rdma|gpu/ {print $1}' | paste -sd, -)"
-export DEVS=$(ls /dev/infiniband/uverbs* | sed 's/^/--device=/' | tr '\n' ' ')
-```
+The MNIST script auto-detects RDMA devices (`DEVS`) and `NCCL_IB_HCA`. You can
+still override them via env vars if needed.
 
 On Node A
 ```bash
