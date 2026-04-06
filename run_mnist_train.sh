@@ -11,7 +11,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR is required}"
 MASTER_PORT="${MASTER_PORT:-29500}"
+NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
 NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
+if [[ "$NUM_GPUS" -eq 0 ]]; then
+  echo "No GPUs detected; set NUM_GPUS manually." >&2
+  exit 1
+fi
 
 # Auto-detect node rank from local IPs.
 if [[ -z "${NODE_RANK:-}" ]]; then
@@ -26,21 +32,18 @@ fi
 # Auto-detect IB HCAs, excluding IPoIB-only devices (ibs* interfaces).
 # ibdev2netdev lines: "mlx5_5 port 1 ==> rdma5 (Up)"  — $5 is the interface name.
 if [[ -z "${NCCL_IB_HCA:-}" ]] && command -v ibdev2netdev &>/dev/null; then
-  NCCL_IB_HCA="$(ibdev2netdev | awk '$5 !~ /^ibs/ {print $1}' | paste -sd, -)"
+  NCCL_IB_HCA="$(ibdev2netdev | awk '$5 !~ /^ibs/ {print $1}' | paste -sd, -)" || true
 fi
 
 # Auto-detect socket interface.
 NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}')}"
 
-# RDMA verbs pin pages; raise memlock limit.
-sudo prlimit --pid=$$ --memlock=unlimited:unlimited
-
-export MASTER_ADDR MASTER_PORT NCCL_SOCKET_IFNAME
+export MASTER_ADDR MASTER_PORT NCCL_DEBUG NCCL_SOCKET_IFNAME
 export NCCL_IB_HCA="${NCCL_IB_HCA:-}"
-# export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-3}"
+export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-3}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
 
-echo "=== MNIST DDP: gpus=$NUM_GPUS rank=$NODE_RANK master=$MASTER_ADDR:$MASTER_PORT ==="
+echo "=== MNIST DDP: gpus=$NUM_GPUS rank=$NODE_RANK master=$MASTER_ADDR:$MASTER_PORT hca=${NCCL_IB_HCA:-auto} ==="
 
 trap 'pkill -TERM -P $$ 2>/dev/null; sleep 1; pkill -KILL -P $$ 2>/dev/null' INT TERM
 

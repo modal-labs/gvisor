@@ -6,6 +6,21 @@ cd gvisor
 git checkout alessio/development
 ```
 
+Raise the locked-memory limit (required on both nodes — RDMA verbs pin pages
+for CQs and MRs; the default limit is too low and causes `ibv_create_cq`
+ENOMEM failures):
+
+```bash
+sudo prlimit --pid=$$ --memlock=unlimited:unlimited
+```
+
+Or make it persistent across logins:
+
+```bash
+echo "$USER - memlock unlimited" | sudo tee /etc/security/limits.d/99-rdma.conf
+# then open a new shell
+```
+
 On Node A
 
 ```bash
