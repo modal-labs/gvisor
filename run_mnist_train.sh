@@ -2,14 +2,14 @@
 # DDP MNIST training (2 nodes only; run on each node).
 #
 # On each node:
-#   MASTER_ADDR=<node0 IP> bash rdma_job_agent/run_mnist_train.sh
+#   MASTER_ADDR=<node0 IP> bash run_mnist_train.sh
 #
 # Required env:
 #   MASTER_ADDR   - IPv4 of the rank-0 node
-#   NODE_RANK     - 0 on master, 1 on worker (optional; auto-detected if unset)
-#   NNODES        - must be 2 (default: 2)
 #
 # Optional env:
+#   NODE_RANK     - 0 on master, 1 on worker (auto-detected if unset)
+#   NNODES        - must be 2 (default: 2)
 #   MASTER_PORT   - rendezvous port (default: 29500)
 #   RUNTIME       - "torchrun" (default) or Docker runtime name (e.g. runc, runsc-rdma)
 #   NUM_GPUS      - GPUs per node (default: all, detected via nvidia-smi)
@@ -17,40 +17,29 @@
 #   NCCL_IB_HCA   - IB HCA filter (default: auto-detected via ibdev2netdev)
 #   DEVS          - IB device flags (default: auto-detected from /dev/infiniband/uverbs*)
 #   NCCL_DEBUG    - NCCL log level (default: WARN)
-#   MASTER_ADDR_IFACE_REGEX         - interfaces to consider for local IP detection (default: ens7|eth0|gpu)
-#   MASTER_ADDR_EXCLUDE_IFACE_REGEX - interfaces to exclude from local IP detection (default: ibs)
+#   DEBUG_DDP     - set to 1 for verbose NCCL/torch distributed logging
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$SCRIPT_DIR"
-
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
 RUNTIME="${RUNTIME:-torchrun}"
 PYTORCH_IMAGE="${PYTORCH_IMAGE:-nvcr.io/nvidia/pytorch:26.03-py3}"
 NNODES="${NNODES:-2}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11}"
-
-cleanup_children() {
-  # Best-effort: ensure a Ctrl-C kills torchrun + all worker processes.
-  # (torchrun sometimes leaves worker python procs behind.)
-  pkill -TERM -P "$$" 2>/dev/null || true
-  sleep 1
-  pkill -KILL -P "$$" 2>/dev/null || true
-}
-
-trap cleanup_children INT TERM
+NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
 if [[ -z "${MASTER_ADDR:-}" ]]; then
-  echo "MASTER_ADDR is required (this script is 2-node only)." >&2
+  echo "MASTER_ADDR is required." >&2
   exit 2
 fi
 if [[ "$NNODES" -ne 2 ]]; then
   echo "NNODES must be 2 (this script is 2-node only)." >&2
   exit 2
 fi
+
+# --- Helper functions ---
 
 detect_local_ipv4s() {
   local iface_re="${MASTER_ADDR_IFACE_REGEX:-ens7|eth0|gpu}"
@@ -65,19 +54,14 @@ detect_local_ipv4s() {
 }
 
 detect_nccl_ib_hca() {
-  # Best-effort: build a comma-separated mlx5 list via ibdev2netdev.
-  # Example output:
-  #   mlx5_10,mlx5_11,mlx5_12,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9
   if command -v ibdev2netdev >/dev/null 2>&1; then
     ibdev2netdev \
       | awk '!/ibs/ && $1 ~ /(ib|rdma|gpu)/ {print $1}' \
-      | paste -sd, - \
-      | sed 's/,$//'
+      | paste -sd, -
   fi
 }
 
 default_socket_ifname() {
-  # Prefer eth0/ens7 if present; otherwise fall back to first non-lo interface.
   for iface in eth0 ens7; do
     if ip link show "$iface" >/dev/null 2>&1; then
       echo "$iface"
@@ -87,9 +71,16 @@ default_socket_ifname() {
   ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}'
 }
 
-NODE_RANK_SOURCE=""
+cleanup_children() {
+  pkill -TERM -P "$$" 2>/dev/null || true
+  sleep 1
+  pkill -KILL -P "$$" 2>/dev/null || true
+}
+trap cleanup_children INT TERM
+
+# --- Auto-detect NODE_RANK ---
+
 if [[ -n "${NODE_RANK:-}" ]]; then
-  : # use NODE_RANK as-is
   NODE_RANK_SOURCE="NODE_RANK"
 elif [[ -n "${RANK:-}" ]]; then
   NODE_RANK="$RANK"
@@ -97,7 +88,8 @@ elif [[ -n "${RANK:-}" ]]; then
 else
   mapfile -t LOCAL_IPV4S < <(detect_local_ipv4s)
   if [[ "${#LOCAL_IPV4S[@]}" -eq 0 ]]; then
-    mapfile -t LOCAL_IPV4S < <(ip -o -4 addr show scope global | awk '{split($4,a,"/"); if (a[1] !~ /^127\\./) print a[1]}' | sort -u)
+    mapfile -t LOCAL_IPV4S < <(ip -o -4 addr show scope global \
+      | awk '{split($4,a,"/"); if (a[1] !~ /^127\\./) print a[1]}' | sort -u)
   fi
   if [[ "${#LOCAL_IPV4S[@]}" -eq 0 ]]; then
     echo "Couldn't detect a local IPv4 for rank auto-detection; set NODE_RANK explicitly." >&2
@@ -105,16 +97,14 @@ else
   fi
   NODE_RANK=1
   for ip in "${LOCAL_IPV4S[@]}"; do
-    if [[ "$ip" == "$MASTER_ADDR" ]]; then
-      NODE_RANK=0
-      break
-    fi
+    [[ "$ip" == "$MASTER_ADDR" ]] && NODE_RANK=0 && break
   done
   NODE_RANK_SOURCE="auto"
   echo "Auto-detected NODE_RANK=$NODE_RANK (MASTER_ADDR=$MASTER_ADDR, local IPv4s: ${LOCAL_IPV4S[*]})"
 fi
 
-# Auto-detect NCCL_IB_HCA if omitted.
+# --- Auto-detect NCCL_IB_HCA ---
+
 if [[ -z "${NCCL_IB_HCA:-}" ]]; then
   NCCL_IB_HCA="$(detect_nccl_ib_hca || true)"
 fi
@@ -124,16 +114,16 @@ fi
 
 NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$(default_socket_ifname)}"
 GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
-NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
-# Optional: turn on verbose distributed/NCCL logging to debug hangs.
 if [[ "${DEBUG_DDP:-0}" == "1" ]]; then
-  TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
-  NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+  NCCL_DEBUG="INFO"
   NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
   NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
   NCCL_BLOCKING_WAIT="${NCCL_BLOCKING_WAIT:-1}"
+  TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
 fi
+
+# --- Auto-detect GPUs and IB devices ---
 
 if [[ -z "${NUM_GPUS:-}" ]]; then
   NUM_GPUS="$(nvidia-smi -L 2>/dev/null | wc -l)"
@@ -150,26 +140,7 @@ if [[ -z "${DEVS:-}" ]]; then
   done
 fi
 
-if [[ "$RUNTIME" == "runsc-rdma" ]]; then
-  sudo rm -rf /tmp/runsc-rdma/logs
-  sudo mkdir -p /tmp/runsc-rdma/logs
-fi
-
-EXTRA_DOCKER_ARGS=()
-EXTRA_ENV=()
-
-if [[ "$RUNTIME" == "runsc-rdma" ]]; then
-  EXTRA_DOCKER_ARGS+=(-v /tmp/nccl_topo.xml:/topo.xml:ro)
-  EXTRA_ENV+=(-e NCCL_IB_GID_INDEX=0 -e NCCL_TOPO_FILE=/topo.xml)
-  EXTRA_ENV+=(-e "NCCL_DMABUF_ENABLE=${NCCL_DMABUF_ENABLE:-0}")
-else
-  EXTRA_DOCKER_ARGS+=(--privileged)
-fi
-
-EXTRA_ENV+=(-e "NCCL_IB_HCA=${NCCL_IB_HCA}")
-EXTRA_ENV+=(-e "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-3}")
-EXTRA_ENV+=(-e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}")
-EXTRA_ENV+=(-e "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME}")
+# --- Build torchrun args ---
 
 TORCHRUN_ARGS=(
   --nproc_per_node="$NUM_GPUS"
@@ -178,7 +149,10 @@ TORCHRUN_ARGS=(
   --master_port="$MASTER_PORT"
   --node_rank="$NODE_RANK"
 )
+
 echo "=== MNIST DDP: runtime=$RUNTIME gpus=$NUM_GPUS nnodes=$NNODES rank=$NODE_RANK ($NODE_RANK_SOURCE) master=$MASTER_ADDR:$MASTER_PORT ==="
+
+# --- Launch ---
 
 if [[ "$RUNTIME" == "torchrun" ]]; then
   # RDMA verbs (ibv_create_cq, ibv_reg_mr) pin pages; needs unlimited memlock.
@@ -186,23 +160,39 @@ if [[ "$RUNTIME" == "torchrun" ]]; then
   # the limit on this shell process via prlimit, then run torchrun as-is.
   sudo prlimit --pid=$$ --memlock=unlimited:unlimited
 
-  export MASTER_ADDR MASTER_PORT
-  export NCCL_IB_HCA
+  export MASTER_ADDR MASTER_PORT NCCL_IB_HCA NCCL_DEBUG
   export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-3}"
   export NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME
-  export NCCL_DEBUG
-  [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]] && export NCCL_DEBUG_SUBSYS
-  [[ -n "${NCCL_ASYNC_ERROR_HANDLING:-}" ]] && export NCCL_ASYNC_ERROR_HANDLING
-  [[ -n "${NCCL_BLOCKING_WAIT:-}" ]] && export NCCL_BLOCKING_WAIT
-  [[ -n "${TORCH_DISTRIBUTED_DEBUG:-}" ]] && export TORCH_DISTRIBUTED_DEBUG
+  for v in NCCL_DEBUG_SUBSYS NCCL_ASYNC_ERROR_HANDLING NCCL_BLOCKING_WAIT TORCH_DISTRIBUTED_DEBUG; do
+    [[ -n "${!v:-}" ]] && export "$v"
+  done
 
   torchrun "${TORCHRUN_ARGS[@]}" ./torch_mnist_train.py
 else
-  sudo docker run --runtime="$RUNTIME" --rm --gpus all ${DEVS} \
-    --ulimit memlock=-1:-1 --shm-size=1g --network=host \
-    "${EXTRA_DOCKER_ARGS[@]}" \
-    -v "${REPO_ROOT}/torch_mnist_train.py:/tmp/train_script.py:ro" \
-    -e "NCCL_DEBUG=${NCCL_DEBUG}" \
-    "${EXTRA_ENV[@]}" \
+  if [[ "$RUNTIME" == "runsc-rdma" ]]; then
+    sudo rm -rf /tmp/runsc-rdma/logs
+    sudo mkdir -p /tmp/runsc-rdma/logs
+  fi
+
+  DOCKER_ARGS=(
+    --runtime="$RUNTIME" --rm --gpus all ${DEVS}
+    --ulimit memlock=-1:-1 --shm-size=1g --network=host
+    -v "${REPO_ROOT}/torch_mnist_train.py:/tmp/train_script.py:ro"
+    -e "NCCL_DEBUG=${NCCL_DEBUG}"
+    -e "NCCL_IB_HCA=${NCCL_IB_HCA}"
+    -e "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-3}"
+    -e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}"
+    -e "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME}"
+  )
+
+  if [[ "$RUNTIME" == "runsc-rdma" ]]; then
+    DOCKER_ARGS+=(-v /tmp/nccl_topo.xml:/topo.xml:ro)
+    DOCKER_ARGS+=(-e NCCL_IB_GID_INDEX=0 -e NCCL_TOPO_FILE=/topo.xml)
+    DOCKER_ARGS+=(-e "NCCL_DMABUF_ENABLE=${NCCL_DMABUF_ENABLE:-0}")
+  else
+    DOCKER_ARGS+=(--privileged)
+  fi
+
+  sudo docker run "${DOCKER_ARGS[@]}" \
     "$PYTORCH_IMAGE" torchrun "${TORCHRUN_ARGS[@]}" /tmp/train_script.py
 fi
