@@ -64,6 +64,8 @@ EXTRA_ENV=()
 if [[ "$RUNTIME" == "runsc-rdma" ]]; then
   EXTRA_DOCKER_ARGS+=(-v /tmp/nccl_topo.xml:/topo.xml:ro)
   EXTRA_ENV+=(-e NCCL_IB_GID_INDEX=0 -e NCCL_TOPO_FILE=/topo.xml)
+else
+  EXTRA_DOCKER_ARGS+=(--privileged)
 fi
 
 EXTRA_ENV+=(-e "NCCL_IB_HCA=${NCCL_IB_HCA}")
