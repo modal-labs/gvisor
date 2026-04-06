@@ -19,8 +19,16 @@ BW_TRIALS = 20
 BW_N, BW_M = 500_000, 2000
 
 
+NIC_MAP = {
+    0: "mlx5_5", 1: "mlx5_6", 2: "mlx5_7", 3: "mlx5_8",
+    4: "mlx5_9", 5: "mlx5_10", 6: "mlx5_11", 7: "mlx5_12",
+}
+
+
 def setup():
     local_rank = int(os.environ["LOCAL_RANK"])
+    if local_rank in NIC_MAP:
+        os.environ["NCCL_IB_HCA"] = NIC_MAP[local_rank]
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
     return local_rank
