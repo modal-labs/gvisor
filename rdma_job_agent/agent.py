@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Long-running HTTP agent to spawn NCCL / PyTorch multi-node jobs on this node.
+"""Long-running HTTP agent to spawn NCCL / torchrun multi-node jobs on this node.
 
 Multi-node collectives still require a second node (typically rank 0) to run the
 matching workload. This agent runs the rank-1 container on node B; start rank 0
@@ -159,53 +159,20 @@ def build_nccl_command(body: dict[str, Any]) -> list[str]:
     return parts
 
 
-def _merge_torch_defaults(body: dict[str, Any]) -> None:
-    """Fill omitted torch fields so POST bodies can be minimal (master_addr only).
+def build_train_command(body: dict[str, Any]) -> list[str]:
+    """Build a `docker run … torchrun` command for multi-node DDP training.
 
-    Defaults match the usual gVisor RDMA two-node PyTorch bench. Override any field in
-    the JSON body; use env on the agent host for image/runtime/NCCL (see README).
+    The agent always runs node_rank=1; the POSTing node runs node_rank=0.
+    master_addr is the POSTing node's IPv4 address.
     """
-    body.setdefault("master_port", 29541)
-    body.setdefault(
-        "runtime",
-        os.environ.get("RDMA_JOB_RUNTIME", "runc"),
-    )
-    body.setdefault("async", True)
-    body.setdefault("nnodes", 2)
-    body.setdefault("node_rank", 1)
-    body.setdefault("nproc_per_node", 8)
-    body.setdefault(
-        "image",
-        os.environ.get("RDMA_PYTORCH_IMAGE", "nvcr.io/nvidia/pytorch:24.07-py3"),
-    )
-    body.setdefault("script_host_path", "/tmp/torch_allreduce_bench.py")
-    body.setdefault("topo_host_path", _default_topo_host_path())
-
-    merged_env: dict[str, str] = {
-        "NCCL_DEBUG": "WARN",
-        "NCCL_SOCKET_IFNAME": os.environ.get("NCCL_SOCKET_IFNAME", "eth0"),
-        "NCCL_NET_GDR_LEVEL": "3",
-        "NCCL_DMABUF_ENABLE": "0",
-    }
-    ib = os.environ.get("NCCL_IB_HCA", "").strip()
-    if ib:
-        merged_env["NCCL_IB_HCA"] = ib
-
-    user_env = body.get("env")
-    if isinstance(user_env, dict):
-        merged_env.update({str(k): str(v) for k, v in user_env.items()})
-    body["env"] = merged_env
-
-
-def build_torch_command(body: dict[str, Any]) -> list[str]:
     parts, runtime = _docker_run_base(body)
-    nnodes = int(body["nnodes"])
-    nproc = int(body.get("nproc_per_node", 8))
-    node_rank = int(body["node_rank"])
     master_addr = str(body["master_addr"])
-    master_port = int(body["master_port"])
-    image = str(body.get("image", "nvcr.io/nvidia/pytorch:24.07-py3"))
-    script = str(body.get("script_host_path", "/tmp/torch_allreduce_bench.py"))
+    master_port = int(body.get("master_port", 29500))
+    nproc_per_node = int(body.get("nproc_per_node", 8))
+    node_rank = int(body.get("node_rank", 1))
+    nnodes = int(body.get("nnodes", 2))
+    image = str(body.get("image", "nvcr.io/nvidia/pytorch:26.03-py3"))
+    script_host_path = str(body["script_host_path"])
     env_extra = body.get("env", {}) or {}
 
     for k, v in env_extra.items():
@@ -213,20 +180,17 @@ def build_torch_command(body: dict[str, Any]) -> list[str]:
     if runtime == "runsc-rdma":
         parts.extend(["-e", "NCCL_IB_GID_INDEX=0", "-e", "NCCL_TOPO_FILE=/topo.xml"])
 
-    parts.extend(
-        [
-            "-v",
-            f"{script}:/tmp/torch_allreduce_bench.py:ro",
-            image,
-            "torchrun",
-            f"--nnodes={nnodes}",
-            f"--nproc_per_node={nproc}",
-            f"--node_rank={node_rank}",
-            f"--master_addr={master_addr}",
-            f"--master_port={master_port}",
-            "/tmp/torch_allreduce_bench.py",
-        ]
-    )
+    parts.extend([
+        "-v", f"{script_host_path}:/tmp/train_script.py:ro",
+        image,
+        "torchrun",
+        f"--nproc_per_node={nproc_per_node}",
+        f"--nnodes={nnodes}",
+        f"--master_addr={master_addr}",
+        f"--master_port={master_port}",
+        f"--node_rank={node_rank}",
+        "/tmp/train_script.py",
+    ])
     return parts
 
 
@@ -783,25 +747,23 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         kind = body.get("kind")
-        if kind not in ("nccl", "torch"):
-            self._json(400, {"error": 'kind must be "nccl" or "torch"'})
+        if kind not in ("nccl", "train"):
+            self._json(400, {"error": 'kind must be "nccl" or "train"'})
             return
 
-        if kind == "torch" and not str(body.get("master_addr", "")).strip():
-            self._json(
-                400,
-                {
-                    "error": "torch job requires non-empty master_addr (set NODE_A_IP on A before building POST body)",
-                },
-            )
-            return
+        if kind == "train":
+            if not str(body.get("master_addr", "")).strip():
+                self._json(400, {"error": "train job requires master_addr (the POSTing node's IPv4)"})
+                return
+            if not str(body.get("script_host_path", "")).strip():
+                self._json(400, {"error": "train job requires script_host_path (host path to the training .py)"})
+                return
 
         try:
             if kind == "nccl":
                 argv = build_nccl_command(body)
             else:
-                _merge_torch_defaults(body)
-                argv = build_torch_command(body)
+                argv = build_train_command(body)
         except (KeyError, TypeError, ValueError) as ex:
             self._json(400, {"error": str(ex)})
             return
