@@ -41,6 +41,16 @@ fi
 MASTER_PORT="${MASTER_PORT:-29500}"
 NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11}"
 
+cleanup_children() {
+  # Best-effort: ensure a Ctrl-C kills torchrun + all worker processes.
+  # (torchrun sometimes leaves worker python procs behind.)
+  pkill -TERM -P "$$" 2>/dev/null || true
+  sleep 1
+  pkill -KILL -P "$$" 2>/dev/null || true
+}
+
+trap cleanup_children INT TERM
+
 detect_local_ipv4s() {
   local iface_re="${MASTER_ADDR_IFACE_REGEX:-ens7|eth0|gpu}"
   local exclude_re="${MASTER_ADDR_EXCLUDE_IFACE_REGEX:-ibs}"
@@ -53,10 +63,13 @@ detect_local_ipv4s() {
     | sort -u
 }
 
+NODE_RANK_SOURCE=""
 if [[ -n "${NODE_RANK:-}" ]]; then
   : # use NODE_RANK as-is
+  NODE_RANK_SOURCE="NODE_RANK"
 elif [[ -n "${RANK:-}" ]]; then
   NODE_RANK="$RANK"
+  NODE_RANK_SOURCE="RANK"
 elif [[ "$NNODES" -gt 1 ]]; then
   if [[ -z "${MASTER_ADDR:-}" ]]; then
     echo "MASTER_ADDR is required when NNODES > 1." >&2
@@ -77,9 +90,11 @@ elif [[ "$NNODES" -gt 1 ]]; then
       break
     fi
   done
+  NODE_RANK_SOURCE="auto"
   echo "Auto-detected NODE_RANK=$NODE_RANK (MASTER_ADDR=$MASTER_ADDR, local IPv4s: ${LOCAL_IPV4S[*]})"
 else
   NODE_RANK=0
+  NODE_RANK_SOURCE="default"
 fi
 
 if [[ -z "${NUM_GPUS:-}" ]]; then
@@ -124,7 +139,7 @@ if [[ "$NNODES" -gt 1 ]]; then
     --master_port="$MASTER_PORT"
     --node_rank="$NODE_RANK"
   )
-  echo "=== MNIST DDP: runtime=$RUNTIME gpus=$NUM_GPUS nnodes=$NNODES rank=$NODE_RANK master=$MASTER_ADDR:$MASTER_PORT ==="
+  echo "=== MNIST DDP: runtime=$RUNTIME gpus=$NUM_GPUS nnodes=$NNODES rank=$NODE_RANK ($NODE_RANK_SOURCE) master=$MASTER_ADDR:$MASTER_PORT ==="
 else
   TORCHRUN_ARGS=(--standalone --nproc_per_node="$NUM_GPUS")
   echo "=== MNIST DDP: runtime=$RUNTIME gpus=$NUM_GPUS standalone ==="
