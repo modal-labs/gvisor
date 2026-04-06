@@ -86,11 +86,15 @@ else
   echo "=== MNIST DDP: runtime=$RUNTIME gpus=$NUM_GPUS standalone ==="
 fi
 
-sudo docker run --runtime="$RUNTIME" --rm --gpus all ${DEVS} \
-  --ulimit memlock=-1:-1 --shm-size=1g --network=host \
-  "${EXTRA_DOCKER_ARGS[@]}" \
-  -v "${REPO_ROOT}/torch_mnist_train.py:/tmp/train_script.py:ro" \
-  -e "NCCL_DEBUG=${NCCL_DEBUG:-WARN}" \
-  -e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}" \
-  "${EXTRA_ENV[@]}" \
-  "$PYTORCH_IMAGE" torchrun "${TORCHRUN_ARGS[@]}" /tmp/train_script.py
+if [[ "$RUNTIME" == "torchrun" ]]; then
+  torchrun "${TORCHRUN_ARGS[@]}" ./torch_mnist_train.py
+else
+  sudo docker run --runtime="$RUNTIME" --rm --gpus all ${DEVS} \
+    --ulimit memlock=-1:-1 --shm-size=1g --network=host \
+    "${EXTRA_DOCKER_ARGS[@]}" \
+    -v "${REPO_ROOT}/torch_mnist_train.py:/tmp/train_script.py:ro" \
+    -e "NCCL_DEBUG=${NCCL_DEBUG:-WARN}" \
+    -e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}" \
+    "${EXTRA_ENV[@]}" \
+    "$PYTORCH_IMAGE" torchrun "${TORCHRUN_ARGS[@]}" /tmp/train_script.py
+fi
