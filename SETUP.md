@@ -33,13 +33,7 @@ echo "export MASTER_ADDR=$MASTER_ADDR"
 ```
 Copy and paste this command on Node B.
 
-### Run MNIST training (single-node, no agent needed)
-
-```bash
-RUNTIME=torchrun bash rdma_job_agent/run_mnist_train.sh
-```
-
-### Run MNIST training (multi-node, no agent needed)
+### Run MNIST training (2-node, no agent needed)
 
 Run the same script on each node. The script auto-detects `NODE_RANK` by
 comparing `MASTER_ADDR` to the machine's local IPv4 on `eth0`/`ens7`. On Node B
