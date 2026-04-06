@@ -45,8 +45,6 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
 
 echo "=== MNIST DDP: gpus=$NUM_GPUS rank=$NODE_RANK master=$MASTER_ADDR:$MASTER_PORT hca=${NCCL_IB_HCA:-auto} ==="
 
-trap 'pkill -TERM -P $$ 2>/dev/null; sleep 1; pkill -KILL -P $$ 2>/dev/null' INT TERM
-
 torchrun \
   --nproc_per_node="$NUM_GPUS" \
   --nnodes=2 \
