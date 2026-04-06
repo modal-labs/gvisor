@@ -33,7 +33,7 @@ echo "export MASTER_ADDR=$MASTER_ADDR"
 Run MNIST Training
 
 ```bash
-bash rdma_job_agent/run_mnist_train.sh
+bash run_mnist_train.sh
 ```
 
 Set `RUNTIME=runc` (or `RUNTIME=runsc-rdma`) to run via Docker instead of the
