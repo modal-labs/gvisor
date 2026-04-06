@@ -7,7 +7,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
 
-EPOCHS = 10
+EPOCHS = 5
 BATCH_SIZE = 128
 LR = 1e-3
 NUM_CLASSES = 10
@@ -20,9 +20,9 @@ BW_N, BW_M = 500_000, 2000
 
 
 def setup():
-    dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
     return local_rank
 
 
@@ -162,9 +162,7 @@ def main():
                   flush=True)
 
     if rank == 0:
-        print("Training complete. Running final bandwidth measurement...", flush=True)
-
-    measure_bus_bandwidth(local_rank)
+        print("Training complete.", flush=True)
 
     cleanup()
 
