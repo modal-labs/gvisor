@@ -64,13 +64,13 @@ EXTRA_ENV=()
 if [[ "$RUNTIME" == "runsc-rdma" ]]; then
   EXTRA_DOCKER_ARGS+=(-v /tmp/nccl_topo.xml:/topo.xml:ro)
   EXTRA_ENV+=(-e NCCL_IB_GID_INDEX=0 -e NCCL_TOPO_FILE=/topo.xml)
+  EXTRA_ENV+=(-e "NCCL_DMABUF_ENABLE=${NCCL_DMABUF_ENABLE:-0}")
 else
   EXTRA_DOCKER_ARGS+=(--privileged)
 fi
 
 EXTRA_ENV+=(-e "NCCL_IB_HCA=${NCCL_IB_HCA}")
 EXTRA_ENV+=(-e "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-3}")
-EXTRA_ENV+=(-e "NCCL_DMABUF_ENABLE=${NCCL_DMABUF_ENABLE:-0}")
 
 if [[ "$NNODES" -gt 1 ]]; then
   TORCHRUN_ARGS=(
