@@ -7,7 +7,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, TensorDataset
 
-EPOCHS = 5
+EPOCHS = 1
 BATCH_SIZE = 128
 LR = 1e-3
 NUM_CLASSES = 10
