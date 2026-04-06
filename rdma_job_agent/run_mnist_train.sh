@@ -10,33 +10,77 @@
 #
 # Required env for multi-node:
 #   MASTER_ADDR   - IPv4 of the rank-0 node
-#   NODE_RANK     - 0 on master, 1 on worker
+#   NODE_RANK     - 0 on master, 1 on worker (optional; auto-detected if unset)
 #   NNODES        - total number of nodes (default: 1 = standalone)
 #
 # Optional env:
 #   MASTER_PORT   - rendezvous port (default: 29500)
-#   RUNTIME       - Docker runtime (default: runc)
+#   RUNTIME       - "torchrun" (default) or Docker runtime name (e.g. runc, runsc-rdma)
 #   NUM_GPUS      - GPUs per node (default: all, detected via nvidia-smi)
 #   PYTORCH_IMAGE - base image (default: nvcr.io/nvidia/pytorch:26.03-py3)
 #   NCCL_IB_HCA   - IB HCA filter (default: hardcoded list)
 #   DEVS          - IB device flags (default: auto-detected)
 #   NCCL_DEBUG    - NCCL log level (default: WARN)
+#   MASTER_ADDR_IFACE_REGEX         - interfaces to consider for local IP detection (default: ens7|eth0|gpu)
+#   MASTER_ADDR_EXCLUDE_IFACE_REGEX - interfaces to exclude from local IP detection (default: ibs)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-RUNTIME="${RUNTIME:-runc}"
+cd "$REPO_ROOT"
+
+RUNTIME="${RUNTIME:-torchrun}"
 PYTORCH_IMAGE="${PYTORCH_IMAGE:-nvcr.io/nvidia/pytorch:26.03-py3}"
 if [[ -n "${MASTER_ADDR:-}" ]]; then
   NNODES="${NNODES:-2}"
 else
   NNODES="${NNODES:-1}"
 fi
-NODE_RANK="${NODE_RANK:-0}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11}"
+
+detect_local_ipv4s() {
+  local iface_re="${MASTER_ADDR_IFACE_REGEX:-ens7|eth0|gpu}"
+  local exclude_re="${MASTER_ADDR_EXCLUDE_IFACE_REGEX:-ibs}"
+  ip -o -4 addr show \
+    | awk -v iface_re="$iface_re" -v exclude_re="$exclude_re" '
+      $2 ~ iface_re && $2 !~ exclude_re {
+        split($4, a, "/")
+        print a[1]
+      }' \
+    | sort -u
+}
+
+if [[ -n "${NODE_RANK:-}" ]]; then
+  : # use NODE_RANK as-is
+elif [[ -n "${RANK:-}" ]]; then
+  NODE_RANK="$RANK"
+elif [[ "$NNODES" -gt 1 ]]; then
+  if [[ -z "${MASTER_ADDR:-}" ]]; then
+    echo "MASTER_ADDR is required when NNODES > 1." >&2
+    exit 2
+  fi
+  mapfile -t LOCAL_IPV4S < <(detect_local_ipv4s)
+  if [[ "${#LOCAL_IPV4S[@]}" -eq 0 ]]; then
+    mapfile -t LOCAL_IPV4S < <(ip -o -4 addr show scope global | awk '{split($4,a,"/"); if (a[1] !~ /^127\\./) print a[1]}' | sort -u)
+  fi
+  if [[ "${#LOCAL_IPV4S[@]}" -eq 0 ]]; then
+    echo "Couldn't detect a local IPv4 for rank auto-detection; set NODE_RANK explicitly." >&2
+    exit 2
+  fi
+  NODE_RANK=1
+  for ip in "${LOCAL_IPV4S[@]}"; do
+    if [[ "$ip" == "$MASTER_ADDR" ]]; then
+      NODE_RANK=0
+      break
+    fi
+  done
+  echo "Auto-detected NODE_RANK=$NODE_RANK (MASTER_ADDR=$MASTER_ADDR, local IPv4s: ${LOCAL_IPV4S[*]})"
+else
+  NODE_RANK=0
+fi
 
 if [[ -z "${NUM_GPUS:-}" ]]; then
   NUM_GPUS="$(nvidia-smi -L 2>/dev/null | wc -l)"

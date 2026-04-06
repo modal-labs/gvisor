@@ -6,7 +6,7 @@ cd gvisor
 git checkout alessio/development
 ```
 
-If pushing changes to branch:
+On Node A
 
 ```bash
 git config user.name "atoniolo76"
@@ -23,88 +23,44 @@ sudo cp /tmp/runsc /usr/local/bin/runsc-rdma
 sudo chmod +x /usr/local/bin/runsc-rdma
 ```
 
-Update Docker’s `daemon.json` to point to our `runsc-rdma` binary and pass necessary flags.
+Export the necessary environment variables
 
 ```bash
-sudo apt-get update && sudo apt-get install -y jq
-
-sudo pkill -f "runsc-rdma" 2>/dev/null || true; sleep 1
-sudo rm -f /usr/local/bin/runsc-rdma
-sudo cp /tmp/runsc /usr/local/bin/runsc-rdma && sudo chmod +x /usr/local/bin/runsc-rdma
-
-sudo python3 -c "
-import json, pathlib
-p = pathlib.Path('/etc/docker/daemon.json')
-raw = p.read_text().strip() if p.exists() else ''
-cfg = json.loads(raw) if raw else {}
-cfg.setdefault('runtimes', {})['runsc-rdma'] = {
-    'path': '/usr/local/bin/runsc-rdma',
-    'runtimeArgs': [
-        '--debug', '--debug-log=/tmp/runsc-rdma/logs/',
-        '--rdmaproxy', '--nvproxy',
-        '--nvproxy-allowed-driver-capabilities=compute,utility,video',
-        '--network=host', '--rdma-expected-ipoib=-1',
-        '--strace'
-    ],
-}
-p.write_text(json.dumps(cfg, indent=2) + '\n')
-"
-sudo systemctl restart docker && sleep 2
-```
-
-Load the NVIDIA-peermem kernel module
-
-```bash
-sudo modprobe nvidia-peermem
-```
-
-Export the RDMA-enabled Mellanox devices
-
-```bash
-export NCCL_IB_HCA=mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11
-```
-
-Export uverbs devices
-
-```bash
+export NCCL_IB_HCA="$(ibdev2netdev | grep -v "ibs" | awk '/ib|rdma|gpu/ {print $1}' | paste -sd, -)"
 export DEVS=$(ls /dev/infiniband/uverbs* | sed 's/^/--device=/' | tr '\n' ' ')
 ```
 
-Run this rather long NCCL test with `runc` to get the topology XML file
-
+On Node A
 ```bash
-sudo docker run --runtime=runc --rm --gpus all $DEVS \
-  --ulimit memlock=-1:-1 --shm-size=1g --network=host \
-  -e NCCL_DEBUG=WARN -e NCCL_SOCKET_IFNAME=eth0 -e NCCL_IB_HCA=$NCCL_IB_HCA \
-  -e NCCL_NET_GDR_LEVEL=3 -e NCCL_DMABUF_ENABLE=0 \
-  -e NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo.xml \
-  -v /tmp:/tmp \
-  "nvcr.io/nvidia/pytorch:26.03-py3" torchrun --nnodes=1 --nproc_per_node=8 \
-  --master_addr=127.0.0.1 --master_port=29599 \
-  /tmp/torch_allreduce_bench.py
+export MASTER_ADDR=$(ip -4 addr show | grep -e "ens7" -e "eth0" | grep inet | awk '{ print $2 }' | awk -F'/' '{ print $1}')
+echo "export MASTER_ADDR=$MASTER_ADDR"
 ```
+Copy and paste this command on Node B.
 
 ### Run MNIST training (single-node, no agent needed)
 
 ```bash
-bash rdma_job_agent/run_mnist_train.sh
+RUNTIME=torchrun bash rdma_job_agent/run_mnist_train.sh
 ```
 
 ### Run MNIST training (multi-node, no agent needed)
 
-Run the same script on each node. On Node B (start first):
+Run the same script on each node. The script auto-detects `NODE_RANK` by
+comparing `MASTER_ADDR` to the machine's local IPv4 on `eth0`/`ens7`. On Node B
+(start first):
 
 ```bash
-MASTER_ADDR=$NODE_A_IP NODE_RANK=1 bash rdma_job_agent/run_mnist_train.sh
+MASTER_ADDR=$NODE_A_IP bash rdma_job_agent/run_mnist_train.sh
 ```
 
 On Node A:
 
 ```bash
-MASTER_ADDR=$NODE_A_IP NODE_RANK=0 bash rdma_job_agent/run_mnist_train.sh
+MASTER_ADDR=$NODE_A_IP bash rdma_job_agent/run_mnist_train.sh
 ```
 
-Use `RUNTIME=runc` to skip runsc-rdma. See the script header for all optional env vars.
+Use `RUNTIME=runc` (or `RUNTIME=runsc-rdma`) to run via Docker instead of the
+default `RUNTIME=torchrun`. See the script header for all optional env vars.
 
 ---
 
