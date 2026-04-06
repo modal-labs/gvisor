@@ -76,6 +76,17 @@ detect_nccl_ib_hca() {
   fi
 }
 
+default_socket_ifname() {
+  # Prefer eth0/ens7 if present; otherwise fall back to first non-lo interface.
+  for iface in eth0 ens7; do
+    if ip link show "$iface" >/dev/null 2>&1; then
+      echo "$iface"
+      return 0
+    fi
+  done
+  ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}'
+}
+
 NODE_RANK_SOURCE=""
 if [[ -n "${NODE_RANK:-}" ]]; then
   : # use NODE_RANK as-is
@@ -111,6 +122,19 @@ if [[ -z "${NCCL_IB_HCA:-}" ]]; then
   NCCL_IB_HCA="mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11"
 fi
 
+NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$(default_socket_ifname)}"
+GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
+NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
+# Optional: turn on verbose distributed/NCCL logging to debug hangs.
+if [[ "${DEBUG_DDP:-0}" == "1" ]]; then
+  TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
+  NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+  NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
+  NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+  NCCL_BLOCKING_WAIT="${NCCL_BLOCKING_WAIT:-1}"
+fi
+
 if [[ -z "${NUM_GPUS:-}" ]]; then
   NUM_GPUS="$(nvidia-smi -L 2>/dev/null | wc -l)"
   if [[ "$NUM_GPUS" -eq 0 ]]; then
@@ -144,6 +168,8 @@ fi
 
 EXTRA_ENV+=(-e "NCCL_IB_HCA=${NCCL_IB_HCA}")
 EXTRA_ENV+=(-e "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-3}")
+EXTRA_ENV+=(-e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}")
+EXTRA_ENV+=(-e "GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME}")
 
 TORCHRUN_ARGS=(
   --nproc_per_node="$NUM_GPUS"
@@ -155,14 +181,31 @@ TORCHRUN_ARGS=(
 echo "=== MNIST DDP: runtime=$RUNTIME gpus=$NUM_GPUS nnodes=$NNODES rank=$NODE_RANK ($NODE_RANK_SOURCE) master=$MASTER_ADDR:$MASTER_PORT ==="
 
 if [[ "$RUNTIME" == "torchrun" ]]; then
+  export MASTER_ADDR MASTER_PORT
+  export NCCL_IB_HCA
+  export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-3}"
+  export NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME
+  export NCCL_DEBUG
+  if [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]]; then
+    export NCCL_DEBUG_SUBSYS
+  fi
+  if [[ -n "${NCCL_ASYNC_ERROR_HANDLING:-}" ]]; then
+    export NCCL_ASYNC_ERROR_HANDLING
+  fi
+  if [[ -n "${NCCL_BLOCKING_WAIT:-}" ]]; then
+    export NCCL_BLOCKING_WAIT
+  fi
+  if [[ -n "${TORCH_DISTRIBUTED_DEBUG:-}" ]]; then
+    export TORCH_DISTRIBUTED_DEBUG
+  fi
+
   torchrun "${TORCHRUN_ARGS[@]}" ./torch_mnist_train.py
 else
   sudo docker run --runtime="$RUNTIME" --rm --gpus all ${DEVS} \
     --ulimit memlock=-1:-1 --shm-size=1g --network=host \
     "${EXTRA_DOCKER_ARGS[@]}" \
     -v "${REPO_ROOT}/torch_mnist_train.py:/tmp/train_script.py:ro" \
-    -e "NCCL_DEBUG=${NCCL_DEBUG:-WARN}" \
-    -e "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}" \
+    -e "NCCL_DEBUG=${NCCL_DEBUG}" \
     "${EXTRA_ENV[@]}" \
     "$PYTORCH_IMAGE" torchrun "${TORCHRUN_ARGS[@]}" /tmp/train_script.py
 fi

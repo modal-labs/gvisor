@@ -13,7 +13,7 @@ git config user.name "atoniolo76"
 git config user.email "alessio@modal.com"
 ```
 
-Kill any old build processes, remove old binaries, and build `runsc-rdma` into `/usr/local/bin/`
+Build gVisor binary
 
 ```bash
 sudo pkill -f "runsc-rdma" 2>/dev/null; sleep 1
@@ -23,33 +23,20 @@ sudo cp /tmp/runsc /usr/local/bin/runsc-rdma
 sudo chmod +x /usr/local/bin/runsc-rdma
 ```
 
-The MNIST script auto-detects RDMA devices (`DEVS`) and `NCCL_IB_HCA`. You can
-still override them via env vars if needed.
-
 On Node A
 ```bash
 export MASTER_ADDR=$(ip -4 addr show | grep -e "ens7" -e "eth0" | grep inet | awk '{ print $2 }' | awk -F'/' '{ print $1}')
 echo "export MASTER_ADDR=$MASTER_ADDR"
 ```
-Copy and paste this command on Node B.
+**Copy and paste this command on Node B.**
 
-### Run MNIST training (2-node, no agent needed)
-
-Run the same script on each node. The script auto-detects `NODE_RANK` by
-comparing `MASTER_ADDR` to the machine's local IPv4 on `eth0`/`ens7`. On Node B
-(start first):
+Run MNIST Training
 
 ```bash
-MASTER_ADDR=$NODE_A_IP bash rdma_job_agent/run_mnist_train.sh
+bash rdma_job_agent/run_mnist_train.sh
 ```
 
-On Node A:
-
-```bash
-MASTER_ADDR=$NODE_A_IP bash rdma_job_agent/run_mnist_train.sh
-```
-
-Use `RUNTIME=runc` (or `RUNTIME=runsc-rdma`) to run via Docker instead of the
+Set `RUNTIME=runc` (or `RUNTIME=runsc-rdma`) to run via Docker instead of the
 default `RUNTIME=torchrun`. See the script header for all optional env vars.
 
 ---
