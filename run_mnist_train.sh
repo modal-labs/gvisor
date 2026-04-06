@@ -11,7 +11,6 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR is required}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
 
 # Auto-detect node rank from local IPs.
@@ -36,7 +35,7 @@ NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$(ip -o link show | awk -F': ' '$2 != 
 # RDMA verbs pin pages; raise memlock limit.
 sudo prlimit --pid=$$ --memlock=unlimited:unlimited
 
-export MASTER_ADDR MASTER_PORT NCCL_DEBUG NCCL_SOCKET_IFNAME
+export MASTER_ADDR MASTER_PORT NCCL_SOCKET_IFNAME
 export NCCL_IB_HCA="${NCCL_IB_HCA:-}"
 # export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-3}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
