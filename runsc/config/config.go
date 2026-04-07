@@ -410,6 +410,16 @@ type Config struct {
 	// AllowSUID causes ID elevation to be allowed when execving into executables
 	// with the SUID/SGID bits set.
 	AllowSUID bool `flag:"allow-suid"`
+
+
+	// ControlRPCStopTimeout is the grace period given to in-flight RPCs on
+	// the sandbox control (urpc) socket when the sandbox is shutting down.
+	// New RPCs are rejected immediately, but ongoing RPCs are allowed to run
+	// to completion. After the timeout elapses, idle client connections are
+	// closed and connections still processing an RPC are marked to be closed
+	// once their current RPC finishes. Setting this to 0 closes idle clients
+	// immediately.
+	ControlRPCStopTimeout time.Duration `flag:"control-rpc-stop-timeout"`
 }
 
 func (c *Config) validate() error {

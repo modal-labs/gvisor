@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -112,6 +113,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(RestoreSpecValidationEnforce.Ptr(), "restore-spec-validation", "how to handle spec validation during restore.")
 	flagSet.Bool("systrap-disable-syscall-patching", false, "disables syscall patching when using the Systrap platform. May be necessary to use in case the workload uses the GS register, or uses ptrace within gVisor. Has significant performance implications and is only recommended when the sandbox is known to run otherwise-incompatible workloads. Only relevant for x86.")
 	flagSet.Bool("allow-suid", false, "allows ID elevation when executing binaries with the SUID/SGID bits set. The OCI --no-new-privileges flag continues to prevent ID elevation even when this flag is true.")
+	flagSet.Duration("control-rpc-stop-timeout", 15*time.Second, "grace period given to in-flight RPCs on the sandbox control socket when the sandbox is shutting down. Once this timeout elapses, client connections are closed, and connections still processing an RPC are closed when their current RPC finishes. Set to 0 to close idle clients immediately.")
 
 	// Flags that control sandbox runtime behavior: MM related.
 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")
