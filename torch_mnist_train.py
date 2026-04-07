@@ -27,8 +27,6 @@ NIC_MAP = {
 
 def setup():
     local_rank = int(os.environ["LOCAL_RANK"])
-    if local_rank in NIC_MAP:
-        os.environ["NCCL_IB_HCA"] = NIC_MAP[local_rank]
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
     return local_rank
