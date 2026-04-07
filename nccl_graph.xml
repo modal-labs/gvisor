@@ -1,117 +1,108 @@
 <graphs version="1">
-  <!-- Ring graph: 8 channels using all 8 400G NICs -->
-  <!-- Net dev IDs match original nccl_topo.xml: 5-8 (NUMA0), 9-12 (NUMA1) -->
-  <!-- Hex: 5,6,7,8 (NUMA0), 9,a,b,c (NUMA1) -->
+  <!-- Ring graph: 8 channels using all 8 400G NICs (merge disabled) -->
+  <!-- Net dev 0-3 = mlx5_5-8 (NUMA0, PHB to GPU 0-3) -->
+  <!-- Net dev 4-7 = mlx5_9-12 (NUMA1, PHB to GPU 4-7) -->
   <graph id="0" pattern="4" crossnic="0" nchannels="8" speedintra="160.0" speedinter="48.0" typeintra="NVL" typeinter="PHB" samechannels="0">
-    <!-- Channel 0: net 5 (mlx5_5, NUMA0), GPU0 at boundary -->
+    <channel>
+      <net dev="0"/>
+      <gpu dev="0"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x5"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x7"/>
+      <net dev="0"/>
+    </channel>
+    <channel>
+      <net dev="1"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x5"/>
+      <gpu dev="0x4"/>
+      <net dev="1"/>
+    </channel>
+    <channel>
+      <net dev="2"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x5"/>
+      <net dev="2"/>
+    </channel>
+    <channel>
+      <net dev="3"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x5"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0x6"/>
+      <net dev="3"/>
+    </channel>
+    <channel>
+      <net dev="4"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x5"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x3"/>
+      <net dev="4"/>
+    </channel>
     <channel>
       <net dev="5"/>
-      <gpu dev="0"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0x4"/>
       <gpu dev="0x5"/>
       <gpu dev="0x6"/>
       <gpu dev="0x7"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0"/>
       <net dev="5"/>
     </channel>
-    <!-- Channel 1: net 6 (mlx5_6, NUMA0), GPU1 at boundary -->
     <channel>
       <net dev="6"/>
-      <gpu dev="0x1"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x5"/>
       <gpu dev="0x2"/>
       <gpu dev="0x3"/>
       <gpu dev="0"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x4"/>
+      <gpu dev="0x1"/>
       <net dev="6"/>
     </channel>
-    <!-- Channel 2: net 7 (mlx5_7, NUMA0), GPU2 at boundary -->
     <channel>
       <net dev="7"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0x6"/>
       <gpu dev="0x7"/>
       <gpu dev="0x4"/>
       <gpu dev="0x5"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0x2"/>
       <net dev="7"/>
-    </channel>
-    <!-- Channel 3: net 8 (mlx5_8, NUMA0), GPU3 at boundary -->
-    <channel>
-      <net dev="8"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x6"/>
-      <net dev="8"/>
-    </channel>
-    <!-- Channel 4: net 9 (mlx5_9, NUMA1), GPU4 at boundary -->
-    <channel>
-      <net dev="9"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x3"/>
-      <net dev="9"/>
-    </channel>
-    <!-- Channel 5: net 10/0xa (mlx5_10, NUMA1), GPU5 at boundary -->
-    <channel>
-      <net dev="a"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0"/>
-      <net dev="a"/>
-    </channel>
-    <!-- Channel 6: net 11/0xb (mlx5_11, NUMA1), GPU6 at boundary -->
-    <channel>
-      <net dev="b"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0"/>
-      <gpu dev="0x1"/>
-      <net dev="b"/>
-    </channel>
-    <!-- Channel 7: net 12/0xc (mlx5_12, NUMA1), GPU7 at boundary -->
-    <channel>
-      <net dev="c"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0x2"/>
-      <net dev="c"/>
     </channel>
   </graph>
-  <!-- Tree graph with same 8 NICs -->
   <graph id="1" pattern="1" crossnic="0" nchannels="8" speedintra="160.0" speedinter="48.0" typeintra="NVL" typeinter="PHB" samechannels="0">
     <channel>
-      <net dev="5"/>
+      <net dev="0"/>
       <gpu dev="0"/>
       <gpu dev="0x1"/>
       <gpu dev="0x2"/>
@@ -120,91 +111,91 @@
       <gpu dev="0x5"/>
       <gpu dev="0x6"/>
       <gpu dev="0x7"/>
+      <net dev="0"/>
+    </channel>
+    <channel>
+      <net dev="1"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x5"/>
+      <gpu dev="0x4"/>
+      <net dev="1"/>
+    </channel>
+    <channel>
+      <net dev="2"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x5"/>
+      <net dev="2"/>
+    </channel>
+    <channel>
+      <net dev="3"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x5"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0x6"/>
+      <net dev="3"/>
+    </channel>
+    <channel>
+      <net dev="4"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x5"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x3"/>
+      <net dev="4"/>
+    </channel>
+    <channel>
+      <net dev="5"/>
+      <gpu dev="0x5"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0x2"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0"/>
       <net dev="5"/>
     </channel>
     <channel>
       <net dev="6"/>
-      <gpu dev="0x1"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x7"/>
+      <gpu dev="0x4"/>
+      <gpu dev="0x5"/>
       <gpu dev="0x2"/>
       <gpu dev="0x3"/>
       <gpu dev="0"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x4"/>
+      <gpu dev="0x1"/>
       <net dev="6"/>
     </channel>
     <channel>
       <net dev="7"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0x6"/>
       <gpu dev="0x7"/>
       <gpu dev="0x4"/>
       <gpu dev="0x5"/>
+      <gpu dev="0x6"/>
+      <gpu dev="0x1"/>
+      <gpu dev="0"/>
+      <gpu dev="0x3"/>
+      <gpu dev="0x2"/>
       <net dev="7"/>
-    </channel>
-    <channel>
-      <net dev="8"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x6"/>
-      <net dev="8"/>
-    </channel>
-    <channel>
-      <net dev="9"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x3"/>
-      <net dev="9"/>
-    </channel>
-    <channel>
-      <net dev="a"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0"/>
-      <net dev="a"/>
-    </channel>
-    <channel>
-      <net dev="b"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x2"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0"/>
-      <gpu dev="0x1"/>
-      <net dev="b"/>
-    </channel>
-    <channel>
-      <net dev="c"/>
-      <gpu dev="0x7"/>
-      <gpu dev="0x4"/>
-      <gpu dev="0x5"/>
-      <gpu dev="0x6"/>
-      <gpu dev="0x1"/>
-      <gpu dev="0"/>
-      <gpu dev="0x3"/>
-      <gpu dev="0x2"/>
-      <net dev="c"/>
     </channel>
   </graph>
 </graphs>
