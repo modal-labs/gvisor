@@ -164,15 +164,15 @@ func (c *cgroupV2) Install(res *specs.LinuxResources) error {
 				return fmt.Errorf("mandatory cgroup controller %q is missing for %q", controllerName, c.MakePath(""))
 			}
 		}
-		// Override any values set above with the unified resource, if set.
-		if res != nil {
-			for k, v := range res.Unified {
-				if strings.Contains(k, "/") {
-					return fmt.Errorf("unified resource %q must be a file name (no slashes)", k)
-				}
-				if err := setValue(c.MakePath(""), k, v); err != nil {
-					return fmt.Errorf("unable to set unified resource %q: %w", k, err)
-				}
+	}
+	// Override any values set above with the unified resource, if set.
+	if res != nil {
+		for k, v := range res.Unified {
+			if strings.Contains(k, "/") {
+				return fmt.Errorf("unified resource %q must be a file name (no slashes)", k)
+			}
+			if err := setValue(c.MakePath(""), k, v); err != nil {
+				return fmt.Errorf("unable to set unified resource %q: %w", k, err)
 			}
 		}
 	}
