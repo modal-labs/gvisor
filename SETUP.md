@@ -160,9 +160,11 @@ sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
   -v $HOME/.local/lib/python3.10/site-packages:/usr/local/lib/python3.10/dist-packages \
   -v $HOME/.local/bin:/usr/local/bin \
   -v $HOME/gvisor:/workspace \
+  -v /tmp/nccl_topo.xml:/topo.xml:ro \
   -e NCCL_DEBUG=INFO \
-  -e NCCL_NET_GDR_LEVEL=3 \
-  -e NCCL_DMABUF_ENABLE=1 \
+  -e NCCL_NET_GDR_LEVEL=0 \
+  -e NCCL_DMABUF_ENABLE=0 \
+  -e NCCL_TOPO_FILE=/topo.xml \
   -e NCCL_SOCKET_IFNAME=eth0 \
   -e GLOO_SOCKET_IFNAME=eth0 \
   -e NCCL_IB_HCA=$NCCL_IB_HCA \
@@ -174,10 +176,12 @@ sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
     --node_rank=0 ./torch_mnist_train.py
 ```
 
-**Note:** gVisor's rdmaproxy intercepts IB verbs at the device level. When
-`libibverbs.so` is also present in the container, NCCL may attempt native IB
-alongside the proxy, causing conflicts (0 nvls channels, 2 coll channels).
-This interaction is under investigation.
+**Important:** Use `NCCL_NET_GDR_LEVEL=0` with gVisor. GPUDirect RDMA (GDR=3)
+is not yet supported because GPU device memory VAs have no VMA in the sentry's
+address space. With GDR=0 (CPU-staged), expect ~90 GB/s busbw (vs ~386 bare metal).
+
+Also requires `NCCL_TOPO_FILE` pointing to a topo XML generated on bare metal
+(gVisor hides PCI topology from the container).
 
 ## 7. Verify RDMA with port counters
 
