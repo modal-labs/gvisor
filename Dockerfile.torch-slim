@@ -1,0 +1,28 @@
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-distutils \
+    libibverbs1 ibverbs-providers libnl-3-200 libnl-route-3-200 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Mount host torch at runtime:
+#   -v /home/modal/.local/lib/python3.10/site-packages:/usr/local/lib/python3.10/dist-packages
+#   -v /home/modal/.local/bin:/usr/local/bin
+#
+# Example runc (full speed, GDR enabled):
+#   DEVS=$(ls /dev/infiniband/uverbs* | sed 's/^/--device=/' | tr '\n' ' ')
+#   sudo docker run --runtime=runc --rm --gpus all $DEVS \
+#     --ulimit memlock=-1:-1 --shm-size=1g --network=host \
+#     -v /home/modal/.local/lib/python3.10/site-packages:/usr/local/lib/python3.10/dist-packages \
+#     -v /home/modal/.local/bin:/usr/local/bin \
+#     -v /home/modal/gvisor:/workspace \
+#     -e NCCL_DEBUG=INFO -e NCCL_NET_GDR_LEVEL=3 -e NCCL_DMABUF_ENABLE=1 \
+#     -e NCCL_SOCKET_IFNAME=eth0 -e GLOO_SOCKET_IFNAME=eth0 \
+#     -e NCCL_IB_HCA=mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12 \
+#     -e OMP_NUM_THREADS=1 -w /workspace \
+#     torch-slim torchrun ...
+#
+# Prerequisites on host:
+#   - sudo systemctl set-property modal-containers.slice AllowedCPUs=0-111
+#   - cgroup-parent=modal-containers.slice in /etc/docker/daemon.json
+#   - sudo modprobe nvidia_peermem
