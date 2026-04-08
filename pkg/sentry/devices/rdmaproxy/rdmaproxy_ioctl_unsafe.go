@@ -969,12 +969,31 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
 }
 
-// mirrorGPUDeviceMemory is a placeholder for future GPU device memory
-// resolution. Currently returns an error, causing fallback to raw
-// VA passthrough. The passthrough works when nvidia-peermem can
-// resolve the GPU VA via the nvidia driver's p2p interface.
+// mirrorGPUDeviceMemory creates a PROT_NONE anonymous VMA in the sentry's
+// address space at the GPU VA. On bare metal, cuMemAlloc creates the GPU VA
+// inside a large PROT_NONE anonymous reservation. nvidia-peermem needs
+// find_vma() to succeed on the VA before it can call nvidia_p2p_get_pages()
+// to resolve the GPU physical pages. In gVisor, nvproxy doesn't create this
+// reservation, so we create it here before ibv_reg_mr.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	return nil, 0, fmt.Errorf("GPU device memory mirroring not yet implemented")
+	// Create a PROT_NONE anonymous mapping at the exact GPU VA.
+	// MAP_FIXED places it at the GPU address. PROT_NONE is sufficient —
+	// nvidia-peermem only needs find_vma() to succeed, then it uses
+	// nvidia_p2p_get_pages() to get the actual GPU physical pages.
+	m, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
+		uintptr(alignedStart), uintptr(alignedLen),
+		unix.PROT_NONE,
+		unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_FIXED,
+		^uintptr(0), 0)
+	if errno != 0 {
+		return nil, 0, fmt.Errorf("mmap PROT_NONE at GPU VA %#x len %d: %w", alignedStart, alignedLen, errno)
+	}
+
+	log.Infof("rdmaproxy: created PROT_NONE VMA for GPU device memory %#x-%#x → sentry %#x",
+		alignedStart, uint64(alignedStart)+alignedLen, m)
+
+	sentryVA := m + uintptr(addr-uint64(alignedStart))
+	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after
