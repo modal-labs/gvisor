@@ -443,15 +443,26 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 
 	// Rewrite inline FD attrs that reference proxied async event FDs.
 	// The application sees sentry FD numbers, but the host kernel needs
-	// the original host FDs (e.g. CQ CREATE's EVENT_FD attr).
-	// Resolve each sandbox FD through the task's FD table to find the
-	// asyncEventFD and extract its hostFD. This is per-task safe and
-	// handles FD number recycling across different sandbox processes.
+	// the original host FDs (e.g. CQ CREATE's comp channel attr).
+	//
+	// IMPORTANT: Only rewrite attrs with known FD attr IDs. Other inline
+	// attrs carry kernel object handles (PD, CQ, QP handles) that have
+	// small numeric values which could collide with sandbox FD numbers.
+	// Rewriting those would corrupt the handles (e.g., PD handle 92 →
+	// host FD 3480 → ibv_create_qp ENOENT).
+	const (
+		uverbsAttrCQCompChannel = 0x0007 // CQ CREATE comp channel FD
+		uverbsAttrQPEventFD     = 0x000c // QP CREATE event FD
+	)
 	for i := 0; i < int(numAttrs); i++ {
 		off := ibUverbsIoctlHdrSize + i*ibUverbsAttrSize
 		attrID := binary.LittleEndian.Uint16(buf[off : off+2])
 		attrLen := binary.LittleEndian.Uint16(buf[off+2 : off+4])
 		if attrLen != 0 {
+			continue
+		}
+		// Only rewrite known FD attrs, not handles.
+		if attrID != uverbsAttrCQCompChannel && attrID != uverbsAttrQPEventFD {
 			continue
 		}
 		sentryVal := int32(binary.LittleEndian.Uint64(buf[off+8 : off+16]))
