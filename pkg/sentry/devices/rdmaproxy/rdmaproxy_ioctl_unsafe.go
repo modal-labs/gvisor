@@ -240,9 +240,10 @@ const (
 
 // UVERBS method IDs.
 const (
-	uverbsMethodInvokeWrite = 0  // DEVICE object
-	uverbsMethodMRDestroy   = 1  // MR object
-	uverbsMethodRegMR       = 5  // MR object (modern path)
+	uverbsMethodInvokeWrite  = 0 // DEVICE object
+	uverbsMethodMRDestroy    = 1 // MR object
+	uverbsMethodRegDMABufMR  = 4 // MR object (DMABUF path — not supported through proxy)
+	uverbsMethodRegMR        = 5 // MR object (modern path)
 	uverbsMethodCoreCreate  = 64 // UVERBS_API_METHOD_KEY_NUM_CORE — CREATE for CQ, QP, etc.
 )
 
@@ -468,6 +469,16 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 		file.DecRef(t)
 	}
 
+	// Reject DMABUF MR_REG (method 4) with EOPNOTSUPP. NCCL probes DMABUF
+	// support by calling this with fd=-1. If forwarded, the kernel returns
+	// EBADF which NCCL treats as a fatal error in multi-process setups.
+	// Returning EOPNOTSUPP tells NCCL cleanly that DMABUF is not available,
+	// so it falls back to standard MR_REG (method 5) via nvidia_peermem.
+	if objectID == uverbsObjectMR && methodID == uverbsMethodRegDMABufMR {
+		log.Debugf("rdmaproxy: rejecting DMABUF MR_REG (method=%d) with EOPNOTSUPP on hostFD=%d", methodID, fd.hostFD)
+		return 0, linuxerr.EOPNOTSUPP
+	}
+
 	// Classify and prepare DMA page mirroring before forwarding.
 	action, writeCmdVal := fd.classifyIoctl(buf, int(numAttrs), objectID, methodID)
 
@@ -501,11 +512,6 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 	}
 
 	log.Debugf("rdmaproxy: forwarding ioctl to host (hostFD=%d, %d rewrites, action=%d)", fd.hostFD, len(rewrites), action)
-
-	// Validate hostFD before forwarding — diagnose stale FD races.
-	if _, _, verifyErr := unix.RawSyscall(unix.SYS_FCNTL, uintptr(fd.hostFD), unix.F_GETFD, 0); verifyErr != 0 {
-		log.Warningf("rdmaproxy: STALE hostFD=%d (F_GETFD errno=%d) obj=0x%04x method=%d — FD was closed externally", fd.hostFD, verifyErr, objectID, methodID)
-	}
 
 	var n uintptr
 	var errno unix.Errno
