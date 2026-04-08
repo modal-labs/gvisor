@@ -970,31 +970,17 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
 }
 
-// mirrorGPUDeviceMemory creates a PROT_NONE anonymous VMA in the sentry's
-// address space at the GPU VA. On bare metal, cuMemAlloc creates the GPU VA
-// inside a large PROT_NONE anonymous reservation. nvidia-peermem needs
-// find_vma() to succeed on the VA before it can call nvidia_p2p_get_pages()
-// to resolve the GPU physical pages. In gVisor, nvproxy doesn't create this
-// reservation, so we create it here before ibv_reg_mr.
+// mirrorGPUDeviceMemory attempts to create a mapping for GPU device memory.
+// GPU VAs from cuMemAlloc have no VMA in the sentry — they only exist in
+// the nvidia driver's internal allocation tables. nvidia-peermem needs the
+// nvidia UVM driver to have registered the VA range via its p2p interface,
+// which requires proper UVM allocation flow (not just a VMA).
+//
+// TODO: Integrate with nvproxy to replicate the nvidia UVM VA registration
+// that happens on bare metal. Until then, GDR_LEVEL=0 (CPU-staged RDMA)
+// must be used for multi-node NCCL.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	// Create a PROT_NONE anonymous mapping at the exact GPU VA.
-	// MAP_FIXED places it at the GPU address. PROT_NONE is sufficient —
-	// nvidia-peermem only needs find_vma() to succeed, then it uses
-	// nvidia_p2p_get_pages() to get the actual GPU physical pages.
-	m, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
-		uintptr(alignedStart), uintptr(alignedLen),
-		unix.PROT_NONE,
-		unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_FIXED,
-		^uintptr(0), 0)
-	if errno != 0 {
-		return nil, 0, fmt.Errorf("mmap PROT_NONE at GPU VA %#x len %d: %w", alignedStart, alignedLen, errno)
-	}
-
-	log.Infof("rdmaproxy: created PROT_NONE VMA for GPU device memory %#x-%#x → sentry %#x",
-		alignedStart, uint64(alignedStart)+alignedLen, m)
-
-	sentryVA := m + uintptr(addr-uint64(alignedStart))
-	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
+	return nil, 0, fmt.Errorf("GPU device memory VA %#x not registered with nvidia UVM for p2p", addr)
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after
