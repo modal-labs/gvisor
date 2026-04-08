@@ -501,6 +501,11 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 
 	log.Debugf("rdmaproxy: forwarding ioctl to host (hostFD=%d, %d rewrites, action=%d)", fd.hostFD, len(rewrites), action)
 
+	// Validate hostFD before forwarding — diagnose stale FD races.
+	if _, _, verifyErr := unix.RawSyscall(unix.SYS_FCNTL, uintptr(fd.hostFD), unix.F_GETFD, 0); verifyErr != 0 {
+		log.Warningf("rdmaproxy: STALE hostFD=%d (F_GETFD errno=%d) obj=0x%04x method=%d — FD was closed externally", fd.hostFD, verifyErr, objectID, methodID)
+	}
+
 	var n uintptr
 	var errno unix.Errno
 	if ioctlNeedsHostNetns(action, objectID, writeCmdVal) {

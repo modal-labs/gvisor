@@ -184,7 +184,13 @@ func (fd *uverbsFD) Release(ctx context.Context) {
 	fd.pinnedQPs = nil
 	fd.mu.Unlock()
 
-	log.Infof("rdmaproxy: closing hostFD=%d", fd.hostFD)
+	// Verify the FD is still valid before closing — detect if something
+	// else already closed it (stale FD race diagnosis).
+	if _, _, verifyErr := unix.RawSyscall(unix.SYS_FCNTL, uintptr(fd.hostFD), unix.F_GETFD, 0); verifyErr != 0 {
+		log.Warningf("rdmaproxy: closing hostFD=%d but F_GETFD says errno=%d — ALREADY CLOSED externally!", fd.hostFD, verifyErr)
+	} else {
+		log.Infof("rdmaproxy: closing hostFD=%d (verified valid)", fd.hostFD)
+	}
 	fdnotifier.RemoveFD(fd.hostFD)
 	unix.Close(int(fd.hostFD))
 }
