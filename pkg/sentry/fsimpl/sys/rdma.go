@@ -61,6 +61,18 @@ type RDMADeviceData struct {
 	Modalias   string         `json:"modalias"`
 	Ports      []RDMAPortData `json:"ports"`
 
+	// PCI device attributes from /sys/class/infiniband/<ibdev>/device/.
+	// NCCL reads these (especially PCI_SLOT_NAME from uevent) to match
+	// NIC PCI bus IDs against GPU bus IDs in the topology XML.
+	PCISlotName     string `json:"pci_slot_name,omitempty"`
+	PCIClass        string `json:"pci_class,omitempty"`
+	PCIVendor       string `json:"pci_vendor,omitempty"`
+	PCIDevice       string `json:"pci_device,omitempty"`
+	PCISubsysVendor string `json:"pci_subsys_vendor,omitempty"`
+	PCISubsysDevice string `json:"pci_subsys_device,omitempty"`
+	NUMANode        string `json:"numa_node,omitempty"`
+	LocalCPUList    string `json:"local_cpulist,omitempty"`
+
 	// DynMajor is the sentry-assigned dynamic major for this device.
 	// Set at runtime during device registration, not serialized.
 	DynMajor uint32 `json:"-"`
@@ -113,19 +125,28 @@ func CollectRDMADeviceData() *RDMAData {
 			continue
 		}
 		ibDir := path.Join("/sys/class/infiniband", ibdev)
+		deviceDir := path.Join(ibDir, "device")
 		dev := RDMADeviceData{
-			Name:       dent.Name(),
-			IBDev:      ibdev,
-			ABIVersion: readSysfsFile(path.Join(devDir, "abi_version")),
-			Dev:        readSysfsFile(path.Join(devDir, "dev")),
-			NodeType:   readSysfsFile(path.Join(ibDir, "node_type")),
-			NodeGUID:   readSysfsFile(path.Join(ibDir, "node_guid")),
-			SysImgGUID: readSysfsFile(path.Join(ibDir, "sys_image_guid")),
-			FWVer:      readSysfsFile(path.Join(ibDir, "fw_ver")),
-			Modalias:   readSysfsFile(path.Join(ibDir, "device", "modalias")),
+			Name:            dent.Name(),
+			IBDev:           ibdev,
+			ABIVersion:      readSysfsFile(path.Join(devDir, "abi_version")),
+			Dev:             readSysfsFile(path.Join(devDir, "dev")),
+			NodeType:        readSysfsFile(path.Join(ibDir, "node_type")),
+			NodeGUID:        readSysfsFile(path.Join(ibDir, "node_guid")),
+			SysImgGUID:      readSysfsFile(path.Join(ibDir, "sys_image_guid")),
+			FWVer:           readSysfsFile(path.Join(ibDir, "fw_ver")),
+			Modalias:        readSysfsFile(path.Join(deviceDir, "modalias")),
+			PCISlotName:     parsePCISlotName(path.Join(deviceDir, "uevent")),
+			PCIClass:        readSysfsFile(path.Join(deviceDir, "class")),
+			PCIVendor:       readSysfsFile(path.Join(deviceDir, "vendor")),
+			PCIDevice:       readSysfsFile(path.Join(deviceDir, "device")),
+			PCISubsysVendor: readSysfsFile(path.Join(deviceDir, "subsystem_vendor")),
+			PCISubsysDevice: readSysfsFile(path.Join(deviceDir, "subsystem_device")),
+			NUMANode:        readSysfsFile(path.Join(deviceDir, "numa_node")),
+			LocalCPUList:    readSysfsFile(path.Join(deviceDir, "local_cpulist")),
 		}
-		log.Infof("rdma collect: %s → ibdev=%s dev=%s node_type=%q fw_ver=%q",
-			dent.Name(), ibdev, dev.Dev, dev.NodeType, dev.FWVer)
+		log.Infof("rdma collect: %s → ibdev=%s dev=%s node_type=%q fw_ver=%q pci=%s numa=%s",
+			dent.Name(), ibdev, dev.Dev, dev.NodeType, dev.FWVer, dev.PCISlotName, dev.NUMANode)
 		portsPath := path.Join(ibDir, "ports")
 		portDents, err := os.ReadDir(portsPath)
 		if err == nil {
@@ -244,6 +265,21 @@ func inferRoCEType(gidIndex string) string {
 	return "RoCE v2"
 }
 
+// parsePCISlotName reads a uevent file and extracts the PCI_SLOT_NAME value.
+// Returns empty string if the file doesn't exist or has no PCI_SLOT_NAME line.
+func parsePCISlotName(ueventPath string) string {
+	data, err := os.ReadFile(ueventPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "PCI_SLOT_NAME=") {
+			return strings.TrimPrefix(line, "PCI_SLOT_NAME=")
+		}
+	}
+	return ""
+}
+
 func readSysfsFile(filePath string) string {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -296,10 +332,39 @@ func (fs *filesystem) newRDMASysfsEntries(ctx context.Context, creds *auth.Crede
 		addFile(ibDevEntries, "node_guid", dev.NodeGUID)
 		addFile(ibDevEntries, "sys_image_guid", dev.SysImgGUID)
 		addFile(ibDevEntries, "fw_ver", dev.FWVer)
-		if dev.Modalias != "" {
-			ibDevEntries["device"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
-				"modalias": fs.newStaticFile(ctx, creds, defaultSysMode, dev.Modalias+"\n"),
-			})
+		// Build the device/ subdirectory with PCI attributes.
+		// NCCL reads uevent for PCI_SLOT_NAME to match NICs against
+		// the topology XML, and class/vendor/device for PCI matching.
+		deviceEntries := map[string]kernfs.Inode{}
+		addFile(deviceEntries, "modalias", dev.Modalias)
+		addFile(deviceEntries, "class", dev.PCIClass)
+		addFile(deviceEntries, "vendor", dev.PCIVendor)
+		addFile(deviceEntries, "device", dev.PCIDevice)
+		addFile(deviceEntries, "subsystem_vendor", dev.PCISubsysVendor)
+		addFile(deviceEntries, "subsystem_device", dev.PCISubsysDevice)
+		addFile(deviceEntries, "numa_node", dev.NUMANode)
+		addFile(deviceEntries, "local_cpulist", dev.LocalCPUList)
+		if dev.PCISlotName != "" {
+			// Reconstruct the uevent file from collected fields.
+			uevent := "DRIVER=mlx5_core\n"
+			if dev.PCIClass != "" {
+				uevent += "PCI_CLASS=" + strings.TrimPrefix(dev.PCIClass, "0x") + "\n"
+			}
+			if dev.PCIVendor != "" && dev.PCIDevice != "" {
+				uevent += "PCI_ID=" + strings.TrimPrefix(strings.ToUpper(dev.PCIVendor), "0X") + ":" + strings.TrimPrefix(strings.ToUpper(dev.PCIDevice), "0X") + "\n"
+			}
+			if dev.PCISubsysVendor != "" && dev.PCISubsysDevice != "" {
+				uevent += "PCI_SUBSYS_ID=" + strings.TrimPrefix(strings.ToUpper(dev.PCISubsysVendor), "0X") + ":" + strings.TrimPrefix(strings.ToUpper(dev.PCISubsysDevice), "0X") + "\n"
+			}
+			uevent += "PCI_SLOT_NAME=" + dev.PCISlotName + "\n"
+			if dev.Modalias != "" {
+				uevent += "MODALIAS=" + dev.Modalias + "\n"
+			}
+			deviceEntries["uevent"] = fs.newStaticFile(ctx, creds, defaultSysMode, uevent)
+			log.Infof("rdma sysfs: %s device/uevent: PCI_SLOT_NAME=%s", dev.IBDev, dev.PCISlotName)
+		}
+		if len(deviceEntries) > 0 {
+			ibDevEntries["device"] = fs.newDir(ctx, creds, defaultSysDirMode, deviceEntries)
 		}
 		if len(dev.Ports) > 0 {
 			portsDir := map[string]kernfs.Inode{}
