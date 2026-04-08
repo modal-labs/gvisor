@@ -246,14 +246,9 @@ func MayRegisterDevicePath(path string) bool {
 // ErrNotUverbsDevice is returned when the device path doesn't match.
 var ErrNotUverbsDevice = linuxerr.ENODEV
 
-// globalAsyncFDs maps sandbox FD → host FD for all proxied async event FDs.
-// Used to rewrite inline FD attrs in subsequent ioctls (e.g. CQ CREATE's
-// EVENT_FD attr) before forwarding to the host kernel. Global because the
-// application may reference an async event FD from any device context.
-var (
-	globalAsyncFDsMu sync.Mutex
-	globalAsyncFDs   = make(map[int32]int32)
-)
+// Async event FD rewriting is done per-task by resolving sandbox FDs
+// through the task's FD table at ioctl time (see handleRDMAVerbsIoctl).
+// This correctly handles FD number recycling across sandbox processes.
 
 // asyncEventFD wraps a host FD for RDMA async event delivery.
 // The kernel creates this FD via UVERBS_METHOD_ASYNC_EVENT_ALLOC;

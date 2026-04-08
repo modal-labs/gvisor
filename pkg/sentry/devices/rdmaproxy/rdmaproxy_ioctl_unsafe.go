@@ -443,28 +443,29 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 	// Rewrite inline FD attrs that reference proxied async event FDs.
 	// The application sees sentry FD numbers, but the host kernel needs
 	// the original host FDs (e.g. CQ CREATE's EVENT_FD attr).
-	// Log every rewrite at WARNING level to identify which attrs need
-	// translation (temporary diagnostic).
-	globalAsyncFDsMu.Lock()
-	hasAsyncFDs := len(globalAsyncFDs) > 0
-	globalAsyncFDsMu.Unlock()
-	if hasAsyncFDs {
-		for i := 0; i < int(numAttrs); i++ {
-			off := ibUverbsIoctlHdrSize + i*ibUverbsAttrSize
-			attrID := binary.LittleEndian.Uint16(buf[off : off+2])
-			attrLen := binary.LittleEndian.Uint16(buf[off+2 : off+4])
-			if attrLen != 0 {
-				continue
-			}
-			sentryVal := int32(binary.LittleEndian.Uint64(buf[off+8 : off+16]))
-			globalAsyncFDsMu.Lock()
-			hostVal, ok := globalAsyncFDs[sentryVal]
-			globalAsyncFDsMu.Unlock()
-			if ok {
-				binary.LittleEndian.PutUint64(buf[off+8:off+16], uint64(hostVal))
-				log.Warningf("rdmaproxy: REWRITE obj=0x%04x method=%d attr[%d] id=0x%04x sentry=%d → host=%d", objectID, methodID, i, attrID, sentryVal, hostVal)
-			}
+	// Resolve each sandbox FD through the task's FD table to find the
+	// asyncEventFD and extract its hostFD. This is per-task safe and
+	// handles FD number recycling across different sandbox processes.
+	for i := 0; i < int(numAttrs); i++ {
+		off := ibUverbsIoctlHdrSize + i*ibUverbsAttrSize
+		attrID := binary.LittleEndian.Uint16(buf[off : off+2])
+		attrLen := binary.LittleEndian.Uint16(buf[off+2 : off+4])
+		if attrLen != 0 {
+			continue
 		}
+		sentryVal := int32(binary.LittleEndian.Uint64(buf[off+8 : off+16]))
+		if sentryVal <= 0 {
+			continue
+		}
+		file, _ := t.FDTable().Get(sentryVal)
+		if file == nil {
+			continue
+		}
+		if afd, ok := file.Impl().(*asyncEventFD); ok {
+			binary.LittleEndian.PutUint64(buf[off+8:off+16], uint64(afd.hostFD))
+			log.Debugf("rdmaproxy: REWRITE obj=0x%04x method=%d attr[%d] id=0x%04x sentry=%d → host=%d (via task FD table)", objectID, methodID, i, attrID, sentryVal, afd.hostFD)
+		}
+		file.DecRef(t)
 	}
 
 	// Classify and prepare DMA page mirroring before forwarding.
@@ -1116,9 +1117,8 @@ func (fd *uverbsFD) proxyAsyncEventFD(t *kernel.Task, buf []byte, numAttrs int) 
 			unix.Close(hostFD)
 			return -1, fmt.Errorf("newAsyncEventFD: %w", err)
 		}
-		globalAsyncFDsMu.Lock()
-		globalAsyncFDs[sentryFD] = int32(hostFD)
-		globalAsyncFDsMu.Unlock()
+		// No global map needed — the FD rewrite loop now resolves
+		// sandbox FDs through the task's FD table at ioctl time.
 		binary.LittleEndian.PutUint64(buf[off+8:off+16], uint64(sentryFD))
 		return sentryFD, nil
 	}
