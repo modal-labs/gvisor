@@ -970,17 +970,36 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
 }
 
-// mirrorGPUDeviceMemory attempts to create a VMA for GPU device memory
-// so nvidia-peermem can resolve it for RDMA. Creating a PROT_NONE VMA
-// allows find_vma() to succeed, but nvidia_p2p_get_pages() returns EIO
-// because the nvidia driver's p2p tables don't have this VA registered
-// for the sentry's process. Full GDR support requires nvproxy to register
-// GPU allocations with the nvidia p2p interface.
-//
-// For now, return error to fall through to raw VA passthrough.
-// Use NCCL_NET_GDR_LEVEL=0 for working multi-node RDMA (~90 GB/s).
+// mirrorGPUDeviceMemory creates a VMA backed by /dev/nvidiactl in the sentry's
+// address space at the GPU VA. nvidia-peermem requires the VMA to have
+// nvidia's vm_ops (attached by the nvidia driver's mmap handler) so that
+// nvidia_p2p_get_pages() can resolve the GPU physical pages. A plain
+// anonymous PROT_NONE VMA is not sufficient — it returns EIO.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	return nil, 0, fmt.Errorf("GPU device memory p2p not registered for VA %#x (use GDR_LEVEL=0)", addr)
+	// Open /dev/nvidiactl to get nvidia vm_ops on the VMA.
+	nvctlFD, err := unix.Open("/dev/nvidiactl", unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, 0, fmt.Errorf("open /dev/nvidiactl: %w", err)
+	}
+
+	// mmap through nvidiactl with PROT_NONE at the GPU VA.
+	// The nvidia driver's mmap handler attaches its vm_ops to the VMA,
+	// which nvidia-peermem uses to identify nvidia memory regions.
+	m, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
+		uintptr(alignedStart), uintptr(alignedLen),
+		unix.PROT_NONE,
+		unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
+		uintptr(nvctlFD), 0)
+	unix.Close(nvctlFD)
+	if errno != 0 {
+		return nil, 0, fmt.Errorf("mmap via nvidiactl at GPU VA %#x len %d: %w", alignedStart, alignedLen, errno)
+	}
+
+	log.Infof("rdmaproxy: created nvidia-backed VMA for GPU device memory %#x-%#x → sentry %#x",
+		alignedStart, uint64(alignedStart)+alignedLen, m)
+
+	sentryVA := m + uintptr(addr-uint64(alignedStart))
+	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after
