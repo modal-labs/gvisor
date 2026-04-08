@@ -46,6 +46,7 @@ NCCL_TOPO_FILE=/home/modal/gvisor/nccl_topo.xml \
 NCCL_SOCKET_IFNAME=ens7 \
 GLOO_SOCKET_IFNAME=ens7 \
 NCCL_IB_HCA=mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12 \
+NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo.xml \
 OMP_NUM_THREADS=1 \
 torchrun --nproc_per_node=8 --nnodes=2 \
 --master_addr="$MASTER_ADDR" --master_port=29500 \
