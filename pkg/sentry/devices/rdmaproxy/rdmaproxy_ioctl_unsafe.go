@@ -787,7 +787,11 @@ func (fd *uverbsFD) prepareMRRegModern(t *kernel.Task, buf []byte, numAttrs int,
 	lengthRW := findRewrite(buf, numAttrs, rewrites, uverbsAttrRegMRLength)
 	if addrRW == nil || lengthRW == nil {
 		// ADDR and LENGTH might be inline for small values.
-		log.Warningf("rdmaproxy: MR REG (modern) ADDR or LENGTH attr not found as pointer")
+		// Try reading them as inline values from the raw buffer.
+		addrInline := findInlineAttr(buf, numAttrs, uverbsAttrRegMRAddr)
+		lengthInline := findInlineAttr(buf, numAttrs, uverbsAttrRegMRLength)
+		log.Warningf("rdmaproxy: MR REG (modern) ADDR/LENGTH not rewritten (addrRW=%v lenRW=%v inline addr=%#x len=%d) — forwarding without mirroring",
+			addrRW != nil, lengthRW != nil, addrInline, lengthInline)
 		return nil, nil
 	}
 	if len(addrRW.sentry) < 8 || len(lengthRW.sentry) < 8 {
