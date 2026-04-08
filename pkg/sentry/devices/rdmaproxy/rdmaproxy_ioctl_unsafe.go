@@ -847,13 +847,15 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 		if err != nil {
 			// Neither Pin nor InternalMappings resolved the VA. This
 			// happens for GPU device memory (cuMemAlloc) which has no
-			// CPU VMA -- the NVIDIA driver tracks it internally.
-			// Pass the VA through unmirrored: the host kernel's
-			// nvidia-peermem module resolves GPU VAs via the driver's
-			// internal tables, not process page tables. This works
-			// because the sentry holds the NVIDIA driver context.
-			log.Debugf("rdmaproxy: proxy device fallback failed (%v), GPU VA passthrough (nvidia-peermem)", err)
-			return nil, uintptr(addr), nil
+			// CPU VMA. nvidia-peermem needs a VMA to pin the pages.
+			// Create one by mmapping the nvidia-uvm host FD at the GPU VA.
+			mp, sentryVA, mmapErr := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
+			if mmapErr != nil {
+				// Fall back to raw passthrough as last resort.
+				log.Debugf("rdmaproxy: GPU device memory mirror failed (%v), raw VA passthrough", mmapErr)
+				return nil, uintptr(addr), nil
+			}
+			return mp, sentryVA, nil
 		}
 		return mp, sentryVA, nil
 	}
@@ -954,6 +956,14 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 
 	sentryVA := m + uintptr(addr-uint64(alignedStart))
 	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
+}
+
+// mirrorGPUDeviceMemory is a placeholder for future GPU device memory
+// resolution. Currently returns an error, causing fallback to raw
+// VA passthrough. The passthrough works when nvidia-peermem can
+// resolve the GPU VA via the nvidia driver's p2p interface.
+func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
+	return nil, 0, fmt.Errorf("GPU device memory mirroring not yet implemented")
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after
