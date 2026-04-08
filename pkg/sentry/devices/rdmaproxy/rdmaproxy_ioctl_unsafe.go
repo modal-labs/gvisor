@@ -970,21 +970,51 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
 }
 
-// mirrorGPUDeviceMemory attempts to create a VMA for GPU device memory.
+// mirrorGPUDeviceMemory creates a nvidia-backed VMA in the sentry for GPU
+// device memory. nvidia-peermem requires VMAs with nvidia vm_ops to resolve
+// GPU physical pages via nvidia_p2p_get_pages().
 //
-// nvidia-peermem requires VMAs with nvidia vm_ops (from nvidiactl mmap).
-// Tested approaches:
-// - Anonymous PROT_NONE: find_vma succeeds but nvidia_p2p_get_pages → EIO
-// - Direct /dev/nvidiactl mmap: blocked by seccomp/sentry restrictions
-//
-// The correct fix: nvproxy's frontendFD.ConfigureMMap should create host-side
-// nvidia-backed VMAs for GPU VA reservations. Currently, sandbox mmaps for
-// GPU VA space (large PROT_NONE) go through gVisor's MM as anonymous, without
-// a corresponding host-side nvidia mmap.
-//
-// Use NCCL_NET_GDR_LEVEL=0 for working multi-node RDMA (~90 GB/s).
+// We find the nvidia frontend host FD from nvproxy (by scanning the task's
+// FD table for frontendFD instances), then mmap through it at the GPU VA.
+// The nvidia driver's mmap handler attaches its vm_ops to the resulting VMA.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	return nil, 0, fmt.Errorf("GPU device memory VA %#x: nvidia-peermem requires nvidia-backed VMA (use GDR_LEVEL=0)", addr)
+	// Find a nvidia frontend host FD by scanning the task's FD table.
+	// frontendFD types from nvproxy have a hostFD for the nvidia device.
+	var nvHostFD int32 = -1
+	t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
+		// Check if this file description has a frontendFDMemmapFile
+		// by checking if it implements the Mappable interface and
+		// has a host FD we can extract.
+		if mappable, ok := file.Impl().(interface {
+			NVProxyHostFD() int32
+		}); ok {
+			nvHostFD = mappable.NVProxyHostFD()
+			return false // stop iteration
+		}
+		return true
+	})
+
+	if nvHostFD < 0 {
+		return nil, 0, fmt.Errorf("no nvidia frontend host FD found for GPU VA %#x", addr)
+	}
+
+	// mmap through the nvidia host FD. The nvidia driver's mmap handler
+	// requires offset=0 and attaches nvidia-specific vm_ops to the VMA.
+	// Use MAP_FIXED_NOREPLACE to avoid clobbering existing mappings.
+	m, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
+		uintptr(alignedStart), uintptr(alignedLen),
+		unix.PROT_NONE,
+		unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
+		uintptr(nvHostFD), 0)
+	if errno != 0 {
+		return nil, 0, fmt.Errorf("mmap via nvidia hostFD=%d at GPU VA %#x len %d: %w", nvHostFD, alignedStart, alignedLen, errno)
+	}
+
+	log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via hostFD=%d → sentry %#x",
+		alignedStart, uint64(alignedStart)+alignedLen, nvHostFD, m)
+
+	sentryVA := m + uintptr(addr-uint64(alignedStart))
+	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after

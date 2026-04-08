@@ -86,6 +86,13 @@ func (dev *frontendDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.D
 	return &fd.vfsfd, nil
 }
 
+// NVProxyHostFD returns the host FD for this nvidia device.
+// Used by rdmaproxy to create nvidia-backed VMAs for GPU device memory
+// RDMA registration (nvidia-peermem requires nvidia vm_ops on VMAs).
+func (fd *frontendFD) NVProxyHostFD() int32 {
+	return fd.hostFD
+}
+
 // frontendFD implements vfs.FileDescriptionImpl for /dev/nvidia# and
 // /dev/nvidiactl.
 //
