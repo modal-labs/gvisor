@@ -461,17 +461,9 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 		if file == nil {
 			continue
 		}
-		// Check all rdmaproxy FD types: asyncEventFD and uverbsFD.
-		var hostVal int32 = -1
-		switch impl := file.Impl().(type) {
-		case *asyncEventFD:
-			hostVal = impl.hostFD
-		case *uverbsFD:
-			hostVal = impl.hostFD
-		}
-		if hostVal >= 0 {
-			binary.LittleEndian.PutUint64(buf[off+8:off+16], uint64(hostVal))
-			log.Debugf("rdmaproxy: REWRITE obj=0x%04x method=%d attr[%d] id=0x%04x sentry=%d → host=%d (via task FD table)", objectID, methodID, i, attrID, sentryVal, hostVal)
+		if afd, ok := file.Impl().(*asyncEventFD); ok {
+			binary.LittleEndian.PutUint64(buf[off+8:off+16], uint64(afd.hostFD))
+			log.Debugf("rdmaproxy: REWRITE obj=0x%04x method=%d attr[%d] id=0x%04x sentry=%d → host=%d (async event FD)", objectID, methodID, i, attrID, sentryVal, afd.hostFD)
 		}
 		file.DecRef(t)
 	}
