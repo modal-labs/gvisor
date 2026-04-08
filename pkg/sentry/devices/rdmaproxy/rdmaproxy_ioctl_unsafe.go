@@ -859,13 +859,14 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 			// Neither Pin nor InternalMappings resolved the VA. This
 			// happens for GPU device memory (cuMemAlloc) which has no
 			// CPU VMA. nvidia-peermem needs a VMA to pin the pages.
-			// Create one by mmapping the nvidia-uvm host FD at the GPU VA.
+			// Create one by mmapping at the GPU VA.
 			mp, sentryVA, mmapErr := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
 			if mmapErr != nil {
 				// Fall back to raw passthrough as last resort.
-				log.Debugf("rdmaproxy: GPU device memory mirror failed (%v), raw VA passthrough", mmapErr)
+				log.Warningf("rdmaproxy: GPU device memory mirror failed (%v), raw VA passthrough for %#x len %d", mmapErr, addr, length)
 				return nil, uintptr(addr), nil
 			}
+			log.Warningf("rdmaproxy: GPU device memory VMA created at %#x len %d → sentry %#x", addr, length, sentryVA)
 			return mp, sentryVA, nil
 		}
 		return mp, sentryVA, nil
