@@ -970,25 +970,17 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
 }
 
-// mirrorGPUDeviceMemory creates a PROT_NONE anonymous VMA in the sentry's
-// address space at the GPU VA. nvidia-peermem needs find_vma() to succeed
-// on the VA, then it calls nvidia_p2p_get_pages() to resolve the GPU
-// physical pages via the nvidia driver's internal allocation tables.
+// mirrorGPUDeviceMemory attempts to create a VMA for GPU device memory
+// so nvidia-peermem can resolve it for RDMA. Creating a PROT_NONE VMA
+// allows find_vma() to succeed, but nvidia_p2p_get_pages() returns EIO
+// because the nvidia driver's p2p tables don't have this VA registered
+// for the sentry's process. Full GDR support requires nvproxy to register
+// GPU allocations with the nvidia p2p interface.
+//
+// For now, return error to fall through to raw VA passthrough.
+// Use NCCL_NET_GDR_LEVEL=0 for working multi-node RDMA (~90 GB/s).
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	m, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
-		uintptr(alignedStart), uintptr(alignedLen),
-		unix.PROT_NONE,
-		unix.MAP_PRIVATE|unix.MAP_ANONYMOUS|unix.MAP_FIXED_NOREPLACE,
-		^uintptr(0), 0)
-	if errno != 0 {
-		return nil, 0, fmt.Errorf("mmap PROT_NONE at GPU VA %#x len %d: %w", alignedStart, alignedLen, errno)
-	}
-
-	log.Infof("rdmaproxy: created PROT_NONE VMA for GPU device memory %#x-%#x → sentry %#x",
-		alignedStart, uint64(alignedStart)+alignedLen, m)
-
-	sentryVA := m + uintptr(addr-uint64(alignedStart))
-	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
+	return nil, 0, fmt.Errorf("GPU device memory p2p not registered for VA %#x (use GDR_LEVEL=0)", addr)
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after
