@@ -36,8 +36,9 @@ Export the correct NCCL IB devices used.
 export NCCL_IB_HCA=mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12
 ```
 
-Run the test.
+Run the test. Need to set memory unlimited in the current shell.
 ```
+sudo prlimit --pid=$$ --memlock=unlimited:unlimited && 
 NCCL_NET_GDR_LEVEL=PHB \
 NCCL_NET_MERGE_LEVEL=LOC \
 NCCL_GRAPH_FILE=/home/modal/gvisor/nccl_graph.xml \
