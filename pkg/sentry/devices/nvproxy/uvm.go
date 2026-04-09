@@ -266,6 +266,9 @@ func uvmIoctlHasFrontendFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Param
 
 	ioctlParams.SetFrontendFD(ctlFile.hostFD)
 	n, err := uvmIoctlInvoke(ui, ioctlParams)
+	if err == nil && ui.cmd == nvgpu.UVM_MAP_EXTERNAL_ALLOCATION && ioctlParams.GetStatus() == nvgpu.NV_OK {
+		recordUVMExternalAllocation(ctlFile, any(ioctlParams))
+	}
 	ioctlParams.SetFrontendFD(origFD)
 	if err != nil {
 		return n, err
@@ -274,6 +277,42 @@ func uvmIoctlHasFrontendFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Param
 		return n, err
 	}
 	return n, nil
+}
+
+func recordUVMExternalAllocation(fd *frontendFD, ioctlParams any) {
+	switch params := ioctlParams.(type) {
+	case *nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS:
+		fd.noteUVMExternalAllocation(
+			params.Base,
+			params.Length,
+			params.Offset,
+			nvgpu.Handle{Val: params.HClient},
+			nvgpu.Handle{Val: params.HMemory},
+			uvmGPUUUIDs(params.PerGPUAttributes[:], params.GPUAttributesCount),
+		)
+	case *nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550:
+		fd.noteUVMExternalAllocation(
+			params.Base,
+			params.Length,
+			params.Offset,
+			nvgpu.Handle{Val: params.HClient},
+			nvgpu.Handle{Val: params.HMemory},
+			uvmGPUUUIDs(params.PerGPUAttributes[:], params.GPUAttributesCount),
+		)
+	}
+}
+
+func uvmGPUUUIDs(attrs []nvgpu.UvmGpuMappingAttributes, count uint64) []string {
+	if count > uint64(len(attrs)) {
+		count = uint64(len(attrs))
+	}
+	gpuUUIDs := make([]string, 0, count)
+	for i := 0; i < int(count); i++ {
+		if gpuUUID := nvUUIDString(attrs[i].GPUUUID); gpuUUID != "" {
+			gpuUUIDs = append(gpuUUIDs, gpuUUID)
+		}
+	}
+	return dedupeStrings(gpuUUIDs)
 }
 
 func uvmFailWithStatus[Params any, PtrParams hasStatusPtr[Params]](ui *uvmIoctlState, ioctlParams PtrParams, status uint32) error {

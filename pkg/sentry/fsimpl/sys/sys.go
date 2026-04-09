@@ -188,7 +188,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			kernelSub["iommu_groups"] = fs.newDir(ctx, creds, defaultSysDirMode, iommuGroups)
 		}
 		if idata.PCIDevicesData != nil {
-			pciDeviceTreeSub, pciBusSub, busPCIDevSub := fs.newPCIDevicesSysfsEntries(ctx, creds, idata.PCIDevicesData)
+			pciDeviceTreeSub, pciBusSub, busPCIDevSub := fs.newPCIDevicesSysfsEntries(ctx, creds, idata.PCIDevicesData, idata.RDMADevices)
 			// Add /sys/devices/pci*/ entries to the devices map.
 			for name, inode := range pciDeviceTreeSub {
 				devicesSub[name] = inode
@@ -213,6 +213,9 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			if ibDir != nil {
 				classSub["infiniband"] = fs.newDir(ctx, creds, defaultSysDirMode, ibDir)
+			}
+			if netDir := fs.newRDMANetClassEntries(ctx, creds, idata.RDMADevices); netDir != nil {
+				classSub["net"] = fs.newDir(ctx, creds, defaultSysDirMode, netDir)
 			}
 			if idata.RDMADevices != nil && idata.RDMADevices.PeerMemVersion != "" {
 				peerMemVer := idata.RDMADevices.PeerMemVersion + "\n"

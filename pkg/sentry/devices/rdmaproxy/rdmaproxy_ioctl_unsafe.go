@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -240,10 +241,10 @@ const (
 
 // UVERBS method IDs.
 const (
-	uverbsMethodInvokeWrite  = 0 // DEVICE object
-	uverbsMethodMRDestroy    = 1 // MR object
-	uverbsMethodRegDMABufMR  = 4 // MR object (DMABUF path — not supported through proxy)
-	uverbsMethodRegMR        = 5 // MR object (modern path)
+	uverbsMethodInvokeWrite = 0  // DEVICE object
+	uverbsMethodMRDestroy   = 1  // MR object
+	uverbsMethodRegDMABufMR = 4  // MR object (DMABUF path — not supported through proxy)
+	uverbsMethodRegMR       = 5  // MR object (modern path)
 	uverbsMethodCoreCreate  = 64 // UVERBS_API_METHOD_KEY_NUM_CORE — CREATE for CQ, QP, etc.
 )
 
@@ -310,9 +311,21 @@ const (
 // REG_MR attr IDs (modern path).
 const (
 	uverbsAttrRegMRHandle = 0
+	uverbsAttrRegMRIova   = 3
 	uverbsAttrRegMRAddr   = 4
 	uverbsAttrRegMRLength = 5
 )
+
+// translatedRelocatedGPUVA rewrites an RDMA IOVA/HCA VA when the backing GPU
+// mapping had to move to a different sentry VA. This is a diagnostic path for
+// GPU-backed MRs only; CPU memory keeps the original IOVA.
+func translatedRelocatedGPUVA(mp *mirroredPages, sandboxVA uint64, sentryVA uintptr, iova uint64) (uint64, bool) {
+	if mp == nil || mp.sharedGPUVMA == nil || sentryVA == uintptr(sandboxVA) {
+		return 0, false
+	}
+	delta := int64(sentryVA) - int64(sandboxVA)
+	return uint64(int64(iova) + delta), true
+}
 
 // DESTROY_MR attr IDs.
 const (
@@ -782,10 +795,17 @@ func (fd *uverbsFD) prepareMRRegInvokeWrite(t *kernel.Task, buf []byte, numAttrs
 		return nil, fmt.Errorf("mirrorSandboxPages: %w", err)
 	}
 
-	// Rewrite start to sentry address; keep hca_va as original sandbox VA
-	// so RDMA work requests use the app's addresses.
+	oldHCAVA := binary.LittleEndian.Uint64(rw.sentry[regMROffHcaVA : regMROffHcaVA+8])
+	if newHCAVA, relocated := translatedRelocatedGPUVA(mp, sandboxVA, sentryVA, oldHCAVA); relocated {
+		binary.LittleEndian.PutUint64(rw.sentry[regMROffHcaVA:regMROffHcaVA+8], newHCAVA)
+		log.Warningf("rdmaproxy: relocated GPU MR rewrote hca_va %#x → sentry %#x (start %#x → %#x)",
+			oldHCAVA, newHCAVA, sandboxVA, sentryVA)
+	}
+
+	// Rewrite start to sentry address. Most paths keep hca_va unchanged, but
+	// relocated GPU-backed MRs may also rewrite it via translatedRelocatedGPUVA.
 	binary.LittleEndian.PutUint64(rw.sentry[regMROffStart:regMROffStart+8], uint64(sentryVA))
-	log.Debugf("rdmaproxy: MR REG rewrote start %#x → sentry %#x (hca_va stays %#x)",
+	log.Debugf("rdmaproxy: MR REG rewrote start %#x → sentry %#x (hca_va=%#x)",
 		sandboxVA, sentryVA, binary.LittleEndian.Uint64(rw.sentry[regMROffHcaVA:regMROffHcaVA+8]))
 
 	return mp, nil
@@ -821,6 +841,15 @@ func (fd *uverbsFD) prepareMRRegModern(t *kernel.Task, buf []byte, numAttrs int,
 	mp, sentryVA, err := mirrorSandboxPages(t, sandboxVA, length)
 	if err != nil {
 		return nil, fmt.Errorf("mirrorSandboxPages: %w", err)
+	}
+
+	if iovaRW := findRewrite(buf, numAttrs, rewrites, uverbsAttrRegMRIova); iovaRW != nil && len(iovaRW.sentry) >= 8 {
+		oldIOVA := binary.LittleEndian.Uint64(iovaRW.sentry[0:8])
+		if newIOVA, relocated := translatedRelocatedGPUVA(mp, sandboxVA, sentryVA, oldIOVA); relocated {
+			binary.LittleEndian.PutUint64(iovaRW.sentry[0:8], newIOVA)
+			log.Warningf("rdmaproxy: relocated GPU MR rewrote iova %#x → sentry %#x (addr %#x → %#x)",
+				oldIOVA, newIOVA, sandboxVA, sentryVA)
+		}
 	}
 
 	// Rewrite ADDR to sentry address. IOVA attr (if present) stays as sandbox VA.
@@ -974,47 +1003,205 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 // device memory. nvidia-peermem requires VMAs with nvidia vm_ops to resolve
 // GPU physical pages via nvidia_p2p_get_pages().
 //
-// We find the nvidia frontend host FD from nvproxy (by scanning the task's
-// FD table for frontendFD instances), then mmap through it at the GPU VA.
-// The nvidia driver's mmap handler attaches its vm_ops to the resulting VMA.
+// We scan the task's FD table for nvproxy frontend FDs and prefer the ones
+// with an active mmap context matching the target length. The nvidia driver's
+// mmap handler attaches its vm_ops to the resulting VMA.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	// Find a nvidia frontend host FD by scanning the task's FD table.
-	// frontendFD types from nvproxy have a hostFD for the nvidia device.
-	var nvHostFD int32 = -1
+	type nvproxyMirrorCandidate struct {
+		sandboxFD  int32
+		hostFD     int32
+		devName    string
+		mmapLength uint64
+		prepare    func(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
+	}
+
+	if shared := acquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen)); shared != nil {
+		log.Infof("rdmaproxy: reusing shared nvidia-backed VMA for GPU VA %#x-%#x", alignedStart, uint64(alignedStart)+alignedLen)
+		sentryVA := shared.mappedStart + uintptr(addr-uint64(alignedStart))
+		return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
+	}
+
+	var candidates []nvproxyMirrorCandidate
+	seenHostFDs := make(map[int32]int)
 	t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
-		// Check if this file description has a frontendFDMemmapFile
-		// by checking if it implements the Mappable interface and
-		// has a host FD we can extract.
+		var prepare func(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
+		if preparer, ok := file.Impl().(interface {
+			NVProxyPrepareGPUVMA(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
+		}); ok {
+			prepare = preparer.NVProxyPrepareGPUVMA
+		}
+		if mappable, ok := file.Impl().(interface {
+			NVProxyMmapInfo() (int32, string, uint64)
+		}); ok {
+			hostFD, devName, mmapLength := mappable.NVProxyMmapInfo()
+			if idx, ok := seenHostFDs[hostFD]; ok {
+				if candidates[idx].prepare == nil {
+					candidates[idx].prepare = prepare
+				}
+				return true
+			}
+			seenHostFDs[hostFD] = len(candidates)
+			candidates = append(candidates, nvproxyMirrorCandidate{
+				sandboxFD:  fd,
+				hostFD:     hostFD,
+				devName:    devName,
+				mmapLength: mmapLength,
+				prepare:    prepare,
+			})
+			return true
+		}
 		if mappable, ok := file.Impl().(interface {
 			NVProxyHostFD() int32
 		}); ok {
-			nvHostFD = mappable.NVProxyHostFD()
-			return false // stop iteration
+			hostFD := mappable.NVProxyHostFD()
+			if idx, ok := seenHostFDs[hostFD]; ok {
+				if candidates[idx].prepare == nil {
+					candidates[idx].prepare = prepare
+				}
+				return true
+			}
+			seenHostFDs[hostFD] = len(candidates)
+			candidates = append(candidates, nvproxyMirrorCandidate{
+				sandboxFD: fd,
+				hostFD:    hostFD,
+				prepare:   prepare,
+			})
 		}
 		return true
 	})
 
-	if nvHostFD < 0 {
+	if len(candidates) == 0 {
 		return nil, 0, fmt.Errorf("no nvidia frontend host FD found for GPU VA %#x", addr)
 	}
 
-	// mmap through the nvidia host FD. The nvidia driver's mmap handler
-	// requires offset=0 and attaches nvidia-specific vm_ops to the VMA.
-	// Use MAP_FIXED_NOREPLACE to avoid clobbering existing mappings.
-	m, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
-		uintptr(alignedStart), uintptr(alignedLen),
-		unix.PROT_NONE,
-		unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
-		uintptr(nvHostFD), 0)
-	if errno != 0 {
-		return nil, 0, fmt.Errorf("mmap via nvidia hostFD=%d at GPU VA %#x len %d: %w", nvHostFD, alignedStart, alignedLen, errno)
+	candidatePriority := func(c nvproxyMirrorCandidate) int {
+		switch {
+		case c.mmapLength == alignedLen && c.devName != "nvidiactl":
+			return 0
+		case c.mmapLength == alignedLen:
+			return 1
+		case c.mmapLength != 0 && c.devName != "nvidiactl":
+			return 2
+		case c.mmapLength != 0:
+			return 3
+		case c.devName != "nvidiactl":
+			return 4
+		default:
+			return 5
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		pi := candidatePriority(candidates[i])
+		pj := candidatePriority(candidates[j])
+		if pi != pj {
+			return pi < pj
+		}
+		if candidates[i].mmapLength != candidates[j].mmapLength {
+			return candidates[i].mmapLength > candidates[j].mmapLength
+		}
+		return candidates[i].sandboxFD < candidates[j].sandboxFD
+	})
+
+	if log.IsLogging(log.Debug) {
+		for _, candidate := range candidates {
+			log.Debugf("rdmaproxy: GPU VMA candidate sandboxFD=%d hostFD=%d dev=%q mmapLen=%d targetLen=%d canPrepare=%t",
+				candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, alignedLen, candidate.prepare != nil)
+		}
 	}
 
-	log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via hostFD=%d → sentry %#x",
-		alignedStart, uint64(alignedStart)+alignedLen, nvHostFD, m)
+	var (
+		lastErr unix.Errno
+		last    nvproxyMirrorCandidate
+	)
+	for _, candidate := range candidates {
+		if candidate.mmapLength != 0 {
+			shared, mapped, errno, reused := mapOrAcquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), func() (uintptr, unix.Errno) {
+				mapped, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
+					uintptr(alignedStart), uintptr(alignedLen),
+					unix.PROT_READ|unix.PROT_WRITE,
+					unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
+					uintptr(candidate.hostFD), 0)
+				if errno == unix.EEXIST {
+					// Overlapping GPU registrations often reuse the same underlying
+					// allocation with a different length. Re-map the same NVIDIA
+					// memmap context at any free sentry VA instead of falling back
+					// to the raw sandbox address.
+					mapped, _, errno = unix.RawSyscall6(unix.SYS_MMAP,
+						0, uintptr(alignedLen),
+						unix.PROT_READ|unix.PROT_WRITE,
+						unix.MAP_SHARED,
+						uintptr(candidate.hostFD), 0)
+				}
+				return mapped, errno
+			})
+			lastErr = errno
+			if lastErr == 0 {
+				if reused {
+					log.Infof("rdmaproxy: reused existing nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d",
+						alignedStart, uint64(alignedStart)+alignedLen, candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength)
+				} else {
+					log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d → sentry %#x",
+						alignedStart, uint64(alignedStart)+alignedLen, candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, mapped)
+				}
+				sentryVA := mapped + uintptr(addr-uint64(alignedStart))
+				return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
+			}
+			last = candidate
+			log.Debugf("rdmaproxy: GPU VMA mmap failed via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d at %#x len %d: %v",
+				candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, alignedStart, alignedLen, lastErr)
+		}
 
-	sentryVA := m + uintptr(addr-uint64(alignedStart))
-	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
+		if candidate.prepare == nil {
+			continue
+		}
+
+		preparedHostFD, preparedDevName, preparedLen, prepErr := candidate.prepare(t, addr, uint64(alignedStart), alignedLen)
+		if prepErr != nil {
+			log.Debugf("rdmaproxy: GPU VMA prepare failed via sandboxFD=%d hostFD=%d dev=%q at %#x len %d: %v",
+				candidate.sandboxFD, candidate.hostFD, candidate.devName, alignedStart, alignedLen, prepErr)
+			continue
+		}
+		preparedCandidate := nvproxyMirrorCandidate{
+			sandboxFD:  candidate.sandboxFD,
+			hostFD:     preparedHostFD,
+			devName:    preparedDevName,
+			mmapLength: preparedLen,
+		}
+		shared, mapped, errno, reused := mapOrAcquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), func() (uintptr, unix.Errno) {
+			mapped, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
+				uintptr(alignedStart), uintptr(alignedLen),
+				unix.PROT_READ|unix.PROT_WRITE,
+				unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
+				uintptr(preparedHostFD), 0)
+			if errno == unix.EEXIST {
+				mapped, _, errno = unix.RawSyscall6(unix.SYS_MMAP,
+					0, uintptr(alignedLen),
+					unix.PROT_READ|unix.PROT_WRITE,
+					unix.MAP_SHARED,
+					uintptr(preparedHostFD), 0)
+			}
+			return mapped, errno
+		})
+		unix.Close(int(preparedHostFD))
+		lastErr = errno
+		if lastErr == 0 {
+			if reused {
+				log.Infof("rdmaproxy: reused existing nvidia-backed VMA for GPU VA %#x-%#x via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d",
+					alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength)
+			} else {
+				log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d → sentry %#x",
+					alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, mapped)
+			}
+			sentryVA := mapped + uintptr(addr-uint64(alignedStart))
+			return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
+		}
+		last = preparedCandidate
+		log.Debugf("rdmaproxy: GPU VMA mmap failed via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d at %#x len %d: %v",
+			preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, alignedStart, alignedLen, lastErr)
+	}
+
+	return nil, 0, fmt.Errorf("all %d nvidia frontend mmap attempts failed for GPU VA %#x len %d (last sandboxFD=%d hostFD=%d dev=%q mmapLen=%d: %w)",
+		len(candidates), addr, alignedLen, last.sandboxFD, last.hostFD, last.devName, last.mmapLength, lastErr)
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after
@@ -1267,6 +1454,12 @@ func (fd *uverbsFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.
 					}
 					mrMirror = mp
 					cu = cleanup.Make(func() { mp.release(t) })
+					oldHCAVA := binary.LittleEndian.Uint64(data[hcaVAOff : hcaVAOff+8])
+					if newHCAVA, relocated := translatedRelocatedGPUVA(mp, sva, sentryVA, oldHCAVA); relocated {
+						binary.LittleEndian.PutUint64(data[hcaVAOff:hcaVAOff+8], newHCAVA)
+						log.Warningf("rdmaproxy: Write REG_MR relocated GPU hca_va %#x → sentry %#x (start %#x → %#x)",
+							oldHCAVA, newHCAVA, sva, sentryVA)
+					}
 					binary.LittleEndian.PutUint64(data[startOff:startOff+8], uint64(sentryVA))
 					log.Debugf("rdmaproxy: Write REG_MR rewrite start %#x → sentry %#x (hca_va=%#x)",
 						sva, sentryVA,

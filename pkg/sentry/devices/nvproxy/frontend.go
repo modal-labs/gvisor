@@ -34,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -93,6 +94,22 @@ func (fd *frontendFD) NVProxyHostFD() int32 {
 	return fd.hostFD
 }
 
+// NVProxyMmapInfo returns metadata about this nvproxy frontend FD that helps
+// rdmaproxy pick the correct FD when synthesizing nvidia-backed VMAs for GPU
+// RDMA registration.
+func (fd *frontendFD) NVProxyMmapInfo() (hostFD int32, devName string, mmapLength uint64) {
+	fd.memmapFile.mmapMu.Lock()
+	defer fd.memmapFile.mmapMu.Unlock()
+	return fd.hostFD, fd.dev.basename(), fd.memmapFile.mmapLength
+}
+
+// NVProxyPrepareGPUVMA attempts to create a fresh host-side RM_MAP_MEMORY mmap
+// context for the GPU VA range containing addr, then returns a host FD that can
+// be mmapped by rdmaproxy to obtain a nvidia-backed VMA.
+func (fd *frontendFD) NVProxyPrepareGPUVMA(ctx context.Context, addr, alignedStart, alignedLen uint64) (hostFD int32, devName string, mmapLength uint64, err error) {
+	return fd.prepareGPUVMA(ctx, addr, alignedStart, alignedLen)
+}
+
 // frontendFD implements vfs.FileDescriptionImpl for /dev/nvidia# and
 // /dev/nvidiactl.
 //
@@ -136,6 +153,90 @@ type frontendFD struct {
 	// clients are handles of clients owned by this frontendFD. clients is
 	// protected by dev.nvp.clientsMu.
 	clients map[*rootClient]struct{}
+
+	// gpuMappings remembers UVM_MAP_EXTERNAL_ALLOCATION ranges seen through this
+	// frontend FD so rdmaproxy can lazily seed RM_MAP_MEMORY for GPU RDMA.
+	gpuMappingsMu sync.Mutex              `state:"nosave"`
+	gpuMappings   []gpuExternalAllocation `state:"nosave"`
+
+	// registeredControl and registeredDeviceFDs track NV_ESC_REGISTER_FD
+	// associations so prepared RM_MAP_MEMORY can reuse device FDs that belong
+	// to the same control-FD context instead of scanning every frontend in the
+	// sandbox.
+	registeredControl   *frontendFD              `state:"nosave"`
+	registeredDeviceFDs map[*frontendFD]struct{} `state:"nosave"`
+}
+
+type gpuExternalAllocation struct {
+	base     uint64
+	length   uint64
+	offset   uint64
+	hClient  nvgpu.Handle
+	hMemory  nvgpu.Handle
+	gpuUUIDs []string
+}
+
+func nvUUIDString(uuid nvgpu.NvUUID) string {
+	if uuid == (nvgpu.NvUUID{}) {
+		return ""
+	}
+	return fmt.Sprintf("GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		uuid[0], uuid[1], uuid[2], uuid[3],
+		uuid[4], uuid[5],
+		uuid[6], uuid[7],
+		uuid[8], uuid[9],
+		uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15])
+}
+
+func (fd *frontendFD) noteUVMExternalAllocation(base, length, offset uint64, hClient, hMemory nvgpu.Handle, gpuUUIDs []string) {
+	if base == 0 || length == 0 || hClient.Val == nvgpu.NV01_NULL_OBJECT || hMemory.Val == nvgpu.NV01_NULL_OBJECT {
+		return
+	}
+	gpuUUIDs = dedupeStrings(gpuUUIDs)
+	fd.gpuMappingsMu.Lock()
+	defer fd.gpuMappingsMu.Unlock()
+	for i := len(fd.gpuMappings) - 1; i >= 0; i-- {
+		existing := fd.gpuMappings[i]
+		if existing.base == base && existing.length == length && existing.offset == offset && existing.hClient == hClient && existing.hMemory == hMemory {
+			if len(existing.gpuUUIDs) == 0 && len(gpuUUIDs) != 0 {
+				fd.gpuMappings[i].gpuUUIDs = append([]string(nil), gpuUUIDs...)
+			}
+			return
+		}
+	}
+	fd.gpuMappings = append(fd.gpuMappings, gpuExternalAllocation{
+		base:     base,
+		length:   length,
+		offset:   offset,
+		hClient:  hClient,
+		hMemory:  hMemory,
+		gpuUUIDs: append([]string(nil), gpuUUIDs...),
+	})
+	if log.IsLogging(log.Debug) {
+		log.Debugf("nvproxy: recorded UVM external allocation via %q hostFD=%d base=%#x len=%d offset=%#x hClient=%v hMemory=%v gpuUUIDs=%v",
+			fd.dev.basename(), fd.hostFD, base, length, offset, hClient, hMemory, gpuUUIDs)
+	}
+}
+
+func (fd *frontendFD) findGPUExternalAllocation(addr, alignedStart, alignedLen uint64) (gpuExternalAllocation, bool) {
+	fd.gpuMappingsMu.Lock()
+	defer fd.gpuMappingsMu.Unlock()
+	for i := len(fd.gpuMappings) - 1; i >= 0; i-- {
+		mapping := fd.gpuMappings[i]
+		rangeEnd := mapping.base + mapping.length
+		targetEnd := alignedStart + alignedLen
+		if rangeEnd < mapping.base || targetEnd < alignedStart {
+			continue
+		}
+		if addr < mapping.base || addr >= rangeEnd {
+			continue
+		}
+		if alignedStart < mapping.base || targetEnd > rangeEnd {
+			continue
+		}
+		return mapping, true
+	}
+	return gpuExternalAllocation{}, false
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
@@ -144,6 +245,16 @@ func (fd *frontendFD) Release(ctx context.Context) {
 	fd.appQueue.Notify(waiter.EventHUp)
 
 	fd.dev.nvp.fdsMu.Lock()
+	if fd.registeredControl != nil {
+		delete(fd.registeredControl.registeredDeviceFDs, fd)
+		fd.registeredControl = nil
+	}
+	for deviceFD := range fd.registeredDeviceFDs {
+		if deviceFD.registeredControl == fd {
+			deviceFD.registeredControl = nil
+		}
+	}
+	fd.registeredDeviceFDs = nil
 	delete(fd.dev.nvp.frontendFDs, fd)
 	fd.dev.nvp.fdsMu.Unlock()
 
@@ -372,7 +483,27 @@ func frontendRegisterFD(fi *frontendIoctlState) (uintptr, error) {
 	}
 	ioctlParams.CtlFD = ctlFile.hostFD
 	// The returned ctl_fd can't change, so skip copying out.
-	return frontendIoctlInvokeNoStatus(fi, &ioctlParams)
+	n, err := frontendIoctlInvokeNoStatus(fi, &ioctlParams)
+	if err != nil {
+		return n, err
+	}
+	if fi.fd != ctlFile {
+		fi.fd.dev.nvp.fdsMu.Lock()
+		if oldCtl := fi.fd.registeredControl; oldCtl != nil && oldCtl != ctlFile {
+			delete(oldCtl.registeredDeviceFDs, fi.fd)
+		}
+		fi.fd.registeredControl = ctlFile
+		if ctlFile.registeredDeviceFDs == nil {
+			ctlFile.registeredDeviceFDs = make(map[*frontendFD]struct{})
+		}
+		ctlFile.registeredDeviceFDs[fi.fd] = struct{}{}
+		fi.fd.dev.nvp.fdsMu.Unlock()
+		if fi.ctx.IsLogging(log.Debug) {
+			fi.ctx.Debugf("nvproxy: REGISTER_FD dev=%q hostFD=%d ctlDev=%q ctlHostFD=%d",
+				fi.fd.dev.basename(), fi.fd.hostFD, ctlFile.dev.basename(), ctlFile.hostFD)
+		}
+	}
+	return n, nil
 }
 
 func frontendIoctlHasFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Params]](fi *frontendIoctlState) (uintptr, error) {
@@ -1509,6 +1640,10 @@ func rmMapMemory(fi *frontendIoctlState) (uintptr, error) {
 		// by kernel-open/nvidia/nv.c:nvidia_ioctl(), so we can get the final
 		// caching type from the updated ioctl params.
 		mapFile.memmapFile.memType = getMemoryType(fi.ctx, mapFile.dev, (ioctlParams.Params.Flags>>nvgpu.NVOS33_FLAGS_CACHING_TYPE_SHIFT)&nvgpu.NVOS33_FLAGS_CACHING_TYPE_MASK)
+		if fi.ctx.IsLogging(log.Debug) {
+			fi.ctx.Debugf("nvproxy: RM_MAP_MEMORY ctlDev=%q mapDev=%q hClient=%v hDevice=%v hMemory=%v addr=%#x offset=%#x len=%d",
+				fi.fd.dev.basename(), mapFile.dev.basename(), ioctlParams.Params.HClient, ioctlParams.Params.HDevice, ioctlParams.Params.HMemory, ioctlParams.Params.PLinearAddress, ioctlParams.Params.Offset, ioctlParams.Params.Length)
+		}
 	}
 
 	ioctlParams.FD = origFD

@@ -115,17 +115,107 @@ func openHostDevice(ctx context.Context, devRelPath string, flags uint32) (int, 
 type mirroredPages struct {
 	prs []mm.PinnedRange
 	// If m != 0, it's a sentry-side mmap we own and must munmap on release.
-	m   uintptr
-	len uintptr
+	m uintptr
+	// If sharedGPUVMA != nil, the sentry mapping is refcounted and shared
+	// across multiple MRs for the same GPU VA range.
+	sharedGPUVMA *sharedGPUVMA
+	len          uintptr
 }
 
 func (mp *mirroredPages) release(ctx context.Context) {
-	if mp.m != 0 {
+	if mp.sharedGPUVMA != nil {
+		mp.sharedGPUVMA.release()
+	} else if mp.m != 0 {
 		if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, mp.m, mp.len, 0); errno != 0 {
 			log.Warningf("rdmaproxy: munmap %#x-%#x: %v", mp.m, mp.m+mp.len, errno)
 		}
 	}
 	mm.Unpin(mp.prs)
+}
+
+type sharedGPUVMAKey struct {
+	gpuStart uintptr
+	gpuLen   uintptr
+}
+
+type sharedGPUVMA struct {
+	key         sharedGPUVMAKey
+	mappedStart uintptr
+	mappedLen   uintptr
+	refs        uint64
+}
+
+func (vma *sharedGPUVMA) release() {
+	sharedGPUVMAs.mu.Lock()
+	defer sharedGPUVMAs.mu.Unlock()
+
+	current, ok := sharedGPUVMAs.byKey[vma.key]
+	if !ok || current != vma {
+		log.Warningf("rdmaproxy: shared GPU VMA gpu=%#x-%#x already released", vma.key.gpuStart, vma.key.gpuStart+vma.key.gpuLen)
+		return
+	}
+	if current.refs == 0 {
+		log.Warningf("rdmaproxy: shared GPU VMA gpu=%#x-%#x has zero refcount", vma.key.gpuStart, vma.key.gpuStart+vma.key.gpuLen)
+		return
+	}
+	current.refs--
+	if current.refs != 0 {
+		return
+	}
+	delete(sharedGPUVMAs.byKey, vma.key)
+	if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, vma.mappedStart, vma.mappedLen, 0); errno != 0 {
+		log.Warningf("rdmaproxy: munmap shared GPU VMA gpu=%#x-%#x sentry=%#x-%#x: %v",
+			vma.key.gpuStart, vma.key.gpuStart+vma.key.gpuLen,
+			vma.mappedStart, vma.mappedStart+vma.mappedLen, errno)
+	}
+}
+
+var sharedGPUVMAs struct {
+	mu    sync.Mutex
+	byKey map[sharedGPUVMAKey]*sharedGPUVMA
+}
+
+func acquireSharedGPUVMA(start, len uintptr) *sharedGPUVMA {
+	sharedGPUVMAs.mu.Lock()
+	defer sharedGPUVMAs.mu.Unlock()
+
+	key := sharedGPUVMAKey{gpuStart: start, gpuLen: len}
+	if sharedGPUVMAs.byKey == nil {
+		sharedGPUVMAs.byKey = make(map[sharedGPUVMAKey]*sharedGPUVMA)
+	}
+	if vma := sharedGPUVMAs.byKey[key]; vma != nil {
+		vma.refs++
+		return vma
+	}
+	return nil
+}
+
+func mapOrAcquireSharedGPUVMA(start, len uintptr, mapper func() (uintptr, unix.Errno)) (*sharedGPUVMA, uintptr, unix.Errno, bool) {
+	sharedGPUVMAs.mu.Lock()
+	defer sharedGPUVMAs.mu.Unlock()
+
+	key := sharedGPUVMAKey{gpuStart: start, gpuLen: len}
+	if sharedGPUVMAs.byKey == nil {
+		sharedGPUVMAs.byKey = make(map[sharedGPUVMAKey]*sharedGPUVMA)
+	}
+	if vma := sharedGPUVMAs.byKey[key]; vma != nil {
+		vma.refs++
+		return vma, vma.mappedStart, 0, true
+	}
+
+	mapped, errno := mapper()
+	if errno != 0 {
+		return nil, 0, errno, false
+	}
+
+	vma := &sharedGPUVMA{
+		key:         key,
+		mappedStart: mapped,
+		mappedLen:   len,
+		refs:        1,
+	}
+	sharedGPUVMAs.byKey[key] = vma
+	return vma, mapped, 0, false
 }
 
 // pinnedDMABufs tracks the buf + doorbell mirrors for a single CQ or QP.

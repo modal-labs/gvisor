@@ -4,6 +4,8 @@ This is a **living document** — update it as progress is made.
 
 For code-level reference (function signatures, nvproxy patterns, integration
 points), see `RDMA_REFERENCE.md`.
+For the April 9, 2026 debugging session and next-step notes, see
+`RDMA_PROGRESS_2026-04-09.md`.
 
 **Author:** @Alessio Toniolo | **Reviewers:** @Peyton
 

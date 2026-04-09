@@ -19,8 +19,10 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
@@ -29,9 +31,10 @@ import (
 
 // RDMAGIDEntry contains a single GID table entry and its RoCE type.
 type RDMAGIDEntry struct {
-	Index string `json:"index"`
-	GID   string `json:"gid"`
-	Type  string `json:"type"`
+	Index  string `json:"index"`
+	GID    string `json:"gid"`
+	Type   string `json:"type"`
+	NetDev string `json:"net_dev,omitempty"`
 }
 
 // RDMAPortData contains sysfs attributes for one port.
@@ -78,11 +81,27 @@ type RDMADeviceData struct {
 	DynMajor uint32 `json:"-"`
 }
 
+// RDMANetDeviceData contains the minimal sysfs attributes NCCL/libibverbs read
+// from /sys/class/net/<name>/ when selecting and characterizing NICs.
+type RDMANetDeviceData struct {
+	Name       string `json:"name"`
+	Type       string `json:"type,omitempty"`
+	Address    string `json:"address,omitempty"`
+	MTU        string `json:"mtu,omitempty"`
+	DevID      string `json:"dev_id,omitempty"`
+	DevPort    string `json:"dev_port,omitempty"`
+	Speed      string `json:"speed,omitempty"`
+	Duplex     string `json:"duplex,omitempty"`
+	OperState  string `json:"operstate,omitempty"`
+	DevicePath string `json:"device_path,omitempty"`
+}
+
 // RDMAData holds all collected RDMA sysfs data.
 type RDMAData struct {
-	VerbsABIVersion string           `json:"verbs_abi_version"`
-	PeerMemVersion  string           `json:"peer_mem_version,omitempty"`
-	Devices         []RDMADeviceData `json:"devices"`
+	VerbsABIVersion string              `json:"verbs_abi_version"`
+	PeerMemVersion  string              `json:"peer_mem_version,omitempty"`
+	Devices         []RDMADeviceData    `json:"devices"`
+	NetDevices      []RDMANetDeviceData `json:"net_devices,omitempty"`
 }
 
 // CollectRDMADeviceData reads the specific sysfs files that libibverbs
@@ -112,6 +131,7 @@ func CollectRDMADeviceData() *RDMAData {
 		}
 	}
 
+	netDevices := make(map[string]struct{})
 	log.Infof("rdma collect: scanning %s (%d entries), verbs_abi=%q",
 		verbsPath, len(dents), data.VerbsABIVersion)
 	for _, dent := range dents {
@@ -165,11 +185,13 @@ func CollectRDMADeviceData() *RDMAData {
 				}
 				gidsPath := path.Join(portDir, "gids")
 				typesPath := path.Join(portDir, "gid_attrs", "types")
+				ndevsPath := path.Join(portDir, "gid_attrs", "ndevs")
 				gidDents, gerr := os.ReadDir(gidsPath)
 				if gerr == nil {
 					for _, gidDent := range gidDents {
 						gidVal := readSysfsFile(path.Join(gidsPath, gidDent.Name()))
 						typeVal := readSysfsFile(path.Join(typesPath, gidDent.Name()))
+						ndevVal := readSysfsFile(path.Join(ndevsPath, gidDent.Name()))
 						if gidVal == "" {
 							continue
 						}
@@ -177,10 +199,14 @@ func CollectRDMADeviceData() *RDMAData {
 							typeVal = inferRoCEType(gidDent.Name())
 						}
 						pd.GIDs = append(pd.GIDs, RDMAGIDEntry{
-							Index: gidDent.Name(),
-							GID:   gidVal,
-							Type:  typeVal,
+							Index:  gidDent.Name(),
+							GID:    gidVal,
+							Type:   typeVal,
+							NetDev: ndevVal,
 						})
+						if ndevVal != "" {
+							netDevices[ndevVal] = struct{}{}
+						}
 					}
 				}
 				log.Infof("rdma collect:   port %s: state=%q link_layer=%q rate=%q gids=%d",
@@ -190,8 +216,36 @@ func CollectRDMADeviceData() *RDMAData {
 		}
 		data.Devices = append(data.Devices, dev)
 	}
+	data.NetDevices = collectRDMANetDevices(netDevices)
 	log.Infof("rdma collect: collected %d device(s)", len(data.Devices))
 	return data
+}
+
+func collectRDMANetDevices(names map[string]struct{}) []RDMANetDeviceData {
+	if len(names) == 0 {
+		return nil
+	}
+	var netDevices []RDMANetDeviceData
+	for name := range names {
+		netDir := path.Join("/sys/class/net", name)
+		devicePath, err := filepath.EvalSymlinks(path.Join(netDir, "device"))
+		if err != nil {
+			devicePath = ""
+		}
+		netDevices = append(netDevices, RDMANetDeviceData{
+			Name:       name,
+			Type:       readSysfsFile(path.Join(netDir, "type")),
+			Address:    readSysfsFile(path.Join(netDir, "address")),
+			MTU:        readSysfsFile(path.Join(netDir, "mtu")),
+			DevID:      readSysfsFile(path.Join(netDir, "dev_id")),
+			DevPort:    readSysfsFile(path.Join(netDir, "dev_port")),
+			Speed:      readSysfsFile(path.Join(netDir, "speed")),
+			Duplex:     readSysfsFile(path.Join(netDir, "duplex")),
+			OperState:  readSysfsFile(path.Join(netDir, "operstate")),
+			DevicePath: devicePath,
+		})
+	}
+	return netDevices
 }
 
 // RDMADataPath is the path within the chroot where serialized RDMA data
@@ -257,6 +311,7 @@ func extractMinor(dev string) string {
 // so we infer from the well-known mlx5 kernel assignment:
 //   - index 0: RoCE v1 (link-local MAC-derived)
 //   - index 1+: RoCE v2
+//
 // NCCL reads types from sysfs but gets actual GID addresses via ioctl.
 func inferRoCEType(gidIndex string) string {
 	if gidIndex == "0" {
@@ -380,19 +435,25 @@ func (fs *filesystem) newRDMASysfsEntries(ctx context.Context, creds *auth.Crede
 				addFile(portEntries, "sm_lid", port.SMLID)
 				addFile(portEntries, "sm_sl", port.SMSL)
 				addFile(portEntries, "cap_mask", port.CapMask)
-					if len(port.GIDs) > 0 {
+				if len(port.GIDs) > 0 {
 					gidsEntries := map[string]kernfs.Inode{}
 					typesEntries := map[string]kernfs.Inode{}
+					ndevsEntries := map[string]kernfs.Inode{}
 					for _, gid := range port.GIDs {
 						addFile(gidsEntries, gid.Index, gid.GID)
 						addFile(typesEntries, gid.Index, gid.Type)
+						addFile(ndevsEntries, gid.Index, gid.NetDev)
 					}
-					log.Infof("rdma sysfs:   port %s: %d gids, gidsEntries=%d typesEntries=%d",
-						port.Number, len(port.GIDs), len(gidsEntries), len(typesEntries))
-					portEntries["gids"] = fs.newDir(ctx, creds, defaultSysDirMode, gidsEntries)
-					portEntries["gid_attrs"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+					log.Infof("rdma sysfs:   port %s: %d gids, gidsEntries=%d typesEntries=%d ndevsEntries=%d",
+						port.Number, len(port.GIDs), len(gidsEntries), len(typesEntries), len(ndevsEntries))
+					gidAttrsEntries := map[string]kernfs.Inode{
 						"types": fs.newDir(ctx, creds, defaultSysDirMode, typesEntries),
-					})
+					}
+					if len(ndevsEntries) > 0 {
+						gidAttrsEntries["ndevs"] = fs.newDir(ctx, creds, defaultSysDirMode, ndevsEntries)
+					}
+					portEntries["gids"] = fs.newDir(ctx, creds, defaultSysDirMode, gidsEntries)
+					portEntries["gid_attrs"] = fs.newDir(ctx, creds, defaultSysDirMode, gidAttrsEntries)
 				}
 				portsDir[port.Number] = fs.newDir(ctx, creds, defaultSysDirMode, portEntries)
 			}
@@ -403,3 +464,35 @@ func (fs *filesystem) newRDMASysfsEntries(ctx context.Context, creds *auth.Crede
 	return ibVerbsDir, ibDir
 }
 
+func (fs *filesystem) newRDMANetClassEntries(ctx context.Context, creds *auth.Credentials, data *RDMAData) map[string]kernfs.Inode {
+	if data == nil || len(data.NetDevices) == 0 {
+		return nil
+	}
+	netDir := make(map[string]kernfs.Inode)
+	addFile := func(m map[string]kernfs.Inode, name, val string) {
+		if val != "" {
+			m[name] = fs.newStaticFile(ctx, creds, defaultSysMode, val+"\n")
+		}
+	}
+	for _, dev := range data.NetDevices {
+		entries := make(map[string]kernfs.Inode)
+		addFile(entries, "type", dev.Type)
+		addFile(entries, "address", dev.Address)
+		addFile(entries, "mtu", dev.MTU)
+		addFile(entries, "dev_id", dev.DevID)
+		addFile(entries, "dev_port", dev.DevPort)
+		addFile(entries, "speed", dev.Speed)
+		addFile(entries, "duplex", dev.Duplex)
+		addFile(entries, "operstate", dev.OperState)
+		if strings.HasPrefix(dev.DevicePath, "/sys/") {
+			// /sys/class/net/<iface>/device is resolved relative to
+			// /sys/class/net/<iface>, so we need three ".." components to
+			// reach /sys before descending into devices/.
+			target := "../../../" + strings.TrimPrefix(dev.DevicePath, "/sys/")
+			entries["device"] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), target)
+		}
+		netDir[dev.Name] = fs.newDir(ctx, creds, defaultSysDirMode, entries)
+	}
+	log.Infof("rdma sysfs: built virtual /sys/class/net entries for %d device(s)", len(netDir))
+	return netDir
+}

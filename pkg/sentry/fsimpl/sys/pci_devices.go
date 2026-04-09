@@ -205,7 +205,7 @@ func DeserializePCIDevicesData(filePath string) *PCIDevicesData {
 //  2. Calling realpath() which resolves through the symlink
 //  3. Walking UP the resolved path reading "class" to find bridges
 //  4. Using the hierarchy depth to compute PCI distance between devices
-func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth.Credentials, data *PCIDevicesData) (devicesSub, pciBusSub, busPCIDevicesSub map[string]kernfs.Inode) {
+func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth.Credentials, data *PCIDevicesData, rdmaData *RDMAData) (devicesSub, pciBusSub, busPCIDevicesSub map[string]kernfs.Inode) {
 	if data == nil || len(data.Devices) == 0 {
 		return nil, nil, nil
 	}
@@ -223,8 +223,9 @@ func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth
 	type dirNode struct {
 		children map[string]*dirNode
 		files    map[string]string // attribute files
+		symlinks map[string]string // child symlink name -> target
 	}
-	root := &dirNode{children: make(map[string]*dirNode)}
+	root := &dirNode{children: make(map[string]*dirNode), files: make(map[string]string), symlinks: make(map[string]string)}
 
 	getOrCreate := func(pathFromSys string) *dirNode {
 		parts := strings.Split(pathFromSys, "/")
@@ -237,6 +238,7 @@ func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth
 				cur.children[part] = &dirNode{
 					children: make(map[string]*dirNode),
 					files:    make(map[string]string),
+					symlinks: make(map[string]string),
 				}
 			}
 			cur = cur.children[part]
@@ -248,6 +250,7 @@ func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth
 	pciBusSymlinks := make(map[string]string)
 	// busPCIDevicesSymlinks: addr -> relative symlink target from /sys/bus/pci/devices/<addr>
 	busPCIDevicesSymlinks := make(map[string]string)
+	pciAddrToRelPath := make(map[string]string)
 
 	for _, dev := range data.Devices {
 		// dev.RealPath is e.g. "/sys/devices/pci0000:07/0000:07:01.0/0000:0f:00.0"
@@ -256,6 +259,7 @@ func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth
 		if relPath == dev.RealPath {
 			continue // not under /sys
 		}
+		pciAddrToRelPath[strings.ToLower(dev.Address)] = relPath
 		node := getOrCreate(relPath)
 		node.files["class"] = dev.Class
 		node.files["vendor"] = dev.Vendor
@@ -302,6 +306,27 @@ func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth
 		}
 	}
 
+	if rdmaData != nil {
+		for _, dev := range rdmaData.Devices {
+			if dev.IBDev == "" || dev.PCISlotName == "" {
+				continue
+			}
+			relPath, ok := pciAddrToRelPath[strings.ToLower(dev.PCISlotName)]
+			if !ok {
+				continue
+			}
+			infinibandDir := getOrCreate(relPath + "/infiniband")
+			linkDir := filepath.Join("/sys", relPath, "infiniband")
+			target := filepath.Join("/sys/class/infiniband", dev.IBDev)
+			relTarget, err := filepath.Rel(linkDir, target)
+			if err != nil {
+				log.Warningf("pci sysfs: relative symlink for %s/%s: %v", relPath, dev.IBDev, err)
+				continue
+			}
+			infinibandDir.symlinks[dev.IBDev] = relTarget
+		}
+	}
+
 	// Convert the tree to kernfs inodes.
 	var buildDir func(node *dirNode) map[string]kernfs.Inode
 	buildDir = func(node *dirNode) map[string]kernfs.Inode {
@@ -310,6 +335,9 @@ func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth
 			if val != "" {
 				entries[name] = fs.newStaticFile(ctx, creds, defaultSysMode, val+"\n")
 			}
+		}
+		for name, target := range node.symlinks {
+			entries[name] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), target)
 		}
 		for name, child := range node.children {
 			entries[name] = fs.newDir(ctx, creds, defaultSysDirMode, buildDir(child))
