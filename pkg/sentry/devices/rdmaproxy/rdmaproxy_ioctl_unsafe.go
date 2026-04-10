@@ -640,9 +640,9 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 					fd.mu.Unlock()
 					dmaCleanup.Release()
 					log.Debugf("rdmaproxy: pinned MR handle=%d (%d ranges)", mrHandle, len(mrMirror.prs))
-				if mrMirror.mrSummary != "" {
-					log.Infof("rdmaproxy: MR_REG handle=%d %s", mrHandle, mrMirror.mrSummary)
-				}
+					if mrMirror.mrSummary != "" {
+						log.Infof("rdmaproxy: MR_REG handle=%d %s", mrHandle, mrMirror.mrSummary)
+					}
 				}
 			}
 
