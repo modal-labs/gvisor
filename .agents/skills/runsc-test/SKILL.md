@@ -21,6 +21,12 @@ $ARGUMENTS should start with two SSH hostnames, then optional flags:
 - `--gdr 0|3` — GDR level (default 3). Use 0 for CPU-staged RDMA fallback.
 - `--debug` — enable sentry debug logging for this run
 - `--build` — rebuild runsc from source before testing
+
+## SSH convention
+
+All SSH commands MUST use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`.
+Pipe stderr through `2>&1 | grep -v "^Warning"` to suppress known-hosts noise.
+See `/node-setup` for details.
 - SSH user is `modal`
 
 If no arguments given, ask the user for the node hostnames.

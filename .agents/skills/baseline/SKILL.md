@@ -18,6 +18,12 @@ Assumes `/node-setup` has already been run on both nodes.
 $ARGUMENTS should be two SSH hostnames, e.g.: `wo-abc123 wo-def456`
 - SSH user is `modal`
 
+## SSH convention
+
+All SSH commands MUST use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`.
+Pipe stderr through `2>&1 | grep -v "^Warning"` to suppress known-hosts noise.
+See `/node-setup` for details.
+
 ## Environment discovery
 
 Run on node 0 and parse the output. All subsequent steps use these values.
