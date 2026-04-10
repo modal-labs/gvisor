@@ -181,24 +181,46 @@ func ioctlNeedsHostNetns(action ioctlAction, objectID uint16, writeCmdVal uint64
 
 // Performance counters for diagnosing throughput regressions.
 var (
-	globalIoctlCount atomic.Uint64
-	globalWriteCount atomic.Uint64
-	globalReadCount  atomic.Uint64
-	reporterOnce     sync.Once
+	globalIoctlCount     atomic.Uint64
+	globalWriteCount     atomic.Uint64
+	globalReadCount      atomic.Uint64
+	globalMRRegCount     atomic.Uint64
+	globalMRDeregCount   atomic.Uint64
+	globalCQCreateCount  atomic.Uint64
+	globalCQDestroyCount atomic.Uint64
+	globalQPCreateCount  atomic.Uint64
+	globalQPDestroyCount atomic.Uint64
+	reporterOnce         sync.Once
 )
 
 func startPerfReporter() {
 	reporterOnce.Do(func() {
 		go func() {
 			var prevIoctl, prevWrite, prevRead uint64
+			var prevMRReg, prevMRDereg uint64
+			var prevCQCreate, prevCQDestroy uint64
+			var prevQPCreate, prevQPDestroy uint64
 			for {
 				time.Sleep(5 * time.Second)
 				curIoctl := globalIoctlCount.Load()
 				curWrite := globalWriteCount.Load()
 				curRead := globalReadCount.Load()
-				log.Warningf("rdmaproxy: PERF ioctl_rate=%d/5s write_rate=%d/5s read_rate=%d/5s total_ioctls=%d",
-					curIoctl-prevIoctl, curWrite-prevWrite, curRead-prevRead, curIoctl)
+				curMRReg := globalMRRegCount.Load()
+				curMRDereg := globalMRDeregCount.Load()
+				curCQCreate := globalCQCreateCount.Load()
+				curCQDestroy := globalCQDestroyCount.Load()
+				curQPCreate := globalQPCreateCount.Load()
+				curQPDestroy := globalQPDestroyCount.Load()
+				log.Warningf("rdmaproxy: PERF ioctl_rate=%d/5s write_rate=%d/5s read_rate=%d/5s mr_reg=%d mr_dereg=%d cq_create=%d cq_destroy=%d qp_create=%d qp_destroy=%d total_ioctls=%d",
+					curIoctl-prevIoctl, curWrite-prevWrite, curRead-prevRead,
+					curMRReg-prevMRReg, curMRDereg-prevMRDereg,
+					curCQCreate-prevCQCreate, curCQDestroy-prevCQDestroy,
+					curQPCreate-prevQPCreate, curQPDestroy-prevQPDestroy,
+					curIoctl)
 				prevIoctl, prevWrite, prevRead = curIoctl, curWrite, curRead
+				prevMRReg, prevMRDereg = curMRReg, curMRDereg
+				prevCQCreate, prevCQDestroy = curCQCreate, curCQDestroy
+				prevQPCreate, prevQPDestroy = curQPCreate, curQPDestroy
 			}
 		}()
 	})
@@ -290,6 +312,57 @@ const (
 	actionQPCreate
 	actionQPDestroy
 )
+
+func countAction(action ioctlAction) {
+	switch action {
+	case actionMRReg:
+		globalMRRegCount.Add(1)
+	case actionMRDereg:
+		globalMRDeregCount.Add(1)
+	case actionCQCreate:
+		globalCQCreateCount.Add(1)
+	case actionCQDestroy:
+		globalCQDestroyCount.Add(1)
+	case actionQPCreate:
+		globalQPCreateCount.Add(1)
+	case actionQPDestroy:
+		globalQPDestroyCount.Add(1)
+	}
+}
+
+func actionFromLegacyWriteCmd(cmdBase uint32) ioctlAction {
+	switch cmdBase {
+	case ibUserVerbsCmdRegMR:
+		return actionMRReg
+	case ibUserVerbsCmdDeregMR:
+		return actionMRDereg
+	case ibUserVerbsCmdCreateCQ:
+		return actionCQCreate
+	case ibUserVerbsCmdDestroyCQ:
+		return actionCQDestroy
+	case ibUserVerbsCmdCreateQP:
+		return actionQPCreate
+	case ibUserVerbsCmdDestroyQP:
+		return actionQPDestroy
+	default:
+		return actionNone
+	}
+}
+
+func taskLogFields(t *kernel.Task) string {
+	if t == nil {
+		return "tid=0 tgid_root=0"
+	}
+	return fmt.Sprintf("tid=%d tgid_root=%d", t.ThreadID(), t.TGIDInRoot())
+}
+
+func formatMRSummary(t *kernel.Task, sandboxVA, length uint64, sentryVA uintptr, oldHCAVA, newHCAVA, oldIOVA, newIOVA uint64) string {
+	relocated := sentryVA != uintptr(sandboxVA)
+	return fmt.Sprintf("app=%#x-%#x len=%d sentry=%#x-%#x relocated=%t hca_va=%#x->%#x iova=%#x->%#x %s",
+		sandboxVA, sandboxVA+length, length,
+		sentryVA, sentryVA+uintptr(length), relocated,
+		oldHCAVA, newHCAVA, oldIOVA, newIOVA, taskLogFields(t))
+}
 
 // ib_uverbs_reg_mr struct field offsets.
 const (
@@ -505,6 +578,7 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 
 	// Classify and prepare DMA page mirroring before forwarding.
 	action, writeCmdVal := fd.classifyIoctl(buf, int(numAttrs), objectID, methodID)
+	countAction(action)
 
 	var mrMirror *mirroredPages
 	var cqqpMirror *pinnedDMABufs
@@ -566,6 +640,9 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 					fd.mu.Unlock()
 					dmaCleanup.Release()
 					log.Debugf("rdmaproxy: pinned MR handle=%d (%d ranges)", mrHandle, len(mrMirror.prs))
+				if mrMirror.mrSummary != "" {
+					log.Infof("rdmaproxy: MR_REG handle=%d %s", mrHandle, mrMirror.mrSummary)
+				}
 				}
 			}
 
@@ -796,7 +873,9 @@ func (fd *uverbsFD) prepareMRRegInvokeWrite(t *kernel.Task, buf []byte, numAttrs
 	}
 
 	oldHCAVA := binary.LittleEndian.Uint64(rw.sentry[regMROffHcaVA : regMROffHcaVA+8])
-	if newHCAVA, relocated := translatedRelocatedGPUVA(mp, sandboxVA, sentryVA, oldHCAVA); relocated {
+	newHCAVA := oldHCAVA
+	if translatedHCAVA, relocated := translatedRelocatedGPUVA(mp, sandboxVA, sentryVA, oldHCAVA); relocated {
+		newHCAVA = translatedHCAVA
 		binary.LittleEndian.PutUint64(rw.sentry[regMROffHcaVA:regMROffHcaVA+8], newHCAVA)
 		log.Warningf("rdmaproxy: relocated GPU MR rewrote hca_va %#x → sentry %#x (start %#x → %#x)",
 			oldHCAVA, newHCAVA, sandboxVA, sentryVA)
@@ -807,6 +886,9 @@ func (fd *uverbsFD) prepareMRRegInvokeWrite(t *kernel.Task, buf []byte, numAttrs
 	binary.LittleEndian.PutUint64(rw.sentry[regMROffStart:regMROffStart+8], uint64(sentryVA))
 	log.Debugf("rdmaproxy: MR REG rewrote start %#x → sentry %#x (hca_va=%#x)",
 		sandboxVA, sentryVA, binary.LittleEndian.Uint64(rw.sentry[regMROffHcaVA:regMROffHcaVA+8]))
+	if mp != nil {
+		mp.mrSummary = formatMRSummary(t, sandboxVA, length, sentryVA, oldHCAVA, newHCAVA, 0, 0)
+	}
 
 	return mp, nil
 }
@@ -843,9 +925,12 @@ func (fd *uverbsFD) prepareMRRegModern(t *kernel.Task, buf []byte, numAttrs int,
 		return nil, fmt.Errorf("mirrorSandboxPages: %w", err)
 	}
 
+	oldIOVA, newIOVA := sandboxVA, sandboxVA
 	if iovaRW := findRewrite(buf, numAttrs, rewrites, uverbsAttrRegMRIova); iovaRW != nil && len(iovaRW.sentry) >= 8 {
-		oldIOVA := binary.LittleEndian.Uint64(iovaRW.sentry[0:8])
-		if newIOVA, relocated := translatedRelocatedGPUVA(mp, sandboxVA, sentryVA, oldIOVA); relocated {
+		oldIOVA = binary.LittleEndian.Uint64(iovaRW.sentry[0:8])
+		newIOVA = oldIOVA
+		if translatedIOVA, relocated := translatedRelocatedGPUVA(mp, sandboxVA, sentryVA, oldIOVA); relocated {
+			newIOVA = translatedIOVA
 			binary.LittleEndian.PutUint64(iovaRW.sentry[0:8], newIOVA)
 			log.Warningf("rdmaproxy: relocated GPU MR rewrote iova %#x → sentry %#x (addr %#x → %#x)",
 				oldIOVA, newIOVA, sandboxVA, sentryVA)
@@ -855,6 +940,9 @@ func (fd *uverbsFD) prepareMRRegModern(t *kernel.Task, buf []byte, numAttrs int,
 	// Rewrite ADDR to sentry address. IOVA attr (if present) stays as sandbox VA.
 	binary.LittleEndian.PutUint64(addrRW.sentry[0:8], uint64(sentryVA))
 	log.Debugf("rdmaproxy: MR REG (modern) rewrote addr %#x → sentry %#x", sandboxVA, sentryVA)
+	if mp != nil {
+		mp.mrSummary = formatMRSummary(t, sandboxVA, length, sentryVA, 0, 0, oldIOVA, newIOVA)
+	}
 
 	return mp, nil
 }
@@ -1014,9 +1102,11 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		mmapLength uint64
 		prepare    func(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
 	}
+	taskFields := taskLogFields(t)
 
 	if shared := acquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen)); shared != nil {
-		log.Infof("rdmaproxy: reusing shared nvidia-backed VMA for GPU VA %#x-%#x", alignedStart, uint64(alignedStart)+alignedLen)
+		log.Infof("rdmaproxy: reusing shared nvidia-backed VMA for GPU VA %#x-%#x (%s)",
+			alignedStart, uint64(alignedStart)+alignedLen, taskFields)
 		sentryVA := shared.mappedStart + uintptr(addr-uint64(alignedStart))
 		return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
 	}
@@ -1122,6 +1212,9 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 					unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
 					uintptr(candidate.hostFD), 0)
 				if errno == unix.EEXIST {
+					log.Warningf("rdmaproxy: GPU VA collision at %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d (%s); retrying at any free sentry VA",
+						alignedStart, uint64(alignedStart)+alignedLen,
+						candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, taskFields)
 					// Overlapping GPU registrations often reuse the same underlying
 					// allocation with a different length. Re-map the same NVIDIA
 					// memmap context at any free sentry VA instead of falling back
@@ -1137,18 +1230,18 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			lastErr = errno
 			if lastErr == 0 {
 				if reused {
-					log.Infof("rdmaproxy: reused existing nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d",
-						alignedStart, uint64(alignedStart)+alignedLen, candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength)
+					log.Infof("rdmaproxy: reused existing nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d (%s)",
+						alignedStart, uint64(alignedStart)+alignedLen, candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, taskFields)
 				} else {
-					log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d → sentry %#x",
-						alignedStart, uint64(alignedStart)+alignedLen, candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, mapped)
+					log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d → sentry %#x (%s)",
+						alignedStart, uint64(alignedStart)+alignedLen, candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, mapped, taskFields)
 				}
 				sentryVA := mapped + uintptr(addr-uint64(alignedStart))
 				return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
 			}
 			last = candidate
-			log.Debugf("rdmaproxy: GPU VMA mmap failed via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d at %#x len %d: %v",
-				candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, alignedStart, alignedLen, lastErr)
+			log.Debugf("rdmaproxy: GPU VMA mmap failed via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d at %#x len %d (%s): %v",
+				candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, alignedStart, alignedLen, taskFields, lastErr)
 		}
 
 		if candidate.prepare == nil {
@@ -1174,6 +1267,9 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 				unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
 				uintptr(preparedHostFD), 0)
 			if errno == unix.EEXIST {
+				log.Warningf("rdmaproxy: GPU VA collision at %#x-%#x via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d (%s); retrying at any free sentry VA",
+					alignedStart, uint64(alignedStart)+alignedLen,
+					preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, taskFields)
 				mapped, _, errno = unix.RawSyscall6(unix.SYS_MMAP,
 					0, uintptr(alignedLen),
 					unix.PROT_READ|unix.PROT_WRITE,
@@ -1186,18 +1282,18 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		lastErr = errno
 		if lastErr == 0 {
 			if reused {
-				log.Infof("rdmaproxy: reused existing nvidia-backed VMA for GPU VA %#x-%#x via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d",
-					alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength)
+				log.Infof("rdmaproxy: reused existing nvidia-backed VMA for GPU VA %#x-%#x via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d (%s)",
+					alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, taskFields)
 			} else {
-				log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d → sentry %#x",
-					alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, mapped)
+				log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d → sentry %#x (%s)",
+					alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, mapped, taskFields)
 			}
 			sentryVA := mapped + uintptr(addr-uint64(alignedStart))
 			return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
 		}
 		last = preparedCandidate
-		log.Debugf("rdmaproxy: GPU VMA mmap failed via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d at %#x len %d: %v",
-			preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, alignedStart, alignedLen, lastErr)
+		log.Debugf("rdmaproxy: GPU VMA mmap failed via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d at %#x len %d (%s): %v",
+			preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, alignedStart, alignedLen, taskFields, lastErr)
 	}
 
 	return nil, 0, fmt.Errorf("all %d nvidia frontend mmap attempts failed for GPU VA %#x len %d (last sandboxFD=%d hostFD=%d dev=%q mmapLen=%d: %w)",
@@ -1412,6 +1508,10 @@ func (fd *uverbsFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.
 
 	log.Debugf("rdmaproxy: Write cmd=%d extended=%v in_words=%d out_words=%d len=%d",
 		cmdBase, isExtended, inWords, outWords, size)
+	startPerfReporter()
+	if !isExtended {
+		countAction(actionFromLegacyWriteCmd(cmdBase))
+	}
 
 	// Response pointer is always at byte offset 8 (first field of the
 	// command-specific struct for non-extended, or the ex_hdr for extended).
@@ -1455,7 +1555,9 @@ func (fd *uverbsFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.
 					mrMirror = mp
 					cu = cleanup.Make(func() { mp.release(t) })
 					oldHCAVA := binary.LittleEndian.Uint64(data[hcaVAOff : hcaVAOff+8])
-					if newHCAVA, relocated := translatedRelocatedGPUVA(mp, sva, sentryVA, oldHCAVA); relocated {
+					newHCAVA := oldHCAVA
+					if translatedHCAVA, relocated := translatedRelocatedGPUVA(mp, sva, sentryVA, oldHCAVA); relocated {
+						newHCAVA = translatedHCAVA
 						binary.LittleEndian.PutUint64(data[hcaVAOff:hcaVAOff+8], newHCAVA)
 						log.Warningf("rdmaproxy: Write REG_MR relocated GPU hca_va %#x → sentry %#x (start %#x → %#x)",
 							oldHCAVA, newHCAVA, sva, sentryVA)
@@ -1464,6 +1566,9 @@ func (fd *uverbsFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.
 					log.Debugf("rdmaproxy: Write REG_MR rewrite start %#x → sentry %#x (hca_va=%#x)",
 						sva, sentryVA,
 						binary.LittleEndian.Uint64(data[hcaVAOff:hcaVAOff+8]))
+					if mp != nil {
+						mp.mrSummary = formatMRSummary(t, sva, length, sentryVA, oldHCAVA, newHCAVA, 0, 0)
+					}
 				}
 			}
 
@@ -1514,6 +1619,9 @@ func (fd *uverbsFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.
 				fd.mu.Unlock()
 				cu.Release()
 				log.Debugf("rdmaproxy: Write REG_MR pinned handle=%d (%d ranges)", mrHandle, len(mrMirror.prs))
+				if mrMirror.mrSummary != "" {
+					log.Infof("rdmaproxy: Write MR_REG handle=%d %s", mrHandle, mrMirror.mrSummary)
+				}
 			}
 
 		case ibUserVerbsCmdDeregMR:
@@ -1692,6 +1800,7 @@ func (fd *uverbsFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.R
 // Uses fdnotifier to check readiness before reading, so we never
 // issue a blocking read() syscall on the host FD.
 func (fd *asyncEventFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	globalReadCount.Add(1)
 	if fdnotifier.NonBlockingPoll(fd.hostFD, waiter.ReadableEvents) == 0 {
 		return 0, linuxerr.ErrWouldBlock
 	}

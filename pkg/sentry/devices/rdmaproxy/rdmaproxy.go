@@ -120,6 +120,9 @@ type mirroredPages struct {
 	// across multiple MRs for the same GPU VA range.
 	sharedGPUVMA *sharedGPUVMA
 	len          uintptr
+	// mrSummary is an optional compact registration summary emitted once the
+	// host returns an MR handle successfully.
+	mrSummary string
 }
 
 func (mp *mirroredPages) release(ctx context.Context) {

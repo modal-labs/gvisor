@@ -19,12 +19,14 @@ $ARGUMENTS should be two SSH hostnames, e.g.: `wo-abc123 wo-def456`
 
 ## Steps
 
-### 1. Verify connectivity
-SSH to both nodes in parallel and verify they respond:
+### 1. Verify connectivity and InfiniBand
+SSH to both nodes in parallel and verify they respond AND have InfiniBand:
 ```
-ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 modal@<node0> 'echo ok'
-ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 modal@<node1> 'echo ok'
+ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 modal@<node0> 'echo ok && ls /dev/infiniband/uverbs* && ibstat | grep -E "CA |State"'
+ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 modal@<node1> 'echo ok && ls /dev/infiniband/uverbs* && ibstat | grep -E "CA |State"'
 ```
+**IMPORTANT:** If `/dev/infiniband/` does not exist on a node, STOP and tell the user.
+These nodes lack InfiniBand hardware and cannot run RDMA tests. Do NOT proceed with setup.
 
 ### 2. Fix git remotes and pull
 Both nodes need HTTPS git remote (SSH keys may not work for GitHub):
