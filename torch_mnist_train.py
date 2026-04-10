@@ -126,6 +126,12 @@ def main():
 
     measure_bus_bandwidth(local_rank)
 
+    if os.environ.get("BW_ONLY", ""):
+        if rank == 0:
+            print("BW_ONLY set, skipping training.", flush=True)
+        cleanup()
+        return
+
     train_set, val_set = get_dataset()
     train_sampler = DistributedSampler(train_set, num_replicas=world_size, rank=rank)
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, sampler=train_sampler,

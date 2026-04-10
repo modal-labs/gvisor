@@ -6,6 +6,9 @@ Covers bare metal, Docker (runc), and gVisor (runsc-rdma).
 ## 1. Host prerequisites (both nodes)
 
 ```bash
+# Verify InfiniBand exists before proceeding
+ls /dev/infiniband/uverbs* || { echo "No InfiniBand — wrong node type"; exit 1; }
+
 # Clone and build gVisor
 git clone https://github.com/modal-labs/gvisor.git && cd gvisor
 git checkout alessio/development
@@ -15,25 +18,37 @@ sudo chmod +x /usr/local/bin/runsc
 # Load nvidia_peermem for GPUDirect RDMA
 sudo modprobe nvidia_peermem
 
-# Install PyTorch
-sudo apt install -y python3-pip
-pip3 install torch torchvision
+# Install PyTorch (pip3 may not be preinstalled on Modal workers)
 export PATH="$HOME/.local/bin:$PATH"
+pip3 --version 2>/dev/null || curl -sS https://bootstrap.pypa.io/get-pip.py | python3 -
+pip3 install torch torchvision
 ```
 
 ## 2. Discover node IPs and IB HCAs
 
 ```bash
 # Node A IP (use eth0 or ens7, whichever exists)
-export MASTER_ADDR=$(ip -4 addr show eth0 | grep inet | awk '{print $2}' | awk -F/ '{print $1}')
+export MASTER_ADDR=$(ip -4 addr show eth0 2>/dev/null | grep inet | awk '{print $2}' | awk -F/ '{print $1}')
+[ -z "$MASTER_ADDR" ] && export MASTER_ADDR=$(ip -4 addr show ens7 | grep inet | awk '{print $2}' | awk -F/ '{print $1}')
 echo "export MASTER_ADDR=$MASTER_ADDR"
 # Copy and paste this export on Node B.
 
-# List active IB devices
-ibstat | grep -E "CA |State"
+# List active IB devices (exclude DOWN ports)
+for dev in /sys/class/infiniband/mlx5_*; do
+  d=$(basename $dev)
+  state=$(cat $dev/ports/1/state)
+  echo "$d: $state"
+done
 
-# Set HCA list (adjust per hardware — exclude management/down ports)
-export NCCL_IB_HCA=mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12
+# Set HCA list — only include ACTIVE ports (state "4: ACTIVE")
+# Examples seen in practice:
+#   B200 nodes:  mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_11,mlx5_12
+#   H200 nodes:  mlx5_0,mlx5_1,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_9,mlx5_10,mlx5_11
+export NCCL_IB_HCA=$(for dev in /sys/class/infiniband/mlx5_*; do
+  d=$(basename $dev)
+  grep -q "4: ACTIVE" $dev/ports/1/state 2>/dev/null && echo -n "$d,"
+done | sed 's/,$//')
+echo "NCCL_IB_HCA=$NCCL_IB_HCA"
 ```
 
 ## 3. Bare-metal test
@@ -44,8 +59,8 @@ sudo prlimit --pid=$$ --memlock=unlimited:unlimited
 NCCL_DEBUG=INFO \
 NCCL_NET_GDR_LEVEL=3 \
 NCCL_DMABUF_ENABLE=1 \
-NCCL_SOCKET_IFNAME=eth0 \
-GLOO_SOCKET_IFNAME=eth0 \
+NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}" \
+GLOO_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}" \
 NCCL_IB_HCA="$NCCL_IB_HCA" \
 OMP_NUM_THREADS=1 \
 torchrun --nproc_per_node=8 --nnodes=2 \
@@ -53,7 +68,11 @@ torchrun --nproc_per_node=8 --nnodes=2 \
   --node_rank=0 ./torch_mnist_train.py
 ```
 
-Set `--node_rank=1` on Node B.
+Set `--node_rank=1` on Node B. Use `NCCL_SOCKET_IFNAME=ens7` on nodes
+that have `ens7` instead of `eth0`.
+
+Add `BW_ONLY=1` to skip training and only run the allreduce bandwidth
+measurement (5 warmup + 20 trials at 4 GB). Much faster feedback loop.
 
 **Expected:** ~386 GB/s busbw, GDR 1, PXN 1, 20 coll channels.
 
@@ -128,17 +147,19 @@ sudo systemctl restart docker
 
 ```bash
 DEVS=$(ls /dev/infiniband/uverbs* | sed 's/^/--device=/' | tr '\n' ' ')
+PYVER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+IFNAME=$(ip -4 addr show ens7 &>/dev/null && echo ens7 || echo eth0)
 
 sudo docker run --runtime=runc --rm --gpus all $DEVS \
   --ulimit memlock=-1:-1 --shm-size=1g --network=host \
-  -v $HOME/.local/lib/python3.10/site-packages:/usr/local/lib/python3.10/dist-packages \
+  -v $HOME/.local/lib/python${PYVER}/site-packages:/usr/local/lib/python${PYVER}/dist-packages \
   -v $HOME/.local/bin:/usr/local/bin \
   -v $HOME/gvisor:/workspace \
   -e NCCL_DEBUG=INFO \
   -e NCCL_NET_GDR_LEVEL=3 \
   -e NCCL_DMABUF_ENABLE=1 \
-  -e NCCL_SOCKET_IFNAME=eth0 \
-  -e GLOO_SOCKET_IFNAME=eth0 \
+  -e NCCL_SOCKET_IFNAME=$IFNAME \
+  -e GLOO_SOCKET_IFNAME=$IFNAME \
   -e NCCL_IB_HCA=$NCCL_IB_HCA \
   -e OMP_NUM_THREADS=1 \
   -w /workspace \
@@ -155,19 +176,22 @@ sudo docker run --runtime=runc --rm --gpus all $DEVS \
 Same command, replace `--runtime=runc` with `--runtime=runsc-rdma`.
 
 ```bash
+# Generate topo XML once on bare metal (single-node is enough):
+#   NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo.xml torchrun --nproc_per_node=8 --nnodes=1 ...
+
 sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
   --ulimit memlock=-1:-1 --shm-size=1g --network=host \
-  -v $HOME/.local/lib/python3.10/site-packages:/usr/local/lib/python3.10/dist-packages \
+  -v $HOME/.local/lib/python${PYVER}/site-packages:/usr/local/lib/python${PYVER}/dist-packages \
   -v $HOME/.local/bin:/usr/local/bin \
   -v $HOME/gvisor:/workspace \
-  -v /tmp/nccl_topo.xml:/topo.xml:ro \
   -e NCCL_DEBUG=INFO \
-  -e NCCL_NET_GDR_LEVEL=0 \
-  -e NCCL_DMABUF_ENABLE=0 \
-  -e NCCL_TOPO_FILE=/topo.xml \
-  -e NCCL_SOCKET_IFNAME=eth0 \
-  -e GLOO_SOCKET_IFNAME=eth0 \
+  -e NCCL_NET_GDR_LEVEL=3 \
+  -e NCCL_DMABUF_ENABLE=1 \
+  -e NCCL_TOPO_FILE=/workspace/nccl_topo.xml \
+  -e NCCL_SOCKET_IFNAME=$IFNAME \
+  -e GLOO_SOCKET_IFNAME=$IFNAME \
   -e NCCL_IB_HCA=$NCCL_IB_HCA \
+  -e BW_ONLY=1 \
   -e OMP_NUM_THREADS=1 \
   -w /workspace \
   torch-slim \
@@ -176,29 +200,56 @@ sudo docker run --runtime=runsc-rdma --rm --gpus all $DEVS \
     --node_rank=0 ./torch_mnist_train.py
 ```
 
-**Important:** Use `NCCL_NET_GDR_LEVEL=0` with gVisor. GPUDirect RDMA (GDR=3)
-is not yet supported because GPU device memory VAs have no VMA in the sentry's
-address space. With GDR=0 (CPU-staged), expect ~90 GB/s busbw (vs ~386 bare metal).
+Add `BW_ONLY=1` (`-e BW_ONLY=1`) to skip training and only measure bandwidth.
 
-Also requires `NCCL_TOPO_FILE` pointing to a topo XML generated on bare metal
-(gVisor hides PCI topology from the container).
+Requires `NCCL_TOPO_FILE` pointing to a topo XML generated on bare metal
+(gVisor hides PCI topology from the container). Generate one with a single-node
+bare-metal run using `NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo.xml`.
+
+**Expected (GDR=3, 8 GPUs):** busbw comparable to bare metal.
+**Expected (GDR=0, 8 GPUs):** ~22 GB/s busbw (CPU-staged, ~20x slower).
 
 ## 7. Verify RDMA with port counters
 
-Read IB port counters before and after a test to confirm bytes flow over the wire:
+Read IB port counters before and after a test to confirm bytes actually flow
+over the wire. Counters are in 4-byte words — multiply deltas by 4 to get bytes.
 
 ```bash
-# Before test
-for dev in mlx5_5 mlx5_6 mlx5_9 mlx5_10 mlx5_11; do
+# Build the list of active HCAs (same as NCCL_IB_HCA)
+ACTIVE_HCAS=$(for dev in /sys/class/infiniband/mlx5_*; do
+  d=$(basename $dev)
+  grep -q "4: ACTIVE" $dev/ports/1/state 2>/dev/null && echo "$d"
+done)
+
+# Snapshot counters (run before AND after the test)
+for dev in $ACTIVE_HCAS; do
   rcv=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data)
   xmit=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_xmit_data)
   echo "$dev: rcv=$rcv xmit=$xmit"
 done
-
-# ... run test ...
-
-# After test (same loop — compute deltas)
 ```
+
+Run the snapshot, execute the test, run the snapshot again, then compute deltas:
+
+```bash
+# Compute deltas (paste before/after values into a script, or eyeball them).
+# Convert words to GB:  delta_words * 4 / 1e9
+#
+# Example from an 8xH200 gVisor run (GDR=0, 8 active rails):
+#   mlx5_0:  rcv=12.87 GB  xmit=12.89 GB
+#   mlx5_3:  rcv=12.99 GB  xmit=13.33 GB
+#   ...
+#   Total:   rcv≈103 GB    xmit≈105 GB   (across 8 HCAs)
+#
+# HCAs with zero delta (e.g. mlx5_1, mlx5_7) are management/NVSwitch ports,
+# not inter-node NICs — this is expected.
+```
+
+**What to look for:**
+- All inter-node HCAs should show non-zero deltas (confirms multi-rail).
+- Traffic should be roughly balanced across rails (~equal per-HCA).
+- rcv ≈ xmit (symmetric for allreduce).
+- Total bytes should be consistent with the reported busbw × test duration.
 
 ## 8. Verify RDMA bandwidth with ib_write_bw
 
