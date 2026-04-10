@@ -112,16 +112,16 @@ export GDR=<0 or 3>
 export DMABUF=$( [ "$GDR" = "3" ] && echo 1 || echo 0 )
 
 # Cleanup any stale containers
-ssh -o StrictHostKeyChecking=no modal@$NODE1 'sudo docker rm -f nccl-runsc 2>/dev/null; echo ok' 2>&1
-ssh -o StrictHostKeyChecking=no modal@$NODE0 'sudo docker kill $(sudo docker ps -q) 2>/dev/null; echo ok' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'sudo docker rm -f nccl-runsc 2>/dev/null; echo ok' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE0 'sudo docker kill $(sudo docker ps -q) 2>/dev/null; echo ok' 2>&1
 
 # BEFORE port counters (both nodes)
 echo "=== BEFORE ==="
-ssh -o StrictHostKeyChecking=no modal@$NODE0 'for dev in $(ls -d /sys/class/infiniband/mlx5_* | xargs -I{} basename {}); do rcv=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data); xmit=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_xmit_data); echo "N0 $dev: rcv=$rcv xmit=$xmit"; done' 2>&1
-ssh -o StrictHostKeyChecking=no modal@$NODE1 'for dev in $(ls -d /sys/class/infiniband/mlx5_* | xargs -I{} basename {}); do rcv=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data); xmit=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_xmit_data); echo "N1 $dev: rcv=$rcv xmit=$xmit"; done' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE0 'for dev in $(ls -d /sys/class/infiniband/mlx5_* | xargs -I{} basename {}); do rcv=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data); xmit=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_xmit_data); echo "N0 $dev: rcv=$rcv xmit=$xmit"; done' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'for dev in $(ls -d /sys/class/infiniband/mlx5_* | xargs -I{} basename {}); do rcv=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data); xmit=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_xmit_data); echo "N1 $dev: rcv=$rcv xmit=$xmit"; done' 2>&1
 
 # Launch node 1 (background via nohup on remote)
-ssh -o StrictHostKeyChecking=no modal@$NODE1 "bash -c '
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 "bash -c '
 DEVS=\$(ls /dev/infiniband/uverbs* | sed \"s/^/--device=/\" | tr \"\n\" \" \")
 NCCL_IB_HCA=\$(for dev in /sys/class/infiniband/mlx5_*; do d=\$(basename \$dev); grep -q \"4: ACTIVE\" \$dev/ports/1/state 2>/dev/null && echo -n \"\$d,\"; done | sed \"s/,\$//\")
 nohup sudo docker run --runtime=runsc-rdma --name nccl-runsc --gpus all \$DEVS \
@@ -141,11 +141,11 @@ echo launched
 
 # Wait for container to start
 sleep 3
-ssh -o StrictHostKeyChecking=no modal@$NODE1 'sudo docker ps --filter name=nccl-runsc --format "{{.Names}} {{.Status}}"' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'sudo docker ps --filter name=nccl-runsc --format "{{.Names}} {{.Status}}"' 2>&1
 
 # Launch node 0 (foreground — blocks until test completes)
 echo "=== NODE 0 OUTPUT ==="
-ssh -o StrictHostKeyChecking=no modal@$NODE0 "
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE0 "
 DEVS=\$(ls /dev/infiniband/uverbs* | sed 's/^/--device=/' | tr '\n' ' ')
 NCCL_IB_HCA=\$(for dev in /sys/class/infiniband/mlx5_*; do d=\$(basename \$dev); grep -q '4: ACTIVE' \$dev/ports/1/state 2>/dev/null && echo -n \"\$d,\"; done | sed 's/,$//')
 sudo docker run --runtime=runsc-rdma --rm --gpus all \$DEVS \
@@ -163,12 +163,12 @@ sudo docker run --runtime=runsc-rdma --rm --gpus all \$DEVS \
 
 # AFTER port counters (both nodes)
 echo "=== AFTER ==="
-ssh -o StrictHostKeyChecking=no modal@$NODE0 'for dev in $(ls -d /sys/class/infiniband/mlx5_* | xargs -I{} basename {}); do rcv=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data); xmit=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_xmit_data); echo "N0 $dev: rcv=$rcv xmit=$xmit"; done' 2>&1
-ssh -o StrictHostKeyChecking=no modal@$NODE1 'for dev in $(ls -d /sys/class/infiniband/mlx5_* | xargs -I{} basename {}); do rcv=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data); xmit=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_xmit_data); echo "N1 $dev: rcv=$rcv xmit=$xmit"; done' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE0 'for dev in $(ls -d /sys/class/infiniband/mlx5_* | xargs -I{} basename {}); do rcv=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data); xmit=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_xmit_data); echo "N0 $dev: rcv=$rcv xmit=$xmit"; done' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'for dev in $(ls -d /sys/class/infiniband/mlx5_* | xargs -I{} basename {}); do rcv=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_rcv_data); xmit=$(cat /sys/class/infiniband/$dev/ports/1/counters/port_xmit_data); echo "N1 $dev: rcv=$rcv xmit=$xmit"; done' 2>&1
 
 # Node 1 log and cleanup
 echo "=== NODE 1 LOG ==="
-ssh -o StrictHostKeyChecking=no modal@$NODE1 'cat /tmp/nccl-runsc.log | grep -E "busbw|algbw|FATAL|ibv_reg_mr|BW_ONLY" | head -10; sudo docker rm -f nccl-runsc 2>/dev/null' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'cat /tmp/nccl-runsc.log | grep -E "busbw|algbw|FATAL|ibv_reg_mr|BW_ONLY" | head -10; sudo docker rm -f nccl-runsc 2>/dev/null' 2>&1
 ```
 
 After running, compute port counter deltas:

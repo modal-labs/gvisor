@@ -50,7 +50,7 @@ export IFNAME="<eth0 or ens7>"
 export NCCL_IB_HCA="<active HCA list>"
 
 # Node 1 (background)
-ssh -o StrictHostKeyChecking=no modal@$NODE1 "bash -c '
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 "bash -c '
 sudo prlimit --pid=\$\$ --memlock=unlimited:unlimited && export PATH=\$HOME/.local/bin:\$PATH && cd ~/gvisor && \
   NCCL_DEBUG=INFO NCCL_NET_GDR_LEVEL=3 NCCL_DMABUF_ENABLE=1 \
   NCCL_SOCKET_IFNAME=$IFNAME GLOO_SOCKET_IFNAME=$IFNAME \
@@ -64,7 +64,7 @@ sleep 3
 
 # Node 0 (foreground, with topo dump)
 echo "=== BARE METAL ==="
-ssh -o StrictHostKeyChecking=no modal@$NODE0 "
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE0 "
 sudo prlimit --pid=\$\$ --memlock=unlimited:unlimited && export PATH=\$HOME/.local/bin:\$PATH && cd ~/gvisor && \
   NCCL_DEBUG=INFO NCCL_NET_GDR_LEVEL=3 NCCL_DMABUF_ENABLE=1 \
   NCCL_SOCKET_IFNAME=$IFNAME GLOO_SOCKET_IFNAME=$IFNAME \
@@ -75,12 +75,12 @@ sudo prlimit --pid=\$\$ --memlock=unlimited:unlimited && export PATH=\$HOME/.loc
 " 2>&1
 
 echo "=== NODE 1 LOG ==="
-ssh -o StrictHostKeyChecking=no modal@$NODE1 'cat /tmp/bare-metal-n1.log | grep -E "busbw|algbw|FATAL" | head -5' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'cat /tmp/bare-metal-n1.log | grep -E "busbw|algbw|FATAL" | head -5' 2>&1
 ```
 
 After the run, copy topo XML to the repo and to node 1:
 ```bash
-ssh -o StrictHostKeyChecking=no modal@$NODE0 'cp /tmp/nccl_topo.xml ~/gvisor/nccl_topo.xml'
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE0 'cp /tmp/nccl_topo.xml ~/gvisor/nccl_topo.xml'
 scp -o StrictHostKeyChecking=no modal@$NODE0:~/gvisor/nccl_topo.xml /tmp/nccl_topo.xml
 scp -o StrictHostKeyChecking=no /tmp/nccl_topo.xml modal@$NODE1:~/gvisor/nccl_topo.xml
 ```
@@ -97,10 +97,10 @@ export PORT=<different unique port>
 export PYVER="<from env discovery>"
 
 # Cleanup
-ssh -o StrictHostKeyChecking=no modal@$NODE1 'sudo docker rm -f runc-test 2>/dev/null' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'sudo docker rm -f runc-test 2>/dev/null' 2>&1
 
 # Node 1 (background)
-ssh -o StrictHostKeyChecking=no modal@$NODE1 "bash -c '
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 "bash -c '
 DEVS=\$(ls /dev/infiniband/uverbs* | sed \"s/^/--device=/\" | tr \"\n\" \" \")
 nohup sudo docker run --runtime=runc --name runc-test --gpus all \$DEVS \
   --ulimit memlock=-1:-1 --shm-size=1g --network=host \
@@ -117,11 +117,11 @@ echo launched
 '" 2>&1
 
 sleep 3
-ssh -o StrictHostKeyChecking=no modal@$NODE1 'sudo docker ps --filter name=runc-test --format "{{.Names}} {{.Status}}"' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'sudo docker ps --filter name=runc-test --format "{{.Names}} {{.Status}}"' 2>&1
 
 # Node 0 (foreground)
 echo "=== RUNC ==="
-ssh -o StrictHostKeyChecking=no modal@$NODE0 "
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE0 "
 DEVS=\$(ls /dev/infiniband/uverbs* | sed 's/^/--device=/' | tr '\n' ' ')
 sudo docker run --runtime=runc --rm --gpus all \$DEVS \
   --ulimit memlock=-1:-1 --shm-size=1g --network=host \
@@ -136,7 +136,7 @@ sudo docker run --runtime=runc --rm --gpus all \$DEVS \
 " 2>&1
 
 echo "=== NODE 1 LOG ==="
-ssh -o StrictHostKeyChecking=no modal@$NODE1 'cat /tmp/runc-n1.log | grep -E "busbw|algbw|FATAL" | head -5; sudo docker rm -f runc-test 2>/dev/null' 2>&1
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'cat /tmp/runc-n1.log | grep -E "busbw|algbw|FATAL" | head -5; sudo docker rm -f runc-test 2>/dev/null' 2>&1
 ```
 
 **Expected:** Matches bare-metal. If busbw is ~4 GB/s with 2 channels, the

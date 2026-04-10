@@ -1,25 +1,79 @@
 # RDMA Plan - 2026-04-10
 
+## Blocking Error
+
+Current blocking failure:
+
+- `ibv_reg_mr_iova2` returns `Bad address`
+- the host `REG_MR` ioctl returns `EFAULT`
+- this first appears once the run exercises true GPU-backed registration
+- `3+ GPU/node` fails before meaningful RDMA traffic reaches the HCAs
+
+What that means right now:
+
+- this is a control-path / registration bug
+- it is happening before the RDMA data plane is established
+- the immediate goal is not scaling or performance tuning
+- the immediate goal is to make one true GPU-backed `MR_REG` succeed
+
+## Immediate Debug Goal
+
+The next debugger should treat this as the primary question:
+
+- why does a sentry-created NVIDIA-backed VMA still fail GPU-backed
+  `ibv_reg_mr`?
+
+The first success criterion is:
+
+- one confirmed successful true GPU-backed `MR_REG` on a `0xa1...` or `0x50...`
+  range
+- with a real MR handle returned
+- and no `EFAULT`
+
+## Project Objective
+
+The broader project objective is still:
+
+- get `runsc-rdma` within `10%` of `runc` on multi-node NCCL `busbw`
+- `runc` reference: about `484 GB/s`
+- target floor: about `436 GB/s`
+
+That objective remains important, but it is downstream of the current blocking
+GPU-backed `MR_REG` bug.
+
+Do not start with:
+
+- per-rank/per-`mm` architecture work
+- broad performance tuning
+- helper-process routing changes
+
+until that one path succeeds.
+
+## Immediate Debug Checklist
+
+For the first debugging pass, answer only these questions:
+
+1. Is the failing `MR_REG` actually GPU-backed?
+2. Did it go through `mirrorGPUDeviceMemory()`?
+3. Was the resulting VMA:
+   - direct
+   - prepared
+   - reused from `sharedGPUVMAs`
+   - relocated after `EEXIST`
+4. Which `hostFD` / device / mmap provenance produced that VMA?
+5. Was the VMA identity-mapped or relocated?
+6. Did the host `REG_MR` return an MR handle or `EFAULT`?
+
+Until those are answered for a failing case and then for one successful
+GPU-backed case, later architecture work should be considered out of scope.
+
 ## Context
-
-This document should now be read in two parts:
-
-1. fix the current blocking bug first:
-   - true GPU-backed `ibv_reg_mr` on sentry-created NVIDIA VMAs has not yet been
-     shown to succeed
-2. only after that, treat the later architecture work in this document as one
-   possible follow-on plan if scaling or shared-`mm` pressure still remains
 
 The current `runsc-rdma` design uses one sentry process and one host address
 space for the whole local sandbox. That works for low-fanout GPUDirect RDMA
 cases, but it appears to break down once enough local ranks and GPU mappings
 are present that GPU virtual address ranges collide inside that shared host
 `mm`.
-
-The performance target remains:
-
-- about `484 GB/s` `busbw` as the `runc` / bare-metal reference point
-- about `436 GB/s` `busbw` as the 10%-from-`runc` target floor
 
 That context matters because the successful `2 GPUs/node` result of about
 `133.4 GB/s` is strong evidence that the architecture works in principle, while
@@ -693,6 +747,101 @@ from
 - non-pinnable or wrong-provenance sentry VMAs
 
 But it is now a secondary diagnostic, not the primary plan.
+
+## Code Anchors For Debugging
+
+The next debugger should start from the exact code paths that define the current
+GPU-backed MR registration surface.
+
+### Primary files
+
+- `pkg/sentry/devices/rdmaproxy/rdmaproxy_ioctl_unsafe.go`
+- `pkg/sentry/devices/rdmaproxy/rdmaproxy.go`
+- `pkg/sentry/fsimpl/sys/rdma.go`
+
+### Most important functions
+
+In `pkg/sentry/devices/rdmaproxy/rdmaproxy_ioctl_unsafe.go`:
+
+- `handleRDMAVerbsIoctl()`
+- `classifyIoctl()`
+- `prepareMRRegModern()`
+- `prepareMRRegInvokeWrite()`
+- `mirrorSandboxPages()`
+- `mirrorGPUDeviceMemory()`
+- `translatedRelocatedGPUVA()`
+- `extractMRHandle()`
+- `extractDeregMRHandle()`
+
+In `pkg/sentry/devices/rdmaproxy/rdmaproxy.go`:
+
+- `mirroredPages`
+- `sharedGPUVMAKey`
+- `sharedGPUVMA`
+- `acquireSharedGPUVMA()`
+- `mapOrAcquireSharedGPUVMA()`
+- `uverbsFD.pinnedMRs`
+
+### Most important branch points
+
+The current bug is likely to be explained by one of these branch points:
+
+- in `mirrorSandboxPages()`:
+  - `mm.Pin()` success
+  - fallback to `mirrorProxyDevicePages()`
+  - fallback to `mirrorGPUDeviceMemory()`
+  - raw passthrough last resort
+- in `mirrorGPUDeviceMemory()`:
+  - direct candidate mmap at the app GPU VA
+  - prepared candidate mmap path
+  - `sharedGPUVMAs` reuse path
+  - `MAP_FIXED_NOREPLACE` failure with `EEXIST`
+  - retry at a free sentry VA
+
+### State that is currently suspicious
+
+The `sharedGPUVMAs` reuse model is especially important to audit.
+
+What is clearly represented today:
+
+- GPU VA start
+- GPU VA length
+
+What may not be represented strongly enough:
+
+- NVIDIA `hostFD`
+- direct vs prepared candidate origin
+- allocation-specific NVIDIA mmap provenance
+- any per-allocation identity beyond VA range
+
+This is one reason the current cache key is a prime suspect.
+
+### Questions to answer in code for each failing GPU-backed `MR_REG`
+
+- did the request go through `prepareMRRegModern()` or
+  `prepareMRRegInvokeWrite()`?
+- did `mirrorSandboxPages()` fall into `mirrorGPUDeviceMemory()`?
+- did `mirrorGPUDeviceMemory()` create a fresh VMA, reuse one from
+  `sharedGPUVMAs`, or relocate after `EEXIST`?
+- which `candidate.hostFD` and `candidate.devName` were used?
+- was the resulting mapping identity-mapped or relocated?
+- did the host `REG_MR` ioctl return a real MR handle or `EFAULT`?
+
+### First success criterion to trace in code
+
+The first meaningful milestone is not performance. It is one confirmed
+successful true GPU-backed `MR_REG` on a `0xa1...` or `0x50...` range.
+
+That success should be traceable through:
+
+- `prepareMRReg*()`
+- `mirrorSandboxPages()`
+- `mirrorGPUDeviceMemory()`
+- host `REG_MR` ioctl return
+- `extractMRHandle()`
+
+Until that path succeeds, later architecture work should be treated as
+secondary.
 
 ## Updated Architecture Direction
 

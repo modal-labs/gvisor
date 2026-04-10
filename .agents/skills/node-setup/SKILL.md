@@ -22,7 +22,7 @@ $ARGUMENTS should be two SSH hostnames, e.g.: `wo-abc123 wo-def456`
 ### 1. Verify connectivity
 SSH to both nodes in parallel:
 ```
-ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 modal@<node> 'echo ok'
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 modal@<node> 'echo ok'
 ```
 If the primary hostname fails, try `<node>-1`. Clean stale host keys with
 `ssh-keygen -R <node>` if you get HOST IDENTIFICATION CHANGED warnings.
