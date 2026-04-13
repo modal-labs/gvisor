@@ -139,6 +139,7 @@ func (mp *mirroredPages) release(ctx context.Context) {
 type sharedGPUVMAKey struct {
 	gpuStart uintptr
 	gpuLen   uintptr
+	devName  string // nvidia device that created this VMA (e.g. "nvidia0")
 }
 
 type sharedGPUVMA struct {
@@ -178,11 +179,11 @@ var sharedGPUVMAs struct {
 	byKey map[sharedGPUVMAKey]*sharedGPUVMA
 }
 
-func acquireSharedGPUVMA(start, len uintptr) *sharedGPUVMA {
+func acquireSharedGPUVMA(start, len uintptr, devName string) *sharedGPUVMA {
 	sharedGPUVMAs.mu.Lock()
 	defer sharedGPUVMAs.mu.Unlock()
 
-	key := sharedGPUVMAKey{gpuStart: start, gpuLen: len}
+	key := sharedGPUVMAKey{gpuStart: start, gpuLen: len, devName: devName}
 	if sharedGPUVMAs.byKey == nil {
 		sharedGPUVMAs.byKey = make(map[sharedGPUVMAKey]*sharedGPUVMA)
 	}
@@ -193,11 +194,11 @@ func acquireSharedGPUVMA(start, len uintptr) *sharedGPUVMA {
 	return nil
 }
 
-func mapOrAcquireSharedGPUVMA(start, len uintptr, mapper func() (uintptr, unix.Errno)) (*sharedGPUVMA, uintptr, unix.Errno, bool) {
+func mapOrAcquireSharedGPUVMA(start, len uintptr, devName string, mapper func() (uintptr, unix.Errno)) (*sharedGPUVMA, uintptr, unix.Errno, bool) {
 	sharedGPUVMAs.mu.Lock()
 	defer sharedGPUVMAs.mu.Unlock()
 
-	key := sharedGPUVMAKey{gpuStart: start, gpuLen: len}
+	key := sharedGPUVMAKey{gpuStart: start, gpuLen: len, devName: devName}
 	if sharedGPUVMAs.byKey == nil {
 		sharedGPUVMAs.byKey = make(map[sharedGPUVMAKey]*sharedGPUVMA)
 	}

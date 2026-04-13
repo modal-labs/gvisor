@@ -975,13 +975,16 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 		if err != nil {
 			// Neither Pin nor InternalMappings resolved the VA. This
 			// happens for GPU device memory (cuMemAlloc) which has no
-			// CPU VMA. Pass the VA through unchanged: the sentry process
-			// owns the nvidia driver context (UVM allocations were made
-			// through it), so nvidia-peermem can resolve the GPU VA via
-			// nvidia's internal per-process tables when the host IB
-			// driver calls ib_umem_get → nvidia_p2p_get_pages.
-			log.Debugf("rdmaproxy: GPU device memory passthrough for %#x len %d", addr, length)
-			return nil, uintptr(addr), nil
+			// CPU VMA. nvidia-peermem needs a VMA to pin the pages.
+			// Create one by mmapping at the GPU VA.
+			mp, sentryVA, mmapErr := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
+			if mmapErr != nil {
+				// Fall back to raw passthrough as last resort.
+				log.Warningf("rdmaproxy: GPU device memory mirror failed (%v), raw VA passthrough for %#x len %d", mmapErr, addr, length)
+				return nil, uintptr(addr), nil
+			}
+			log.Warningf("rdmaproxy: GPU device memory VMA created at %#x len %d → sentry %#x", addr, length, sentryVA)
+			return mp, sentryVA, nil
 		}
 		return mp, sentryVA, nil
 	}
@@ -1101,13 +1104,6 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 	}
 	taskFields := taskLogFields(t)
 
-	if shared := acquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen)); shared != nil {
-		log.Infof("rdmaproxy: reusing shared nvidia-backed VMA for GPU VA %#x-%#x (%s)",
-			alignedStart, uint64(alignedStart)+alignedLen, taskFields)
-		sentryVA := shared.mappedStart + uintptr(addr-uint64(alignedStart))
-		return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
-	}
-
 	var candidates []nvproxyMirrorCandidate
 	seenHostFDs := make(map[int32]int)
 	t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
@@ -1196,51 +1192,16 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		}
 	}
 
+	// Only use the prepareGPUVMA path which matches by GPU allocation
+	// metadata (hClient, hMemory, gpuUUIDs). The previous approach of
+	// mmapping an existing nvidia FD picked the wrong GPU's device FD at
+	// 3+ GPUs, creating VMAs with wrong provenance that nvidia-peermem
+	// could not resolve.
 	var (
-		lastErr unix.Errno
+		lastErr error
 		last    nvproxyMirrorCandidate
 	)
 	for _, candidate := range candidates {
-		if candidate.mmapLength != 0 {
-			shared, mapped, errno, reused := mapOrAcquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), func() (uintptr, unix.Errno) {
-				mapped, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
-					uintptr(alignedStart), uintptr(alignedLen),
-					unix.PROT_READ|unix.PROT_WRITE,
-					unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
-					uintptr(candidate.hostFD), 0)
-				if errno == unix.EEXIST {
-					log.Warningf("rdmaproxy: GPU VA collision at %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d (%s); retrying at any free sentry VA",
-						alignedStart, uint64(alignedStart)+alignedLen,
-						candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, taskFields)
-					// Overlapping GPU registrations often reuse the same underlying
-					// allocation with a different length. Re-map the same NVIDIA
-					// memmap context at any free sentry VA instead of falling back
-					// to the raw sandbox address.
-					mapped, _, errno = unix.RawSyscall6(unix.SYS_MMAP,
-						0, uintptr(alignedLen),
-						unix.PROT_READ|unix.PROT_WRITE,
-						unix.MAP_SHARED,
-						uintptr(candidate.hostFD), 0)
-				}
-				return mapped, errno
-			})
-			lastErr = errno
-			if lastErr == 0 {
-				if reused {
-					log.Infof("rdmaproxy: reused existing nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d (%s)",
-						alignedStart, uint64(alignedStart)+alignedLen, candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, taskFields)
-				} else {
-					log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d → sentry %#x (%s)",
-						alignedStart, uint64(alignedStart)+alignedLen, candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, mapped, taskFields)
-				}
-				sentryVA := mapped + uintptr(addr-uint64(alignedStart))
-				return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
-			}
-			last = candidate
-			log.Debugf("rdmaproxy: GPU VMA mmap failed via sandboxFD=%d hostFD=%d dev=%q mmapLen=%d at %#x len %d (%s): %v",
-				candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, alignedStart, alignedLen, taskFields, lastErr)
-		}
-
 		if candidate.prepare == nil {
 			continue
 		}
@@ -1251,13 +1212,24 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 				candidate.sandboxFD, candidate.hostFD, candidate.devName, alignedStart, alignedLen, prepErr)
 			continue
 		}
+
+		// Check cache keyed by (VA, len, devName) so different GPUs
+		// don't share VMAs even for the same VA range.
+		if shared := acquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), preparedDevName); shared != nil {
+			unix.Close(int(preparedHostFD))
+			log.Infof("rdmaproxy: reusing shared nvidia-backed VMA for GPU VA %#x-%#x dev=%q (%s)",
+				alignedStart, uint64(alignedStart)+alignedLen, preparedDevName, taskFields)
+			sentryVA := shared.mappedStart + uintptr(addr-uint64(alignedStart))
+			return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
+		}
+
 		preparedCandidate := nvproxyMirrorCandidate{
 			sandboxFD:  candidate.sandboxFD,
 			hostFD:     preparedHostFD,
 			devName:    preparedDevName,
 			mmapLength: preparedLen,
 		}
-		shared, mapped, errno, reused := mapOrAcquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), func() (uintptr, unix.Errno) {
+		shared, mapped, errno, _ := mapOrAcquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), preparedDevName, func() (uintptr, unix.Errno) {
 			mapped, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
 				uintptr(alignedStart), uintptr(alignedLen),
 				unix.PROT_READ|unix.PROT_WRITE,
@@ -1276,25 +1248,23 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			return mapped, errno
 		})
 		unix.Close(int(preparedHostFD))
-		lastErr = errno
-		if lastErr == 0 {
-			if reused {
-				log.Infof("rdmaproxy: reused existing nvidia-backed VMA for GPU VA %#x-%#x via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d (%s)",
-					alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, taskFields)
-			} else {
-				log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d → sentry %#x (%s)",
-					alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, mapped, taskFields)
-			}
+		if errno == 0 {
+			log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via prepared sandboxFD=%d dev=%q mmapLen=%d → sentry %#x (%s)",
+				alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.devName, preparedCandidate.mmapLength, mapped, taskFields)
 			sentryVA := mapped + uintptr(addr-uint64(alignedStart))
 			return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
 		}
 		last = preparedCandidate
+		lastErr = fmt.Errorf("%v", errno)
 		log.Debugf("rdmaproxy: GPU VMA mmap failed via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d at %#x len %d (%s): %v",
-			preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, alignedStart, alignedLen, taskFields, lastErr)
+			preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, alignedStart, alignedLen, taskFields, errno)
 	}
 
-	return nil, 0, fmt.Errorf("all %d nvidia frontend mmap attempts failed for GPU VA %#x len %d (last sandboxFD=%d hostFD=%d dev=%q mmapLen=%d: %w)",
-		len(candidates), addr, alignedLen, last.sandboxFD, last.hostFD, last.devName, last.mmapLength, lastErr)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no candidates with prepare capability")
+	}
+	return nil, 0, fmt.Errorf("all nvidia frontend attempts failed for GPU VA %#x len %d (last sandboxFD=%d hostFD=%d dev=%q mmapLen=%d: %w)",
+		addr, alignedLen, last.sandboxFD, last.hostFD, last.devName, last.mmapLength, lastErr)
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after
