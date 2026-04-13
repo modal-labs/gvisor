@@ -134,6 +134,9 @@ func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf
 	*(*uint32)(unsafe.Pointer(sp + agentOffIoctlCmd)) = ioctlCmd
 	*(*uint32)(unsafe.Pointer(sp + agentOffBufLen)) = uint32(bufLen)
 
+	log.Warningf("rdmaproxy: agent forward: dev=%q gpuVA=%#x len=%d nvidiaFD=%d uverbsFD=%d bufLen=%d rewrites=%d",
+		agent.devName, mp.gpuVA, mp.gpuLen, mp.nvidiaFD, uverbsFD, bufLen, len(rewrites))
+
 	// Set command (must be last write before wake) and signal agent.
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(sp+agentOffCmd)), agentCmdMmapAndIoctl)
 	agent.sendCommand()
@@ -157,9 +160,11 @@ func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf
 	resultN := *(*int64)(unsafe.Pointer(sp + agentOffResultN))
 	resultErrno := *(*int32)(unsafe.Pointer(sp + agentOffErrno))
 
-	// Close the prepared nvidia FD in the sentry (agent has its own copy
-	// from the COW fork). Only close after first use since the agent
-	// inherits it once.
+	log.Warningf("rdmaproxy: agent result: dev=%q gpuVA=%#x n=%d errno=%d",
+		agent.devName, mp.gpuVA, resultN, resultErrno)
+
+	// Close the prepared nvidia FD in the sentry (with CLONE_FILES this
+	// also closes it in the agent, but the mmap VMA survives FD close).
 	if mp.nvidiaFD >= 0 {
 		unix.Close(int(mp.nvidiaFD))
 		mp.nvidiaFD = -1
