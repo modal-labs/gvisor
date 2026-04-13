@@ -129,10 +129,14 @@ func spawnGPUAgent(devName string) (*gpuAgent, error) {
 	clearCloexec(cmdPipe[0]) // child reads commands
 	clearCloexec(resPipe[1]) // child writes results
 
-	// Clone without CLONE_VM — child gets its own mm_struct.
+	// Clone with CLONE_FILES but without CLONE_VM:
+	// - Own mm_struct (no CLONE_VM) → GPU VMAs don't collide
+	// - Shared FD table (CLONE_FILES) → agent sees FDs opened after clone
+	//   (nvidia FDs from prepareGPUVMA, uverbs host FDs)
+	// CLONE_FILES|SIGCHLD = 0x411, which is in the seccomp allowlist.
 	log.Infof("rdmaproxy: about to clone for GPU agent dev=%q", devName)
 	beforeFork()
-	pid, errno := hostsyscall.RawSyscall(unix.SYS_CLONE, uintptr(unix.SIGCHLD), 0, 0)
+	pid, errno := hostsyscall.RawSyscall(unix.SYS_CLONE, unix.CLONE_FILES|uintptr(unix.SIGCHLD), 0, 0)
 	if errno != 0 {
 		afterFork()
 		unix.Close(cmdPipe[0])

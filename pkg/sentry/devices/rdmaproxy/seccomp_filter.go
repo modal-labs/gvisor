@@ -60,15 +60,14 @@ func Filters() seccomp.SyscallRules {
 			seccomp.NonNegativeFD{},
 			seccomp.EqualTo(unix.CLONE_NEWNET),
 		},
-		// clone, wait4, pipe2, fcntl, getpid, setsid, exit are used by
+		// pipe2, fcntl, wait4, getpid, setsid, exit are used by
 		// the per-GPU agent processes. Each agent holds nvidia-backed
 		// VMAs in its own mm_struct to avoid VA collisions across GPUs.
-		unix.SYS_CLONE: seccomp.PerArg{
-			seccomp.EqualTo(unix.SIGCHLD), // clone without CLONE_VM
-		},
-		unix.SYS_WAIT4: seccomp.MatchAll{},
-		unix.SYS_PIPE2: seccomp.MatchAll{},
-		unix.SYS_FCNTL: seccomp.MatchAll{},
+		// clone(CLONE_FILES|SIGCHLD = 0x411) is already allowed by the
+		// systrap platform seccomp filter.
+		unix.SYS_PIPE2:  seccomp.MatchAll{},
+		unix.SYS_FCNTL:  seccomp.MatchAll{},
+		unix.SYS_WAIT4:  seccomp.MatchAll{},
 		unix.SYS_GETPID: seccomp.MatchAll{},
 		unix.SYS_SETSID: seccomp.MatchAll{},
 		unix.SYS_EXIT:   seccomp.MatchAll{},
