@@ -140,8 +140,8 @@ func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf
 	*(*uint32)(unsafe.Pointer(sp + agentOffRmMapCmd)) = mp.rmMapCmd
 	copy(unsafe.Slice((*byte)(unsafe.Pointer(sp+agentOffRmMapParams)), 64), mp.rmMapParams[:])
 
-	log.Warningf("rdmaproxy: agent forward: dev=%q gpuVA=%#x len=%d nvidiaFD=%d uverbsFD=%d ctrlFD=%d rmMapCmd=%#x bufLen=%d rewrites=%d",
-		agent.devName, mp.gpuVA, mp.gpuLen, mp.nvidiaFD, uverbsFD, mp.ctrlFD, mp.rmMapCmd, bufLen, len(rewrites))
+	log.Warningf("rdmaproxy: agent forward: dev=%q gpuVA=%#x len=%d nvidiaFD=%d uverbsFD=%d ctrlFD=%d rmMapCmd=%#x bufLen=%d rewrites=%d rmParamsLen=%d",
+		agent.devName, mp.gpuVA, mp.gpuLen, mp.nvidiaFD, uverbsFD, mp.ctrlFD, mp.rmMapCmd, bufLen, len(rewrites), len(mp.rmMapParams))
 
 	// Set command (must be last write before wake) and signal agent.
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(sp+agentOffCmd)), agentCmdMmapAndIoctl)
@@ -166,8 +166,11 @@ func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf
 	resultN := *(*int64)(unsafe.Pointer(sp + agentOffResultN))
 	resultErrno := *(*int32)(unsafe.Pointer(sp + agentOffErrno))
 
-	log.Warningf("rdmaproxy: agent result: dev=%q gpuVA=%#x n=%d errno=%d",
-		agent.devName, mp.gpuVA, resultN, resultErrno)
+	// Read RM_MAP_MEMORY Status from the shared page (nvidia-internal
+	// error code at offset 36 within NVOS33_PARAMETERS).
+	rmStatus := *(*uint32)(unsafe.Pointer(sp + agentOffRmMapParams + 36))
+	log.Warningf("rdmaproxy: agent result: dev=%q gpuVA=%#x n=%d errno=%d rmStatus=%#x",
+		agent.devName, mp.gpuVA, resultN, resultErrno, rmStatus)
 
 	// Do NOT close nvidiaFD — with CLONE_FILES, closing it here would
 	// close it in the agent too. The FD is shared and may be reused
