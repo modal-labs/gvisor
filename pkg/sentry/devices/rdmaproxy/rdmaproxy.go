@@ -194,6 +194,36 @@ func acquireSharedGPUVMA(start, len uintptr, devName string) *sharedGPUVMA {
 	return nil
 }
 
+// evictConflictingGPUVMAs munmaps and removes cached VMAs from OTHER GPUs
+// whose sentry mappings overlap [start, start+len). This allows the current
+// GPU to map at its correct VA. Already-registered MRs are not affected
+// because the IB driver holds GPU page references independently of the VMA.
+//
+// Must be called with sharedGPUVMAs.mu held.
+func evictConflictingGPUVMAs(start, len uintptr, devName string) {
+	end := start + len
+	var toDelete []sharedGPUVMAKey
+	for key, vma := range sharedGPUVMAs.byKey {
+		if key.devName == devName {
+			continue // same GPU, don't evict
+		}
+		vmaEnd := vma.mappedStart + vma.mappedLen
+		if vma.mappedStart < end && vmaEnd > start {
+			// Overlapping VMA from a different GPU — evict it.
+			log.Infof("rdmaproxy: evicting conflicting GPU VMA dev=%q gpu=%#x-%#x sentry=%#x-%#x (refs=%d) to make room for dev=%q",
+				key.devName, key.gpuStart, key.gpuStart+key.gpuLen,
+				vma.mappedStart, vmaEnd, vma.refs, devName)
+			if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, vma.mappedStart, vma.mappedLen, 0); errno != 0 {
+				log.Warningf("rdmaproxy: munmap conflicting GPU VMA sentry=%#x-%#x: %v", vma.mappedStart, vmaEnd, errno)
+			}
+			toDelete = append(toDelete, key)
+		}
+	}
+	for _, key := range toDelete {
+		delete(sharedGPUVMAs.byKey, key)
+	}
+}
+
 func mapOrAcquireSharedGPUVMA(start, len uintptr, devName string, mapper func() (uintptr, unix.Errno)) (*sharedGPUVMA, uintptr, unix.Errno, bool) {
 	sharedGPUVMAs.mu.Lock()
 	defer sharedGPUVMAs.mu.Unlock()
@@ -208,6 +238,11 @@ func mapOrAcquireSharedGPUVMA(start, len uintptr, devName string, mapper func() 
 	}
 
 	mapped, errno := mapper()
+	if errno == unix.EEXIST {
+		// Another GPU's VMA occupies this address. Evict it and retry.
+		evictConflictingGPUVMAs(start, len, devName)
+		mapped, errno = mapper()
+	}
 	if errno != 0 {
 		return nil, 0, errno, false
 	}

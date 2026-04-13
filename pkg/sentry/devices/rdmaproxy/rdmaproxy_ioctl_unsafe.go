@@ -1229,22 +1229,16 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			devName:    preparedDevName,
 			mmapLength: preparedLen,
 		}
+		// Map at the exact GPU VA. mapOrAcquireSharedGPUVMA handles
+		// EEXIST by evicting conflicting VMAs from other GPUs and
+		// retrying. We never relocate to a different sentry VA because
+		// nvidia-peermem requires the VMA at the original GPU VA.
 		shared, mapped, errno, _ := mapOrAcquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), preparedDevName, func() (uintptr, unix.Errno) {
 			mapped, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
 				uintptr(alignedStart), uintptr(alignedLen),
 				unix.PROT_READ|unix.PROT_WRITE,
 				unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
 				uintptr(preparedHostFD), 0)
-			if errno == unix.EEXIST {
-				log.Warningf("rdmaproxy: GPU VA collision at %#x-%#x via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d (%s); retrying at any free sentry VA",
-					alignedStart, uint64(alignedStart)+alignedLen,
-					preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, taskFields)
-				mapped, _, errno = unix.RawSyscall6(unix.SYS_MMAP,
-					0, uintptr(alignedLen),
-					unix.PROT_READ|unix.PROT_WRITE,
-					unix.MAP_SHARED,
-					uintptr(preparedHostFD), 0)
-			}
 			return mapped, errno
 		})
 		unix.Close(int(preparedHostFD))
