@@ -130,6 +130,7 @@ func spawnGPUAgent(devName string) (*gpuAgent, error) {
 	clearCloexec(resPipe[1]) // child writes results
 
 	// Clone without CLONE_VM — child gets its own mm_struct.
+	log.Infof("rdmaproxy: about to clone for GPU agent dev=%q", devName)
 	beforeFork()
 	pid, errno := hostsyscall.RawSyscall(unix.SYS_CLONE, uintptr(unix.SIGCHLD), 0, 0)
 	if errno != 0 {
@@ -139,6 +140,7 @@ func spawnGPUAgent(devName string) (*gpuAgent, error) {
 		unix.Close(resPipe[0])
 		unix.Close(resPipe[1])
 		unix.RawSyscall(unix.SYS_MUNMAP, sharedPage, agentSharedSize, 0)
+		log.Warningf("rdmaproxy: clone failed for GPU agent dev=%q: errno=%d (%v)", devName, errno, errno)
 		return nil, fmt.Errorf("clone: %v", errno)
 	}
 
