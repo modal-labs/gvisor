@@ -514,6 +514,96 @@ func (fd *frontendFD) prepareGPUVMA(ctx context.Context, addr, alignedStart, ali
 	return -1, fd.dev.basename(), 0, fmt.Errorf("NV_ESC_RM_MAP_MEMORY failed for GPU VA %#x len %d (%s)", alignedStart, alignedLen, strings.Join(errs, "; "))
 }
 
+// prepareGPUVMADryRun finds the correct GPU allocation and device FDs, builds
+// the RM_MAP_MEMORY ioctl parameters, but does NOT call the ioctl. Returns
+// the raw params so a GPU agent process can call RM_MAP_MEMORY in its own
+// process context. This is needed because the nvidia driver tracks mmap
+// contexts per-process.
+func (fd *frontendFD) prepareGPUVMADryRun(ctx context.Context, addr, alignedStart, alignedLen uint64) (mapFD int32, devName string, ctrlFD int32, rmMapCmd uint32, rmMapParams []byte, err error) {
+	mapping, ok := fd.findGPUExternalAllocation(addr, alignedStart, alignedLen)
+	if !ok {
+		return -1, fd.dev.basename(), 0, 0, nil, fmt.Errorf("no UVM external allocation tracked for GPU VA %#x", addr)
+	}
+
+	client, unlock := fd.dev.nvp.getClientWithLock(ctx, mapping.hClient)
+	if client == nil {
+		return -1, fd.dev.basename(), 0, 0, nil, fmt.Errorf("missing client %v for GPU VA %#x", mapping.hClient, addr)
+	}
+	memObj := client.getObject(ctx, mapping.hMemory)
+	if memObj == nil {
+		unlock()
+		return -1, fd.dev.basename(), 0, 0, nil, fmt.Errorf("missing memory object %v for GPU VA %#x", mapping.hMemory, addr)
+	}
+	targets := fd.gpuMapTargets(ctx, client, mapping, memObj)
+	unlock()
+	if len(targets) == 0 {
+		return -1, fd.dev.basename(), 0, 0, nil, fmt.Errorf("no GPU mapping target found for memory object %v GPU VA %#x", mapping.hMemory, addr)
+	}
+
+	delta := alignedStart - mapping.base
+	ioctlCmd := uint32(frontendIoctlCmd(nvgpu.NV_ESC_RM_MAP_MEMORY, nvgpu.SizeofIoctlNVOS33ParametersWithFD))
+
+	// Find the first viable FD candidate and build the params.
+	var errs []string
+	for _, target := range targets {
+		for _, candidate := range fd.existingGPUMapFDCandidates(target.mapDevNames) {
+			ioctlParams := nvgpu.IoctlNVOS33ParametersWithFD{
+				Params: nvgpu.NVOS33_PARAMETERS{
+					HClient:        mapping.hClient,
+					HDevice:        target.hDevice,
+					HMemory:        mapping.hMemory,
+					Offset:         mapping.offset + delta,
+					Length:         alignedLen,
+					PLinearAddress: nvgpu.P64(alignedStart),
+				},
+				FD: candidate.hostFD,
+			}
+			paramBytes := make([]byte, unsafe.Sizeof(ioctlParams))
+			copy(paramBytes, (*[64]byte)(unsafe.Pointer(&ioctlParams))[:len(paramBytes)])
+
+			returnFD, derr := unix.Dup(int(candidate.hostFD))
+			if derr != nil {
+				errs = append(errs, fmt.Sprintf("dup %d: %v", candidate.hostFD, derr))
+				continue
+			}
+
+			if ctx.IsLogging(log.Debug) {
+				ctx.Debugf("nvproxy: dry-run prepared RM_MAP_MEMORY params for GPU VA %#x-%#x ctrlHostFD=%d mapFD=%d mapDev=%q hClient=%v hDevice=%v hMemory=%v",
+					alignedStart, alignedStart+alignedLen, fd.hostFD, returnFD, candidate.devName, mapping.hClient, target.hDevice, mapping.hMemory)
+			}
+			return int32(returnFD), candidate.devName, fd.hostFD, ioctlCmd, paramBytes, nil
+		}
+
+		for _, mapDevName := range target.mapDevNames {
+			candidateFD, _, oerr := openHostDevFile(ctx, mapDevName, fd.dev.nvp.useDevGofer, unix.O_RDWR)
+			if oerr != nil {
+				errs = append(errs, fmt.Sprintf("open %q: %v", mapDevName, oerr))
+				continue
+			}
+			ioctlParams := nvgpu.IoctlNVOS33ParametersWithFD{
+				Params: nvgpu.NVOS33_PARAMETERS{
+					HClient:        mapping.hClient,
+					HDevice:        target.hDevice,
+					HMemory:        mapping.hMemory,
+					Offset:         mapping.offset + delta,
+					Length:         alignedLen,
+					PLinearAddress: nvgpu.P64(alignedStart),
+				},
+				FD: candidateFD,
+			}
+			paramBytes := make([]byte, unsafe.Sizeof(ioctlParams))
+			copy(paramBytes, (*[64]byte)(unsafe.Pointer(&ioctlParams))[:len(paramBytes)])
+
+			if ctx.IsLogging(log.Debug) {
+				ctx.Debugf("nvproxy: dry-run prepared RM_MAP_MEMORY params (fresh open) for GPU VA %#x-%#x ctrlHostFD=%d mapFD=%d mapDev=%q hClient=%v hDevice=%v hMemory=%v",
+					alignedStart, alignedStart+alignedLen, fd.hostFD, candidateFD, mapDevName, mapping.hClient, target.hDevice, mapping.hMemory)
+			}
+			return candidateFD, mapDevName, fd.hostFD, ioctlCmd, paramBytes, nil
+		}
+	}
+	return -1, fd.dev.basename(), 0, 0, nil, fmt.Errorf("no viable FD candidate for GPU VA %#x len %d (%s)", alignedStart, alignedLen, strings.Join(errs, "; "))
+}
+
 func rmControlInvoke[Params any](fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS, ctrlParams *Params) (uintptr, error) {
 	defer runtime.KeepAlive(ctrlParams) // since we convert to non-pointer-typed P64
 	origParams := ioctlParams.Params

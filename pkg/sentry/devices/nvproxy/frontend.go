@@ -110,6 +110,15 @@ func (fd *frontendFD) NVProxyPrepareGPUVMA(ctx context.Context, addr, alignedSta
 	return fd.prepareGPUVMA(ctx, addr, alignedStart, alignedLen)
 }
 
+// NVProxyPrepareGPUVMADryRun finds the correct GPU allocation and device FDs
+// for a GPU VA range, builds the RM_MAP_MEMORY ioctl parameters, but does NOT
+// call the ioctl. Returns the raw params so rdmaproxy's GPU agent can call
+// RM_MAP_MEMORY in its own process context (required for per-process mmap
+// context tracking in the nvidia driver).
+func (fd *frontendFD) NVProxyPrepareGPUVMADryRun(ctx context.Context, addr, alignedStart, alignedLen uint64) (mapFD int32, devName string, ctrlFD int32, rmMapCmd uint32, rmMapParams []byte, err error) {
+	return fd.prepareGPUVMADryRun(ctx, addr, alignedStart, alignedLen)
+}
+
 // NVProxyLastRMMapInfo returns the RM_MAP_MEMORY ioctl parameters from the
 // most recent successful prepareGPUVMA call. This allows rdmaproxy's GPU
 // agent to replay the RM_MAP_MEMORY in its own process context.

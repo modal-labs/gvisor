@@ -1198,12 +1198,13 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 // mmap handler attaches its vm_ops to the resulting VMA.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
 	type nvproxyMirrorCandidate struct {
-		sandboxFD   int32
-		hostFD      int32
-		devName     string
-		mmapLength  uint64
-		prepare     func(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
-		lastRMMapFn func() (int32, uint32, []byte, bool) // NVProxyLastRMMapInfo
+		sandboxFD      int32
+		hostFD         int32
+		devName        string
+		mmapLength     uint64
+		prepare        func(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
+		dryRunPrepare  func(context.Context, uint64, uint64, uint64) (int32, string, int32, uint32, []byte, error)
+		lastRMMapFn    func() (int32, uint32, []byte, bool)
 	}
 	taskFields := taskLogFields(t)
 
@@ -1211,11 +1212,17 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 	seenHostFDs := make(map[int32]int)
 	t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
 		var prepare func(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
+		var dryRunPrepare func(context.Context, uint64, uint64, uint64) (int32, string, int32, uint32, []byte, error)
 		var lastRMMapFn func() (int32, uint32, []byte, bool)
 		if preparer, ok := file.Impl().(interface {
 			NVProxyPrepareGPUVMA(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
 		}); ok {
 			prepare = preparer.NVProxyPrepareGPUVMA
+		}
+		if dryRunner, ok := file.Impl().(interface {
+			NVProxyPrepareGPUVMADryRun(context.Context, uint64, uint64, uint64) (int32, string, int32, uint32, []byte, error)
+		}); ok {
+			dryRunPrepare = dryRunner.NVProxyPrepareGPUVMADryRun
 		}
 		if rmMapper, ok := file.Impl().(interface {
 			NVProxyLastRMMapInfo() (int32, uint32, []byte, bool)
@@ -1229,18 +1236,20 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			if idx, ok := seenHostFDs[hostFD]; ok {
 				if candidates[idx].prepare == nil {
 					candidates[idx].prepare = prepare
+					candidates[idx].dryRunPrepare = dryRunPrepare
 					candidates[idx].lastRMMapFn = lastRMMapFn
 				}
 				return true
 			}
 			seenHostFDs[hostFD] = len(candidates)
 			candidates = append(candidates, nvproxyMirrorCandidate{
-				sandboxFD:   fd,
-				hostFD:      hostFD,
-				devName:     devName,
-				mmapLength:  mmapLength,
-				prepare:     prepare,
-				lastRMMapFn: lastRMMapFn,
+				sandboxFD:     fd,
+				hostFD:        hostFD,
+				devName:       devName,
+				mmapLength:    mmapLength,
+				prepare:       prepare,
+				dryRunPrepare: dryRunPrepare,
+				lastRMMapFn:   lastRMMapFn,
 			})
 			return true
 		}
@@ -1251,16 +1260,18 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			if idx, ok := seenHostFDs[hostFD]; ok {
 				if candidates[idx].prepare == nil {
 					candidates[idx].prepare = prepare
+					candidates[idx].dryRunPrepare = dryRunPrepare
 					candidates[idx].lastRMMapFn = lastRMMapFn
 				}
 				return true
 			}
 			seenHostFDs[hostFD] = len(candidates)
 			candidates = append(candidates, nvproxyMirrorCandidate{
-				sandboxFD:   fd,
-				hostFD:      hostFD,
-				prepare:     prepare,
-				lastRMMapFn: lastRMMapFn,
+				sandboxFD:     fd,
+				hostFD:        hostFD,
+				prepare:       prepare,
+				dryRunPrepare: dryRunPrepare,
+				lastRMMapFn:   lastRMMapFn,
 			})
 		}
 		return true
@@ -1305,49 +1316,41 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		}
 	}
 
-	// Use prepareGPUVMA to get the correct nvidia FD for this GPU allocation,
-	// then delegate the mmap+ioctl to a per-GPU agent process. Each agent has
-	// its own mm_struct, so GPU VMAs from different GPUs don't collide.
+	// Use dry-run prepare to get the RM_MAP_MEMORY params WITHOUT calling
+	// the ioctl. The agent will call RM_MAP_MEMORY + mmap + RDMA ioctl in
+	// its own process (required for per-process nvidia mmap context).
 	var lastErr error
 	for _, candidate := range candidates {
-		if candidate.prepare == nil {
+		if candidate.dryRunPrepare == nil {
 			continue
 		}
 
-		preparedHostFD, preparedDevName, _, prepErr := candidate.prepare(t, addr, uint64(alignedStart), alignedLen)
+		mapFD, preparedDevName, ctrlFD, rmMapCmd, rmMapRaw, prepErr := candidate.dryRunPrepare(t, addr, uint64(alignedStart), alignedLen)
 		if prepErr != nil {
-			log.Debugf("rdmaproxy: GPU VMA prepare failed via sandboxFD=%d hostFD=%d dev=%q at %#x len %d: %v",
+			log.Debugf("rdmaproxy: GPU VMA dry-run prepare failed via sandboxFD=%d hostFD=%d dev=%q at %#x len %d: %v",
 				candidate.sandboxFD, candidate.hostFD, candidate.devName, alignedStart, alignedLen, prepErr)
 			continue
 		}
 
-		// Get the RM_MAP_MEMORY params so the agent can replay the ioctl.
-		var ctrlFD int32
-		var rmMapCmd uint32
 		var rmMapParams [64]byte
-		if candidate.lastRMMapFn != nil {
-			cfd, cmd, raw, ok := candidate.lastRMMapFn()
-			if ok && len(raw) <= 64 {
-				ctrlFD = cfd
-				rmMapCmd = cmd
-				copy(rmMapParams[:], raw)
-			}
+		if len(rmMapRaw) <= 64 {
+			copy(rmMapParams[:], rmMapRaw)
 		}
 
 		agent, agentErr := getOrSpawnGPUAgent(preparedDevName)
 		if agentErr != nil {
-			unix.Close(int(preparedHostFD))
+			unix.Close(int(mapFD))
 			log.Warningf("rdmaproxy: GPU agent spawn failed for dev=%q: %v", preparedDevName, agentErr)
 			lastErr = agentErr
 			continue
 		}
 
 		sentryVA := uintptr(addr)
-		log.Infof("rdmaproxy: GPU VMA will be created by agent pid=%d dev=%q for GPU VA %#x-%#x ctrlFD=%d (%s)",
-			agent.pid, preparedDevName, alignedStart, uint64(alignedStart)+alignedLen, ctrlFD, taskFields)
+		log.Infof("rdmaproxy: GPU VMA will be created by agent pid=%d dev=%q for GPU VA %#x-%#x ctrlFD=%d rmMapCmd=%#x (%s)",
+			agent.pid, preparedDevName, alignedStart, uint64(alignedStart)+alignedLen, ctrlFD, rmMapCmd, taskFields)
 		return &mirroredPages{
 			agent:       agent,
-			nvidiaFD:    preparedHostFD,
+			nvidiaFD:    mapFD,
 			gpuVA:       uint64(alignedStart),
 			gpuLen:      alignedLen,
 			ctrlFD:      ctrlFD,
