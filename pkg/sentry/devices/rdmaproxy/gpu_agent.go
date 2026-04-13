@@ -183,7 +183,7 @@ func gpuAgentLoop(cmdFD, resFD int32, shared uintptr) {
 	var cmdByte [1]byte
 	for {
 		// Wait for command signal from sentry.
-		n, _, errno := hostsyscall.RawSyscall(unix.SYS_READ, uintptr(cmdFD), uintptr(unsafe.Pointer(&cmdByte[0])), 1)
+		n, errno := hostsyscall.RawSyscall(unix.SYS_READ, uintptr(cmdFD), uintptr(unsafe.Pointer(&cmdByte[0])), 1)
 		if n == 0 || errno != 0 {
 			hostsyscall.RawSyscall(unix.SYS_EXIT, 1, 0, 0)
 		}
@@ -204,7 +204,7 @@ func gpuAgentLoop(cmdFD, resFD int32, shared uintptr) {
 			hostsyscall.RawSyscall(unix.SYS_MUNMAP, uintptr(gpuVA), uintptr(length), 0)
 
 			// mmap nvidia FD at the exact GPU VA.
-			mapped, _, mmapErrno := hostsyscall.RawSyscall6(unix.SYS_MMAP,
+			mapped, mmapErrno := hostsyscall.RawSyscall6(unix.SYS_MMAP,
 				uintptr(gpuVA), uintptr(length),
 				unix.PROT_READ|unix.PROT_WRITE,
 				unix.MAP_SHARED|unix.MAP_FIXED,
@@ -216,7 +216,7 @@ func gpuAgentLoop(cmdFD, resFD int32, shared uintptr) {
 			} else {
 				_ = mapped
 				// Call the RDMA verbs ioctl with the buffer from shared page.
-				ioctlN, _, ioctlErrno := hostsyscall.RawSyscall(
+				ioctlN, ioctlErrno := hostsyscall.RawSyscall(
 					unix.SYS_IOCTL,
 					uintptr(uverbsFD),
 					uintptr(ioctlCmd),
