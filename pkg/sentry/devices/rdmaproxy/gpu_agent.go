@@ -127,7 +127,10 @@ func spawnGPUAgent(devName string) (*gpuAgent, error) {
 
 	if pid == 0 {
 		// Child process — raw syscalls only, no Go runtime.
-		afterForkInChild()
+		// Do NOT call afterForkInChild() — with CLONE_FILES it would
+		// close Go runtime internal FDs (epoll, pipes) in the shared
+		// FD table, breaking the parent's runtime. The child only
+		// needs to run raw syscalls, not Go code.
 		gpuAgentLoop(sharedPage)
 		// unreachable
 	}
