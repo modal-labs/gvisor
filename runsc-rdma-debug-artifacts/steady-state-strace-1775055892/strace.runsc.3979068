@@ -1,1 +1,0 @@
-15:04:52.927245 ppoll([{fd=14, events=POLLIN}, {fd=19, events=POLLIN}], 2, NULL, NULL, 0 <detached ...>

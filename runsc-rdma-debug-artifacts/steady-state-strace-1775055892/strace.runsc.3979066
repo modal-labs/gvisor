@@ -1,1 +1,0 @@
-15:04:52.927264 ppoll([{fd=9, events=POLLHUP|POLLRDHUP}], 1, NULL, NULL, 0 <detached ...>
