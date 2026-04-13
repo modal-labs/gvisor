@@ -68,11 +68,19 @@ Then verify:
 ssh ... modal@<node> 'export PATH="$HOME/.local/bin:$PATH" && python3 -c "import torch; print(torch.__version__, torch.cuda.device_count(), \"GPUs\")" && which torchrun'
 ```
 
-### 6. Load nvidia_peermem
+### 6. Load nvidia_peermem and expand Docker cpuset
 ```
 ssh ... modal@<node> 'sudo modprobe nvidia_peermem 2>&1; echo "exit: $?"'
 ```
 May fail with EINVAL if already loaded — that's fine. Run on both in parallel.
+
+Then expand the Docker cgroup cpuset so containers can use all CPUs.
+Modal workers restrict `system.slice` to a small CPU set (e.g. 0-11), which
+starves NCCL proxy threads and causes ~4-5x bandwidth regression in containers.
+```
+ssh ... modal@<node> 'sudo bash -c "echo 0-\$(( \$(nproc) - 1 )) > /sys/fs/cgroup/system.slice/cpuset.cpus" && cat /sys/fs/cgroup/system.slice/docker.service/cpuset.cpus.effective'
+```
+Run on both nodes in parallel. The output should match `nproc` (e.g. `0-111`).
 
 ### 7. Discover network and IB
 ```
@@ -93,4 +101,5 @@ Report for each node:
 - IP address and interface name (eth0 or ens7)
 - Active HCA count and list
 - nvidia_peermem status
+- Docker cpuset (should show all CPUs, e.g. `0-111`)
 - Working SSH hostname (may differ from the one provided if `-1` fallback was used)
