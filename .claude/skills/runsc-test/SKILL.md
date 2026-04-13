@@ -78,6 +78,14 @@ p.write_text(json.dumps(cfg, indent=2) + chr(10))
 ssh modal@<node> 'cd ~/gvisor && sudo docker build -f Dockerfile.torch-slim -t torch-slim .'
 ```
 
+### Expand Docker cpuset
+Docker restart resets the cgroup cpuset. Re-expand so containers get all CPUs
+(without this, NCCL proxy threads are starved and busbw drops ~4-5x):
+```
+ssh modal@<node> 'sudo bash -c "echo 0-$(( $(nproc) - 1 )) > /sys/fs/cgroup/system.slice/cpuset.cpus" && cat /sys/fs/cgroup/system.slice/docker.service/cpuset.cpus.effective'
+```
+Run on both nodes. Output should match `nproc` (e.g. `0-111`).
+
 ### Verify
 ```
 ssh modal@<node> '/usr/local/bin/runsc-rdma --version && sudo docker info 2>&1 | grep -A3 Runtimes'

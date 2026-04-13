@@ -234,7 +234,6 @@ Present results:
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `ibv_reg_mr_iova2 EFAULT` | GPU memory VMA not pinnable | Reduce GPUs to 2 or use `--gdr 0` |
 | `Could not find NET with id N` | Wrong topo/graph XML | Regenerate via `/baseline` on this hardware |
 | `Connection closed by remote peer` | Node 1 started alone, node 0 never launched | Check coordinated launch timing |
 | Zero port counter deltas | Crashed before data flowed | Check NCCL errors in output |
