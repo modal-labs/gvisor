@@ -1,2 +1,0 @@
-size_bytes,size_human,native_busbw_gbps,runc_busbw_gbps,gvisor_busbw_gbps,native_time_us,runc_time_us,gvisor_time_us,gvisor_vs_runc_ratio,gvisor_vs_native_ratio
-
