@@ -155,8 +155,10 @@ func gpuAgentLoop(shared uintptr) {
 
 	for {
 		// Wait for a command: futex_wait until *cmdPtr != 0.
+		// Use raw pointer reads (not sync/atomic) — Go runtime is
+		// not safe after fork.
 		for {
-			cmd := atomic.LoadUint32(cmdPtr)
+			cmd := *cmdPtr
 			if cmd != agentCmdNone {
 				break
 			}
@@ -168,7 +170,7 @@ func gpuAgentLoop(shared uintptr) {
 				0, 0, 0)
 		}
 
-		cmd := atomic.LoadUint32(cmdPtr)
+		cmd := *cmdPtr
 
 		switch cmd {
 		case agentCmdMmapAndIoctl:
@@ -203,8 +205,8 @@ func gpuAgentLoop(shared uintptr) {
 			}
 
 			// Signal completion: set done=1, wake parent.
-			atomic.StoreUint32(cmdPtr, agentCmdNone)
-			atomic.StoreUint32(donePtr, 1)
+			*cmdPtr = agentCmdNone
+			*donePtr = 1
 			hostsyscall.RawSyscall6(unix.SYS_FUTEX,
 				uintptr(unsafe.Pointer(donePtr)),
 				1, // FUTEX_WAKE
@@ -216,8 +218,8 @@ func gpuAgentLoop(shared uintptr) {
 			length := *(*uint64)(unsafe.Pointer(shared + agentOffLen))
 			hostsyscall.RawSyscall(unix.SYS_MUNMAP, uintptr(gpuVA), uintptr(length), 0)
 
-			atomic.StoreUint32(cmdPtr, agentCmdNone)
-			atomic.StoreUint32(donePtr, 1)
+			*cmdPtr = agentCmdNone
+			*donePtr = 1
 			hostsyscall.RawSyscall6(unix.SYS_FUTEX,
 				uintptr(unsafe.Pointer(donePtr)),
 				1, 1, 0, 0, 0)
