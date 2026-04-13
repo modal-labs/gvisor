@@ -123,10 +123,23 @@ type mirroredPages struct {
 	// mrSummary is an optional compact registration summary emitted once the
 	// host returns an MR handle successfully.
 	mrSummary string
+	// If agent is set, the GPU VMA lives in the agent's address space.
+	// The ioctl must be forwarded to the agent instead of called directly.
+	agent    *gpuAgent
+	nvidiaFD int32  // prepared nvidia FD for the agent to mmap
+	gpuVA    uint64 // GPU VA where the agent should mmap
+	gpuLen   uint64 // length of the GPU VMA
 }
 
 func (mp *mirroredPages) release(ctx context.Context) {
-	if mp.sharedGPUVMA != nil {
+	if mp.agent != nil {
+		// Tell the agent to munmap the GPU VMA.
+		mp.agent.munmapVMA(mp.gpuVA, mp.gpuLen)
+		if mp.nvidiaFD >= 0 {
+			unix.Close(int(mp.nvidiaFD))
+			mp.nvidiaFD = -1
+		}
+	} else if mp.sharedGPUVMA != nil {
 		mp.sharedGPUVMA.release()
 	} else if mp.m != 0 {
 		if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, mp.m, mp.len, 0); errno != 0 {

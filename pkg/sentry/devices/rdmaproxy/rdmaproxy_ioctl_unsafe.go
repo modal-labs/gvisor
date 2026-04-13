@@ -81,6 +81,97 @@ func ioctlDirect(fd int32, cmd uint32, arg unsafe.Pointer) (uintptr, unix.Errno)
 	return n, errno
 }
 
+// forwardIoctlToAgent serializes the ioctl buffer + rewritten attr data into
+// the agent's shared memory page and asks the agent to mmap the nvidia FD at
+// the GPU VA, then call the ioctl. The agent has its own mm_struct so the
+// VMA doesn't collide with other GPUs' VMAs.
+func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf []byte, rewrites []attrRewrite) (uintptr, unix.Errno) {
+	agent := mp.agent
+	sp := agent.sharedPage
+	bufLen := len(buf)
+
+	if agentOffBuf+bufLen > agentSharedSize {
+		log.Warningf("rdmaproxy: ioctl buffer too large for agent shared page: %d > %d", bufLen, agentSharedSize-agentOffBuf)
+		return 0, unix.EINVAL
+	}
+
+	// Copy ioctl buffer to shared page.
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(sp+agentOffBuf)), bufLen), buf)
+
+	// Copy rewritten attr data into the shared page (after the ioctl buffer)
+	// and update pointer fields in the shared-page copy to reference the
+	// data within the shared page.
+	dataOff := bufLen
+	for _, rw := range rewrites {
+		if len(rw.sentry) == 0 {
+			continue
+		}
+		if agentOffBuf+dataOff+len(rw.sentry) > agentSharedSize {
+			log.Warningf("rdmaproxy: attr data overflow in agent shared page")
+			return 0, unix.EINVAL
+		}
+		// Copy attr data into shared page.
+		dst := unsafe.Slice((*byte)(unsafe.Pointer(sp+uintptr(agentOffBuf+dataOff))), len(rw.sentry))
+		copy(dst, rw.sentry)
+		// Rewrite the attr's data pointer in the shared-page copy of
+		// the ioctl buffer to point to the shared page location.
+		newPtr := uint64(sp) + uint64(agentOffBuf+dataOff)
+		binary.LittleEndian.PutUint64(
+			unsafe.Slice((*byte)(unsafe.Pointer(sp+uintptr(agentOffBuf+rw.attrOff+8))), 8),
+			newPtr,
+		)
+		dataOff += len(rw.sentry)
+	}
+
+	// Write command parameters.
+	*(*uint32)(unsafe.Pointer(sp + agentOffCmd)) = agentCmdMmapAndIoctl
+	*(*uint64)(unsafe.Pointer(sp + agentOffGPUVA)) = mp.gpuVA
+	*(*uint64)(unsafe.Pointer(sp + agentOffLen)) = mp.gpuLen
+	*(*int32)(unsafe.Pointer(sp + agentOffNvidiaFD)) = mp.nvidiaFD
+	*(*int32)(unsafe.Pointer(sp + agentOffUverbsFD)) = uverbsFD
+	*(*uint32)(unsafe.Pointer(sp + agentOffIoctlCmd)) = ioctlCmd
+	*(*uint32)(unsafe.Pointer(sp + agentOffBufLen)) = uint32(bufLen)
+
+	// Signal the agent and wait for result.
+	cmdByte := [1]byte{1}
+	if _, err := unix.Write(int(agent.cmdPipe), cmdByte[:]); err != nil {
+		return 0, unix.EIO
+	}
+	var resByte [1]byte
+	if _, err := unix.Read(int(agent.resPipe), resByte[:]); err != nil {
+		return 0, unix.EIO
+	}
+
+	// Copy ioctl buffer back (kernel may have written output attrs).
+	copy(buf, unsafe.Slice((*byte)(unsafe.Pointer(sp+agentOffBuf)), bufLen))
+
+	// Copy rewritten attr data back from shared page.
+	dataOff = bufLen
+	for _, rw := range rewrites {
+		if len(rw.sentry) == 0 {
+			continue
+		}
+		src := unsafe.Slice((*byte)(unsafe.Pointer(sp+uintptr(agentOffBuf+dataOff))), len(rw.sentry))
+		copy(rw.sentry, src)
+		// Restore the original sentry pointer in buf (for post-ioctl processing).
+		binary.LittleEndian.PutUint64(buf[rw.attrOff+8:rw.attrOff+16], uint64(uintptr(unsafe.Pointer(&rw.sentry[0]))))
+		dataOff += len(rw.sentry)
+	}
+
+	resultN := *(*int64)(unsafe.Pointer(sp + agentOffResultN))
+	resultErrno := *(*int32)(unsafe.Pointer(sp + agentOffErrno))
+
+	// Close the prepared nvidia FD in the sentry (agent has its own copy
+	// from the COW fork). Only close after first use since the agent
+	// inherits it once.
+	if mp.nvidiaFD >= 0 {
+		unix.Close(int(mp.nvidiaFD))
+		mp.nvidiaFD = -1
+	}
+
+	return uintptr(resultN), unix.Errno(resultErrno)
+}
+
 // writeInHostNetns runs write(2) on the uverbs fd in the host network namespace.
 // Legacy ibv_modify_qp uses the write() command path (IB_USER_VERBS_CMD_MODIFY_QP);
 // it needs the same netns as ioctl MODIFY_QP for RoCE GID resolution.
@@ -613,7 +704,11 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 
 	var n uintptr
 	var errno unix.Errno
-	if ioctlNeedsHostNetns(action, objectID, writeCmdVal) {
+	if mrMirror != nil && mrMirror.agent != nil {
+		// GPU-backed MR_REG: forward through agent process which has
+		// its own mm_struct to avoid GPU VA collisions.
+		n, errno = forwardIoctlToAgent(mrMirror, fd.hostFD, uint32(rdmaVerbsIoctl), buf, rewrites)
+	} else if ioctlNeedsHostNetns(action, objectID, writeCmdVal) {
 		n, errno = ioctlInHostNetns(fd.hostFD, rdmaVerbsIoctl, unsafe.Pointer(&buf[0]))
 	} else {
 		n, errno = ioctlDirect(fd.hostFD, rdmaVerbsIoctl, unsafe.Pointer(&buf[0]))
@@ -1192,82 +1287,51 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		}
 	}
 
-	// Only use the prepareGPUVMA path which matches by GPU allocation
-	// metadata (hClient, hMemory, gpuUUIDs). The previous approach of
-	// mmapping an existing nvidia FD picked the wrong GPU's device FD at
-	// 3+ GPUs, creating VMAs with wrong provenance that nvidia-peermem
-	// could not resolve.
-	var (
-		lastErr error
-		last    nvproxyMirrorCandidate
-	)
+	// Use prepareGPUVMA to get the correct nvidia FD for this GPU allocation,
+	// then delegate the mmap+ioctl to a per-GPU agent process. Each agent has
+	// its own mm_struct, so GPU VMAs from different GPUs don't collide.
+	var lastErr error
 	for _, candidate := range candidates {
 		if candidate.prepare == nil {
 			continue
 		}
 
-		preparedHostFD, preparedDevName, preparedLen, prepErr := candidate.prepare(t, addr, uint64(alignedStart), alignedLen)
+		preparedHostFD, preparedDevName, _, prepErr := candidate.prepare(t, addr, uint64(alignedStart), alignedLen)
 		if prepErr != nil {
 			log.Debugf("rdmaproxy: GPU VMA prepare failed via sandboxFD=%d hostFD=%d dev=%q at %#x len %d: %v",
 				candidate.sandboxFD, candidate.hostFD, candidate.devName, alignedStart, alignedLen, prepErr)
 			continue
 		}
 
-		// Check cache keyed by (VA, len, devName) so different GPUs
-		// don't share VMAs even for the same VA range.
-		if shared := acquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), preparedDevName); shared != nil {
+		agent, agentErr := getOrSpawnGPUAgent(preparedDevName)
+		if agentErr != nil {
 			unix.Close(int(preparedHostFD))
-			log.Infof("rdmaproxy: reusing shared nvidia-backed VMA for GPU VA %#x-%#x dev=%q (%s)",
-				alignedStart, uint64(alignedStart)+alignedLen, preparedDevName, taskFields)
-			sentryVA := shared.mappedStart + uintptr(addr-uint64(alignedStart))
-			return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
+			log.Warningf("rdmaproxy: GPU agent spawn failed for dev=%q: %v", preparedDevName, agentErr)
+			lastErr = agentErr
+			continue
 		}
 
-		preparedCandidate := nvproxyMirrorCandidate{
-			sandboxFD:  candidate.sandboxFD,
-			hostFD:     preparedHostFD,
-			devName:    preparedDevName,
-			mmapLength: preparedLen,
-		}
-		// Try to map at the exact GPU VA first. If another GPU's VMA
-		// occupies this address, relocate to any free sentry VA. The
-		// nvidia driver resolves GPU pages by file offset, not by
-		// comparing against the mmap address.
-		shared, mapped, errno, _ := mapOrAcquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), preparedDevName, func() (uintptr, unix.Errno) {
-			mapped, _, errno := unix.RawSyscall6(unix.SYS_MMAP,
-				uintptr(alignedStart), uintptr(alignedLen),
-				unix.PROT_READ|unix.PROT_WRITE,
-				unix.MAP_SHARED|unix.MAP_FIXED_NOREPLACE,
-				uintptr(preparedHostFD), 0)
-			if errno == unix.EEXIST {
-				log.Warningf("rdmaproxy: GPU VA collision at %#x-%#x dev=%q (%s); relocating to free sentry VA",
-					alignedStart, uint64(alignedStart)+alignedLen, preparedDevName, taskFields)
-				mapped, _, errno = unix.RawSyscall6(unix.SYS_MMAP,
-					0, uintptr(alignedLen),
-					unix.PROT_READ|unix.PROT_WRITE,
-					unix.MAP_SHARED,
-					uintptr(preparedHostFD), 0)
-			}
-			return mapped, errno
-		})
-		unix.Close(int(preparedHostFD))
-		if errno == 0 {
-			log.Infof("rdmaproxy: created nvidia-backed VMA for GPU VA %#x-%#x via prepared sandboxFD=%d dev=%q mmapLen=%d → sentry %#x (%s)",
-				alignedStart, uint64(alignedStart)+alignedLen, preparedCandidate.sandboxFD, preparedCandidate.devName, preparedCandidate.mmapLength, mapped, taskFields)
-			sentryVA := mapped + uintptr(addr-uint64(alignedStart))
-			return &mirroredPages{sharedGPUVMA: shared, len: uintptr(alignedLen)}, sentryVA, nil
-		}
-		last = preparedCandidate
-		lastErr = fmt.Errorf("%v", errno)
-		log.Debugf("rdmaproxy: GPU VMA mmap failed via prepared sandboxFD=%d hostFD=%d dev=%q mmapLen=%d at %#x len %d (%s): %v",
-			preparedCandidate.sandboxFD, preparedCandidate.hostFD, preparedCandidate.devName, preparedCandidate.mmapLength, alignedStart, alignedLen, taskFields, errno)
+		// Return the agent reference. The actual mmap+ioctl will be
+		// performed by the agent when handleRDMAVerbsIoctl forwards
+		// the ioctl. We use the GPU VA as the "sentry VA" since the
+		// agent will mmap there (identity-mapped, no collision in its
+		// own address space).
+		sentryVA := uintptr(addr)
+		log.Infof("rdmaproxy: GPU VMA will be created by agent pid=%d dev=%q for GPU VA %#x-%#x (%s)",
+			agent.pid, preparedDevName, alignedStart, uint64(alignedStart)+alignedLen, taskFields)
+		return &mirroredPages{
+			agent:    agent,
+			nvidiaFD: preparedHostFD,
+			gpuVA:    uint64(alignedStart),
+			gpuLen:   alignedLen,
+		}, sentryVA, nil
 	}
 
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no candidates with prepare capability")
 	}
-	return nil, 0, fmt.Errorf("all nvidia frontend attempts failed for GPU VA %#x len %d (last sandboxFD=%d hostFD=%d dev=%q mmapLen=%d: %w)",
-		addr, alignedLen, last.sandboxFD, last.hostFD, last.devName, last.mmapLength, lastErr)
+	return nil, 0, fmt.Errorf("all nvidia frontend attempts failed for GPU VA %#x len %d: %w",
+		addr, alignedLen, lastErr)
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after
