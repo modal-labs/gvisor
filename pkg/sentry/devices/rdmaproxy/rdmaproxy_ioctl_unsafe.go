@@ -134,8 +134,14 @@ func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf
 	*(*uint32)(unsafe.Pointer(sp + agentOffIoctlCmd)) = ioctlCmd
 	*(*uint32)(unsafe.Pointer(sp + agentOffBufLen)) = uint32(bufLen)
 
-	log.Warningf("rdmaproxy: agent forward: dev=%q gpuVA=%#x len=%d nvidiaFD=%d uverbsFD=%d bufLen=%d rewrites=%d",
-		agent.devName, mp.gpuVA, mp.gpuLen, mp.nvidiaFD, uverbsFD, bufLen, len(rewrites))
+	// Write RM_MAP_MEMORY params to shared page so the agent can call
+	// RM_MAP_MEMORY in its own process before mmap.
+	*(*int32)(unsafe.Pointer(sp + agentOffCtrlFD)) = mp.ctrlFD
+	*(*uint32)(unsafe.Pointer(sp + agentOffRmMapCmd)) = mp.rmMapCmd
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(sp+agentOffRmMapParams)), 64), mp.rmMapParams[:])
+
+	log.Warningf("rdmaproxy: agent forward: dev=%q gpuVA=%#x len=%d nvidiaFD=%d uverbsFD=%d ctrlFD=%d rmMapCmd=%#x bufLen=%d rewrites=%d",
+		agent.devName, mp.gpuVA, mp.gpuLen, mp.nvidiaFD, uverbsFD, mp.ctrlFD, mp.rmMapCmd, bufLen, len(rewrites))
 
 	// Set command (must be last write before wake) and signal agent.
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(sp+agentOffCmd)), agentCmdMmapAndIoctl)
@@ -1192,11 +1198,12 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 // mmap handler attaches its vm_ops to the resulting VMA.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
 	type nvproxyMirrorCandidate struct {
-		sandboxFD  int32
-		hostFD     int32
-		devName    string
-		mmapLength uint64
-		prepare    func(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
+		sandboxFD   int32
+		hostFD      int32
+		devName     string
+		mmapLength  uint64
+		prepare     func(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
+		lastRMMapFn func() (int32, uint32, []byte, bool) // NVProxyLastRMMapInfo
 	}
 	taskFields := taskLogFields(t)
 
@@ -1204,10 +1211,16 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 	seenHostFDs := make(map[int32]int)
 	t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
 		var prepare func(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
+		var lastRMMapFn func() (int32, uint32, []byte, bool)
 		if preparer, ok := file.Impl().(interface {
 			NVProxyPrepareGPUVMA(context.Context, uint64, uint64, uint64) (int32, string, uint64, error)
 		}); ok {
 			prepare = preparer.NVProxyPrepareGPUVMA
+		}
+		if rmMapper, ok := file.Impl().(interface {
+			NVProxyLastRMMapInfo() (int32, uint32, []byte, bool)
+		}); ok {
+			lastRMMapFn = rmMapper.NVProxyLastRMMapInfo
 		}
 		if mappable, ok := file.Impl().(interface {
 			NVProxyMmapInfo() (int32, string, uint64)
@@ -1216,16 +1229,18 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			if idx, ok := seenHostFDs[hostFD]; ok {
 				if candidates[idx].prepare == nil {
 					candidates[idx].prepare = prepare
+					candidates[idx].lastRMMapFn = lastRMMapFn
 				}
 				return true
 			}
 			seenHostFDs[hostFD] = len(candidates)
 			candidates = append(candidates, nvproxyMirrorCandidate{
-				sandboxFD:  fd,
-				hostFD:     hostFD,
-				devName:    devName,
-				mmapLength: mmapLength,
-				prepare:    prepare,
+				sandboxFD:   fd,
+				hostFD:      hostFD,
+				devName:     devName,
+				mmapLength:  mmapLength,
+				prepare:     prepare,
+				lastRMMapFn: lastRMMapFn,
 			})
 			return true
 		}
@@ -1236,14 +1251,16 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			if idx, ok := seenHostFDs[hostFD]; ok {
 				if candidates[idx].prepare == nil {
 					candidates[idx].prepare = prepare
+					candidates[idx].lastRMMapFn = lastRMMapFn
 				}
 				return true
 			}
 			seenHostFDs[hostFD] = len(candidates)
 			candidates = append(candidates, nvproxyMirrorCandidate{
-				sandboxFD: fd,
-				hostFD:    hostFD,
-				prepare:   prepare,
+				sandboxFD:   fd,
+				hostFD:      hostFD,
+				prepare:     prepare,
+				lastRMMapFn: lastRMMapFn,
 			})
 		}
 		return true
@@ -1304,6 +1321,19 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			continue
 		}
 
+		// Get the RM_MAP_MEMORY params so the agent can replay the ioctl.
+		var ctrlFD int32
+		var rmMapCmd uint32
+		var rmMapParams [64]byte
+		if candidate.lastRMMapFn != nil {
+			cfd, cmd, raw, ok := candidate.lastRMMapFn()
+			if ok && len(raw) <= 64 {
+				ctrlFD = cfd
+				rmMapCmd = cmd
+				copy(rmMapParams[:], raw)
+			}
+		}
+
 		agent, agentErr := getOrSpawnGPUAgent(preparedDevName)
 		if agentErr != nil {
 			unix.Close(int(preparedHostFD))
@@ -1312,19 +1342,17 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			continue
 		}
 
-		// Return the agent reference. The actual mmap+ioctl will be
-		// performed by the agent when handleRDMAVerbsIoctl forwards
-		// the ioctl. We use the GPU VA as the "sentry VA" since the
-		// agent will mmap there (identity-mapped, no collision in its
-		// own address space).
 		sentryVA := uintptr(addr)
-		log.Infof("rdmaproxy: GPU VMA will be created by agent pid=%d dev=%q for GPU VA %#x-%#x (%s)",
-			agent.pid, preparedDevName, alignedStart, uint64(alignedStart)+alignedLen, taskFields)
+		log.Infof("rdmaproxy: GPU VMA will be created by agent pid=%d dev=%q for GPU VA %#x-%#x ctrlFD=%d (%s)",
+			agent.pid, preparedDevName, alignedStart, uint64(alignedStart)+alignedLen, ctrlFD, taskFields)
 		return &mirroredPages{
-			agent:    agent,
-			nvidiaFD: preparedHostFD,
-			gpuVA:    uint64(alignedStart),
-			gpuLen:   alignedLen,
+			agent:       agent,
+			nvidiaFD:    preparedHostFD,
+			gpuVA:       uint64(alignedStart),
+			gpuLen:      alignedLen,
+			ctrlFD:      ctrlFD,
+			rmMapCmd:    rmMapCmd,
+			rmMapParams: rmMapParams,
 		}, sentryVA, nil
 	}
 

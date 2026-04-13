@@ -64,8 +64,14 @@ const (
 	agentOffResultN  = 40 // i64: ioctl return value
 	agentOffErrno    = 48 // i32: ioctl errno
 	agentOffBufLen   = 52 // u32: ioctl buffer length
-	agentOffBuf      = 64 // ioctl buffer data
-	agentSharedSize  = 8192
+	// RM_MAP_MEMORY params (NV_ESC_RM_MAP_MEMORY ioctl on control FD).
+	// The RM_MAP_MEMORY ioctl must happen in the same process as the mmap
+	// so the nvidia driver associates the mmap context with this process.
+	agentOffCtrlFD      = 56  // i32: nvidia control/frontend host FD
+	agentOffRmMapCmd    = 60  // u32: RM_MAP_MEMORY ioctl cmd number
+	agentOffRmMapParams = 128 // IoctlNVOS33ParametersWithFD (64 bytes)
+	agentOffBuf         = 256 // ioctl buffer data (RDMA verbs)
+	agentSharedSize     = 8192
 )
 
 // gpuAgents is the global registry of per-GPU agent processes.
@@ -182,29 +188,47 @@ func gpuAgentLoop(shared uintptr) {
 			nvidiaFD := *(*int32)(unsafe.Pointer(shared + agentOffNvidiaFD))
 			uverbsFD := *(*int32)(unsafe.Pointer(shared + agentOffUverbsFD))
 			ioctlCmd := *(*uint32)(unsafe.Pointer(shared + agentOffIoctlCmd))
+			ctrlFD := *(*int32)(unsafe.Pointer(shared + agentOffCtrlFD))
+			rmMapCmd := *(*uint32)(unsafe.Pointer(shared + agentOffRmMapCmd))
 
-			// munmap any existing mapping at the target GPU VA.
-			hostsyscall.RawSyscall(unix.SYS_MUNMAP, uintptr(gpuVA), uintptr(length), 0)
+			// Step 1: Call RM_MAP_MEMORY on the control FD to create
+			// the mmap context in THIS process. The params struct is
+			// at agentOffRmMapParams in the shared page.
+			_, rmErrno := hostsyscall.RawSyscall(
+				unix.SYS_IOCTL,
+				uintptr(ctrlFD),
+				uintptr(rmMapCmd),
+				shared+agentOffRmMapParams)
 
-			// mmap nvidia FD at the exact GPU VA.
-			_, mmapErrno := hostsyscall.RawSyscall6(unix.SYS_MMAP,
-				uintptr(gpuVA), uintptr(length),
-				unix.PROT_READ|unix.PROT_WRITE,
-				unix.MAP_SHARED|unix.MAP_FIXED,
-				uintptr(nvidiaFD), 0)
-
-			if mmapErrno != 0 {
+			if rmErrno != 0 {
 				*(*int64)(unsafe.Pointer(shared + agentOffResultN)) = -1
-				*(*int32)(unsafe.Pointer(shared + agentOffErrno)) = int32(mmapErrno)
+				*(*int32)(unsafe.Pointer(shared + agentOffErrno)) = int32(rmErrno) + 1000 // offset to distinguish from mmap/ioctl errors
 			} else {
-				// Call the RDMA verbs ioctl.
-				ioctlN, ioctlErrno := hostsyscall.RawSyscall(
-					unix.SYS_IOCTL,
-					uintptr(uverbsFD),
-					uintptr(ioctlCmd),
-					shared+agentOffBuf)
-				*(*int64)(unsafe.Pointer(shared + agentOffResultN)) = int64(ioctlN)
-				*(*int32)(unsafe.Pointer(shared + agentOffErrno)) = int32(ioctlErrno)
+				// Step 2: munmap any existing mapping at the GPU VA.
+				hostsyscall.RawSyscall(unix.SYS_MUNMAP, uintptr(gpuVA), uintptr(length), 0)
+
+				// Step 3: mmap the device FD at the GPU VA. The
+				// RM_MAP_MEMORY context is now in this process, so
+				// the nvidia driver will attach vm_ops to the VMA.
+				_, mmapErrno := hostsyscall.RawSyscall6(unix.SYS_MMAP,
+					uintptr(gpuVA), uintptr(length),
+					unix.PROT_READ|unix.PROT_WRITE,
+					unix.MAP_SHARED|unix.MAP_FIXED,
+					uintptr(nvidiaFD), 0)
+
+				if mmapErrno != 0 {
+					*(*int64)(unsafe.Pointer(shared + agentOffResultN)) = -1
+					*(*int32)(unsafe.Pointer(shared + agentOffErrno)) = int32(mmapErrno) + 2000
+				} else {
+					// Step 4: Call the RDMA verbs ioctl.
+					ioctlN, ioctlErrno := hostsyscall.RawSyscall(
+						unix.SYS_IOCTL,
+						uintptr(uverbsFD),
+						uintptr(ioctlCmd),
+						shared+agentOffBuf)
+					*(*int64)(unsafe.Pointer(shared + agentOffResultN)) = int64(ioctlN)
+					*(*int32)(unsafe.Pointer(shared + agentOffErrno)) = int32(ioctlErrno)
+				}
 			}
 
 			// Signal completion: set done=1, wake parent.

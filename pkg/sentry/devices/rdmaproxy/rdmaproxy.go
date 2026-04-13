@@ -125,10 +125,13 @@ type mirroredPages struct {
 	mrSummary string
 	// If agent is set, the GPU VMA lives in the agent's address space.
 	// The ioctl must be forwarded to the agent instead of called directly.
-	agent    *gpuAgent
-	nvidiaFD int32  // prepared nvidia FD for the agent to mmap
-	gpuVA    uint64 // GPU VA where the agent should mmap
-	gpuLen   uint64 // length of the GPU VMA
+	agent       *gpuAgent
+	nvidiaFD    int32  // prepared nvidia FD for the agent to mmap
+	gpuVA       uint64 // GPU VA where the agent should mmap
+	gpuLen      uint64 // length of the GPU VMA
+	ctrlFD      int32  // nvidia control FD for RM_MAP_MEMORY
+	rmMapCmd    uint32 // RM_MAP_MEMORY ioctl command number
+	rmMapParams [64]byte // IoctlNVOS33ParametersWithFD raw bytes
 }
 
 func (mp *mirroredPages) release(ctx context.Context) {
