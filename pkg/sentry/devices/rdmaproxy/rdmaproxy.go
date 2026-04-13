@@ -138,10 +138,6 @@ func (mp *mirroredPages) release(ctx context.Context) {
 	if mp.agent != nil {
 		// Tell the agent to munmap the GPU VMA.
 		mp.agent.munmapVMA(mp.gpuVA, mp.gpuLen)
-		if mp.nvidiaFD >= 0 {
-			unix.Close(int(mp.nvidiaFD))
-			mp.nvidiaFD = -1
-		}
 	} else if mp.sharedGPUVMA != nil {
 		mp.sharedGPUVMA.release()
 	} else if mp.m != 0 {

@@ -561,17 +561,14 @@ func (fd *frontendFD) prepareGPUVMADryRun(ctx context.Context, addr, alignedStar
 			paramBytes := make([]byte, unsafe.Sizeof(ioctlParams))
 			copy(paramBytes, (*[64]byte)(unsafe.Pointer(&ioctlParams))[:len(paramBytes)])
 
-			returnFD, derr := unix.Dup(int(candidate.hostFD))
-			if derr != nil {
-				errs = append(errs, fmt.Sprintf("dup %d: %v", candidate.hostFD, derr))
-				continue
-			}
-
+			// Return candidate.hostFD directly (no dup needed — with
+			// CLONE_FILES the agent shares the FD table). The agent
+			// uses this same FD for both RM_MAP_MEMORY and mmap.
 			if ctx.IsLogging(log.Debug) {
 				ctx.Debugf("nvproxy: dry-run prepared RM_MAP_MEMORY params for GPU VA %#x-%#x ctrlHostFD=%d mapFD=%d mapDev=%q hClient=%v hDevice=%v hMemory=%v",
-					alignedStart, alignedStart+alignedLen, fd.hostFD, returnFD, candidate.devName, mapping.hClient, target.hDevice, mapping.hMemory)
+					alignedStart, alignedStart+alignedLen, fd.hostFD, candidate.hostFD, candidate.devName, mapping.hClient, target.hDevice, mapping.hMemory)
 			}
-			return int32(returnFD), candidate.devName, fd.hostFD, ioctlCmd, paramBytes, nil
+			return candidate.hostFD, candidate.devName, fd.hostFD, ioctlCmd, paramBytes, nil
 		}
 
 		for _, mapDevName := range target.mapDevNames {

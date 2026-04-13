@@ -169,12 +169,9 @@ func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf
 	log.Warningf("rdmaproxy: agent result: dev=%q gpuVA=%#x n=%d errno=%d",
 		agent.devName, mp.gpuVA, resultN, resultErrno)
 
-	// Close the prepared nvidia FD in the sentry (with CLONE_FILES this
-	// also closes it in the agent, but the mmap VMA survives FD close).
-	if mp.nvidiaFD >= 0 {
-		unix.Close(int(mp.nvidiaFD))
-		mp.nvidiaFD = -1
-	}
+	// Do NOT close nvidiaFD — with CLONE_FILES, closing it here would
+	// close it in the agent too. The FD is shared and may be reused
+	// for future mmap contexts.
 
 	return uintptr(resultN), unix.Errno(resultErrno)
 }
