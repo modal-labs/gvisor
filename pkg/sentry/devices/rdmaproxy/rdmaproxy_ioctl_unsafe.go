@@ -123,8 +123,10 @@ func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf
 		dataOff += len(rw.sentry)
 	}
 
-	// Write command parameters.
-	*(*uint32)(unsafe.Pointer(sp + agentOffCmd)) = agentCmdMmapAndIoctl
+	// Write command parameters and signal the agent via futex.
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+
 	*(*uint64)(unsafe.Pointer(sp + agentOffGPUVA)) = mp.gpuVA
 	*(*uint64)(unsafe.Pointer(sp + agentOffLen)) = mp.gpuLen
 	*(*int32)(unsafe.Pointer(sp + agentOffNvidiaFD)) = mp.nvidiaFD
@@ -132,15 +134,9 @@ func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf
 	*(*uint32)(unsafe.Pointer(sp + agentOffIoctlCmd)) = ioctlCmd
 	*(*uint32)(unsafe.Pointer(sp + agentOffBufLen)) = uint32(bufLen)
 
-	// Signal the agent and wait for result.
-	cmdByte := [1]byte{1}
-	if _, err := unix.Write(int(agent.cmdPipe), cmdByte[:]); err != nil {
-		return 0, unix.EIO
-	}
-	var resByte [1]byte
-	if _, err := unix.Read(int(agent.resPipe), resByte[:]); err != nil {
-		return 0, unix.EIO
-	}
+	// Set command (must be last write before wake) and signal agent.
+	atomic.StoreUint32((*uint32)(unsafe.Pointer(sp+agentOffCmd)), agentCmdMmapAndIoctl)
+	agent.sendCommand()
 
 	// Copy ioctl buffer back (kernel may have written output attrs).
 	copy(buf, unsafe.Slice((*byte)(unsafe.Pointer(sp+agentOffBuf)), bufLen))
