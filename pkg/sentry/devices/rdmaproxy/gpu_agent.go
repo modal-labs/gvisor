@@ -125,10 +125,6 @@ func spawnGPUAgent(devName string) (*gpuAgent, error) {
 		return nil, fmt.Errorf("pipe2 res: %v", err)
 	}
 
-	// Clear CLOEXEC on the FDs the child needs.
-	clearCloexec(cmdPipe[0]) // child reads commands
-	clearCloexec(resPipe[1]) // child writes results
-
 	// Clone with CLONE_FILES but without CLONE_VM:
 	// - Own mm_struct (no CLONE_VM) → GPU VMAs don't collide
 	// - Shared FD table (CLONE_FILES) → agent sees FDs opened after clone
@@ -158,9 +154,9 @@ func spawnGPUAgent(devName string) (*gpuAgent, error) {
 	// Parent process.
 	afterFork()
 
-	// Close child's ends of pipes.
-	unix.Close(cmdPipe[0])
-	unix.Close(resPipe[1])
+	// With CLONE_FILES, the FD table is shared. Do NOT close the child's
+	// pipe endpoints — that would close them in the child too. Both ends
+	// stay open in both processes; each side only reads/writes its own end.
 
 	agent := &gpuAgent{
 		devName:    devName,
