@@ -1,4 +1,71 @@
-# RDMA Plan - 2026-04-10
+# RDMA Plan - 2026-04-13 (updated)
+
+## Current State (commit 8dede45cc)
+
+Per-GPU agent architecture is implemented. 8 agents spawn via
+clone(CLONE_FILES|SIGCHLD), futex-based signaling, dry-run RM_MAP_MEMORY
+params forwarded to agent. The agent calls RM_MAP_MEMORY (errno=0) then
+mmap (EINVAL). All 32 GPU-backed MR_REG forwards fail with errno=2022
+(mmap EINVAL).
+
+### Next diagnostic step
+
+Run 8-GPU test and check `rmStatus` in the sentry log (Warning level,
+no --debug needed, just --debug-log=/tmp/runsc-logs/). The log line is:
+
+```
+rdmaproxy: agent result: dev="nvidia7" gpuVA=0x... n=-1 errno=2022 rmStatus=0x...
+```
+
+- If `rmStatus != 0`: RM_MAP_MEMORY failed logically in the agent's process
+  context. The nvidia driver likely can't find the RM client (hClient) in
+  the agent's process because the RM client was created by the sentry.
+  Fix: may need to share RM client context or use a different approach.
+
+- If `rmStatus == 0`: RM_MAP_MEMORY succeeded but mmap still fails. Check:
+  - Does the nvidia FD match the FD field in the RM_MAP_MEMORY params?
+  - Does the mmap length match the RM_MAP_MEMORY Length field?
+  - Does the nvidia driver require the mmap caller to be the same process
+    that opened the device FD (not just shared via CLONE_FILES)?
+
+### Test procedure
+
+1. Provision new Modal nodes via `/node-setup`
+2. Build and deploy this commit
+3. Configure runtime: `--debug-log=/tmp/runsc-logs/` (NO `--debug`)
+4. Run 8-GPU test via `/runsc-test`
+5. Check sentry log for `agent result:` lines with `rmStatus`
+
+### Architecture summary
+
+```
+Sentry process:
+  - handles all CPU memory MR_REGs (Pin path)
+  - handles CQ/QP/GID operations
+  - calls prepareGPUVMADryRun → gets RM_MAP_MEMORY params without calling
+  - spawns per-GPU agent via clone(CLONE_FILES|SIGCHLD)
+  - forwards GPU MR_REG to agent via shared page + futex
+
+Agent process (one per GPU):
+  - own mm_struct (no CLONE_VM) → no VA collisions
+  - shared FD table (CLONE_FILES) → sees nvidia/uverbs FDs
+  - calls RM_MAP_MEMORY (raw ioctl on shared page)
+  - mmaps nvidia FD at GPU VA (MAP_SHARED|MAP_FIXED, offset=0)
+  - calls RDMA verbs ioctl
+  - holds VMA alive for MR lifetime
+```
+
+### Key files
+
+- `pkg/sentry/devices/rdmaproxy/gpu_agent.go` — agent lifecycle + loop
+- `pkg/sentry/devices/rdmaproxy/rdmaproxy_ioctl_unsafe.go` — forwardIoctlToAgent
+- `pkg/sentry/devices/rdmaproxy/rdmaproxy.go` — mirroredPages with agent
+- `pkg/sentry/devices/nvproxy/frontend.go` — NVProxyPrepareGPUVMADryRun
+- `pkg/sentry/devices/nvproxy/frontend_unsafe.go` — prepareGPUVMADryRun
+
+---
+
+# RDMA Plan - 2026-04-10 (original)
 
 ## Blocking Error
 
