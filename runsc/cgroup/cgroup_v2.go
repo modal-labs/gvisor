@@ -172,6 +172,23 @@ func (c *cgroupV2) Install(res *specs.LinuxResources) error {
 				return fmt.Errorf("unified resource %q must be a file name (no slashes)", k)
 			}
 			if err := setValue(c.MakePath(""), k, v); err != nil {
+				if errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) {
+					controller, _, ok := strings.Cut(k, ".")
+					if !ok {
+						return fmt.Errorf("unified resource %q must be in the form CONTROLLER.PARAMETER", k)
+					}
+					// Try providing a helpful message if the controller is unknown.
+					found := false
+					for _, knownController := range c.Controllers {
+						if controller == knownController {
+							found = true
+							break
+						}
+					}
+					if !found && controller != "cgroup" {
+						return fmt.Errorf("unified resource %q can't be set: controller %q not available", k, controller)
+					}
+				}
 				return fmt.Errorf("unable to set unified resource %q: %w", k, err)
 			}
 		}
