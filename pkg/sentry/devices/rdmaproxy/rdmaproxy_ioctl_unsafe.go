@@ -1205,22 +1205,15 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		}
 	}
 
-	// Map GPU device memory in the sentry at the exact GPU VA. CUDA UVA
-	// gives each GPU a unique VA range, so no collisions in the sentry's
-	// address space. The sentry owns the RM client so RM_MAP_MEMORY
-	// succeeds, and identity-mapped VAs let nvidia-peermem resolve pages.
+	// Ephemeral GPU VMA: map at the GPU VA, call REG_MR, then munmap.
+	// The VMA only needs to exist at the instant of the ioctl — peermem
+	// grabs GPU page references during pin_user_pages, and the MR stays
+	// valid after the VMA is torn down. Serializing GPU MR_REGs prevents
+	// VA collisions even if multiple GPUs allocate at the same address.
 	var lastErr error
 	for _, candidate := range candidates {
 		if candidate.prepare == nil {
 			continue
-		}
-
-		// Check if we already have a mapping for this GPU VA + device.
-		if existing := acquireSharedGPUVMA(uintptr(alignedStart), uintptr(alignedLen), candidate.devName); existing != nil {
-			log.Infof("rdmaproxy: reusing shared GPU VMA dev=%q gpu=%#x-%#x sentry=%#x-%#x refs=%d (%s)",
-				candidate.devName, alignedStart, uint64(alignedStart)+alignedLen,
-				existing.mappedStart, existing.mappedStart+existing.mappedLen, existing.refs, taskFields)
-			return &mirroredPages{sharedGPUVMA: existing}, existing.mappedStart, nil
 		}
 
 		// RM_MAP_MEMORY with PLinearAddress = GPU VA (identity mapped).
@@ -1245,24 +1238,11 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			continue
 		}
 
-		// Register in the shared VMA cache for dedup.
-		sharedGPUVMAs.mu.Lock()
-		if sharedGPUVMAs.byKey == nil {
-			sharedGPUVMAs.byKey = make(map[sharedGPUVMAKey]*sharedGPUVMA)
-		}
-		key := sharedGPUVMAKey{gpuStart: uintptr(alignedStart), gpuLen: uintptr(alignedLen), devName: preparedDevName}
-		vma := &sharedGPUVMA{
-			key:         key,
-			mappedStart: mapped,
-			mappedLen:   uintptr(alignedLen),
-			refs:        1,
-		}
-		sharedGPUVMAs.byKey[key] = vma
-		sharedGPUVMAs.mu.Unlock()
-
-		log.Infof("rdmaproxy: GPU VMA mapped in sentry dev=%q gpu=%#x-%#x mapFD=%d (%s)",
-			preparedDevName, alignedStart, uint64(alignedStart)+alignedLen, mapFD, taskFields)
-		return &mirroredPages{sharedGPUVMA: vma}, mapped, nil
+		log.Debugf("rdmaproxy: ephemeral GPU VMA at %#x-%#x dev=%q mapFD=%d (%s)",
+			alignedStart, uint64(alignedStart)+alignedLen, preparedDevName, mapFD, taskFields)
+		// Return mirroredPages with m set so the VMA is munmapped after
+		// the REG_MR ioctl completes (MR holds pages independently).
+		return &mirroredPages{m: mapped, len: uintptr(alignedLen)}, mapped, nil
 	}
 
 	if lastErr == nil {
