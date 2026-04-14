@@ -418,11 +418,10 @@ func (fd *frontendFD) prepareGPUVMA(ctx context.Context, addr, alignedStart, ali
 	if client == nil {
 		return -1, fd.dev.basename(), 0, fmt.Errorf("missing client %v for GPU VA %#x", mapping.hClient, addr)
 	}
+	// memObj may be nil if the memory handle isn't tracked in nvproxy's
+	// object tree (e.g. CUDA driver internal sub-allocations). That's OK —
+	// gpuMapTargets resolves hDevice from GPU UUIDs as the primary path.
 	memObj := client.getObject(ctx, mapping.hMemory)
-	if memObj == nil {
-		unlock()
-		return -1, fd.dev.basename(), 0, fmt.Errorf("missing memory object %v for GPU VA %#x", mapping.hMemory, addr)
-	}
 	targets := fd.gpuMapTargets(ctx, client, mapping, memObj)
 	unlock()
 	if len(targets) == 0 {
