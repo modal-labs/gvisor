@@ -936,11 +936,24 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 		return nil, 0, linuxerr.EINVAL
 	}
 
+	// GPU device memory must be identity-mapped at the GPU VA for
+	// nvidia-peermem. Check BEFORE Pin because some GPU allocations have
+	// CPU-accessible UVM pages (Pin succeeds) but nvidia-peermem still
+	// needs the VMA at the GPU VA to resolve GPU physical pages.
+	if lookupGPUVA(addr) != nil {
+		mp, sentryVA, err := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
+		if err == nil {
+			return mp, sentryVA, nil
+		}
+		// Not mappable as GPU device memory (e.g. UVM managed memory
+		// that returns NV_ERR_NOT_SUPPORTED). Fall through to Pin.
+		log.Debugf("rdmaproxy: GPU mirror for %#x failed (%v), falling through to Pin", addr, err)
+	}
+
 	at := hostarch.ReadWrite
 	prs, pinErr := t.MemoryManager().Pin(t, appAR, at, false /* ignorePermissions */)
 	if pinErr != nil {
-		// Pin fails → GPU device memory. Identity-map at the GPU VA so
-		// nvidia-peermem can resolve physical pages via nvidia_p2p_get_pages.
+		// Pin fails and not in GPU registry → try GPU mirror as last resort.
 		return mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
 	}
 
