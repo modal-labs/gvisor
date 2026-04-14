@@ -405,10 +405,25 @@ func frontendIoctlInvokeNoStatus[Params any](fi *frontendIoctlState, ioctlParams
 }
 
 func (fd *frontendFD) prepareGPUVMA(ctx context.Context, addr, alignedStart, alignedLen, mapAddr uint64) (int32, string, uint64, error) {
-	mapping, ok := fd.findGPUExternalAllocation(addr, alignedStart, alignedLen)
-	if !ok {
+	// Try all overlapping allocations — different allocations at the same
+	// VA can have different hMemory handles, and only one may be mappable.
+	allocs := fd.findAllGPUExternalAllocations(addr)
+	if len(allocs) == 0 {
 		return -1, fd.dev.basename(), 0, fmt.Errorf("no UVM external allocation tracked for GPU VA %#x", addr)
 	}
+	var lastErr error
+	for _, mapping := range allocs {
+		mapFD, devName, preparedLen, err := fd.tryPrepareGPUVMA(ctx, mapping, addr, alignedStart, alignedLen, mapAddr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return mapFD, devName, preparedLen, nil
+	}
+	return -1, fd.dev.basename(), 0, lastErr
+}
+
+func (fd *frontendFD) tryPrepareGPUVMA(ctx context.Context, mapping gpuExternalAllocation, addr, alignedStart, alignedLen, mapAddr uint64) (int32, string, uint64, error) {
 	if ctx.IsLogging(log.Debug) {
 		ctx.Debugf("nvproxy: preparing GPU VMA for addr=%#x alignedStart=%#x len=%d via %q hostFD=%d base=%#x mapLen=%d offset=%#x hClient=%v hMemory=%v gpuUUIDs=%v",
 			addr, alignedStart, alignedLen, fd.dev.basename(), fd.hostFD, mapping.base, mapping.length, mapping.offset, mapping.hClient, mapping.hMemory, mapping.gpuUUIDs)

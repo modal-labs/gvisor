@@ -225,19 +225,26 @@ func (fd *frontendFD) noteUVMExternalAllocation(tgid int32, base, length, offset
 }
 
 func (fd *frontendFD) findGPUExternalAllocation(addr, alignedStart, alignedLen uint64) (gpuExternalAllocation, bool) {
+	allocs := fd.findAllGPUExternalAllocations(addr)
+	if len(allocs) > 0 {
+		return allocs[0], true
+	}
+	return gpuExternalAllocation{}, false
+}
+
+// findAllGPUExternalAllocations returns all tracked allocations covering addr.
+func (fd *frontendFD) findAllGPUExternalAllocations(addr uint64) []gpuExternalAllocation {
 	fd.gpuMappingsMu.Lock()
 	defer fd.gpuMappingsMu.Unlock()
+	var result []gpuExternalAllocation
 	for i := len(fd.gpuMappings) - 1; i >= 0; i-- {
 		mapping := fd.gpuMappings[i]
 		rangeEnd := mapping.base + mapping.length
-		// Only require addr (the MR start) to be within the allocation.
-		// NCCL buffers can span multiple contiguous UVM allocations; the
-		// nvidia driver resolves cross-allocation ranges internally.
 		if addr >= mapping.base && addr < rangeEnd {
-			return mapping, true
+			result = append(result, mapping)
 		}
 	}
-	return gpuExternalAllocation{}, false
+	return result
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
