@@ -229,17 +229,12 @@ func (fd *frontendFD) findGPUExternalAllocation(addr, alignedStart, alignedLen u
 	for i := len(fd.gpuMappings) - 1; i >= 0; i-- {
 		mapping := fd.gpuMappings[i]
 		rangeEnd := mapping.base + mapping.length
-		targetEnd := alignedStart + alignedLen
-		if rangeEnd < mapping.base || targetEnd < alignedStart {
-			continue
+		// Only require addr (the MR start) to be within the allocation.
+		// NCCL buffers can span multiple contiguous UVM allocations; the
+		// nvidia driver resolves cross-allocation ranges internally.
+		if addr >= mapping.base && addr < rangeEnd {
+			return mapping, true
 		}
-		if addr < mapping.base || addr >= rangeEnd {
-			continue
-		}
-		if alignedStart < mapping.base || targetEnd > rangeEnd {
-			continue
-		}
-		return mapping, true
 	}
 	return gpuExternalAllocation{}, false
 }
