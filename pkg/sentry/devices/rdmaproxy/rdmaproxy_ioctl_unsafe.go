@@ -1025,6 +1025,7 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 
 	// Collect frontends to try: registry first, then FD table scan.
 	frontends := lookupAllGPUVA(tgid, addr)
+	log.Warningf("rdmaproxy: mirrorGPUDeviceMemory %#x: lookupAllGPUVA(tgid=%d) returned %d frontends", addr, tgid, len(frontends))
 	if len(frontends) == 0 {
 		// Not in registry — speculatively try all frontendFDs.
 		seen := make(map[GPUVAFrontend]bool)
