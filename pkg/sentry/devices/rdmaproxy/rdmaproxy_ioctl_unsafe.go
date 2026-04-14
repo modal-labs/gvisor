@@ -943,6 +943,7 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 	if gpuErr == nil {
 		return mp, sentryVA, nil
 	}
+	log.Warningf("rdmaproxy: GPU mirror for %#x failed: %v (falling through to Pin)", addr, gpuErr)
 
 	at := hostarch.ReadWrite
 	prs, pinErr := t.MemoryManager().Pin(t, appAR, at, false /* ignorePermissions */)
