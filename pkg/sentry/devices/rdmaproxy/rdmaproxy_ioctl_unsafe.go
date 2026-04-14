@@ -611,8 +611,21 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 	if errno != 0 {
 		log.Debugf("rdmaproxy: host ioctl returned n=%d errno=%d (%v)", n, errno, errno)
 		if errno == unix.EFAULT {
-			log.Warningf("rdmaproxy: EFAULT from host ioctl obj=0x%04x method=%d action=%d hostFD=%d (%s)",
-				objectID, methodID, action, fd.hostFD, taskLogFields(t))
+			// Extract the sentry VA that was passed to the host from the ioctl buffer.
+			var sentryVA, mrLen uint64
+			if action == actionMRReg {
+				if rw := findRewrite(buf, int(numAttrs), rewrites, uverbsAttrCoreIn); rw != nil && len(rw.sentry) >= regMROffLength+8 {
+					sentryVA = binary.LittleEndian.Uint64(rw.sentry[regMROffStart : regMROffStart+8])
+					mrLen = binary.LittleEndian.Uint64(rw.sentry[regMROffLength : regMROffLength+8])
+				}
+			}
+			cached := acquireGPUVMA(uintptr(sentryVA), uintptr(mrLen))
+			hasCached := cached != nil
+			if cached != nil {
+				cached.decRef() // just checking, don't actually hold it
+			}
+			log.Warningf("rdmaproxy: EFAULT from host ioctl obj=0x%04x method=%d action=%d hostFD=%d sentryVA=%#x mrLen=%d cached=%v (%s)",
+				objectID, methodID, action, fd.hostFD, sentryVA, mrLen, hasCached, taskLogFields(t))
 		}
 	} else {
 		log.Debugf("rdmaproxy: host ioctl returned n=%d OK", n)
