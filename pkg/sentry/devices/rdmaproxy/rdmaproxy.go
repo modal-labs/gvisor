@@ -196,14 +196,6 @@ func acquireGPUVMA(tgid int32, va uintptr, len uintptr) *gpuVMARef {
 	return nil
 }
 
-// createGPUVMA is unused — kept for compatibility.
-func createGPUVMA(va uintptr, len uintptr) *gpuVMARef {
-	// Should not be called — use the serialized path in mirrorGPUDeviceMemory.
-	v := &gpuVMARef{va: va, len: len, refs: 1}
-	gpuVMACache.byVA[va] = v
-	return v
-}
-
 // GPUVAFrontend is the interface that nvproxy frontendFDs implement for
 // GPU VA operations needed by rdmaproxy.
 type GPUVAFrontend interface {
