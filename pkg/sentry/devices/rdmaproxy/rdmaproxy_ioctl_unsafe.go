@@ -610,6 +610,10 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 
 	if errno != 0 {
 		log.Debugf("rdmaproxy: host ioctl returned n=%d errno=%d (%v)", n, errno, errno)
+		if errno == unix.EFAULT {
+			log.Warningf("rdmaproxy: EFAULT from host ioctl obj=0x%04x method=%d action=%d hostFD=%d (%s)",
+				objectID, methodID, action, fd.hostFD, taskLogFields(t))
+		}
 	} else {
 		log.Debugf("rdmaproxy: host ioctl returned n=%d OK", n)
 	}
