@@ -60,10 +60,5 @@ func Filters() seccomp.SyscallRules {
 			seccomp.NonNegativeFD{},
 			seccomp.EqualTo(unix.CLONE_NEWNET),
 		},
-		// Per-GPU agent processes need clone with their own mm_struct
-		// but shared FD table.
-		unix.SYS_CLONE: seccomp.PerArg{
-			seccomp.EqualTo(unix.CLONE_FILES | uintptr(unix.SIGCHLD)),
-		},
 	})
 }

@@ -8,7 +8,6 @@ package(
 go_library(
     name = "rdmaproxy",
     srcs = [
-        "gpu_agent.go",
         "rdmaproxy.go",
         "rdmaproxy_ioctl_unsafe.go",
         "seccomp_filter.go",
@@ -25,7 +24,6 @@ go_library(
         "//pkg/errors/linuxerr",
         "//pkg/fdnotifier",
         "//pkg/hostarch",
-        "//pkg/hostsyscall",
         "//pkg/log",
         "//pkg/seccomp",
         "//pkg/sentry/arch",

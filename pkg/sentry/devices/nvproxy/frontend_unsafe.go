@@ -404,7 +404,7 @@ func frontendIoctlInvokeNoStatus[Params any](fi *frontendIoctlState, ioctlParams
 	return n, nil
 }
 
-func (fd *frontendFD) prepareGPUVMA(ctx context.Context, addr, alignedStart, alignedLen uint64) (int32, string, uint64, error) {
+func (fd *frontendFD) prepareGPUVMA(ctx context.Context, addr, alignedStart, alignedLen, mapAddr uint64) (int32, string, uint64, error) {
 	mapping, ok := fd.findGPUExternalAllocation(addr, alignedStart, alignedLen)
 	if !ok {
 		return -1, fd.dev.basename(), 0, fmt.Errorf("no UVM external allocation tracked for GPU VA %#x", addr)
@@ -430,6 +430,10 @@ func (fd *frontendFD) prepareGPUVMA(ctx context.Context, addr, alignedStart, ali
 	}
 
 	delta := alignedStart - mapping.base
+	pLinAddr := alignedStart
+	if mapAddr != 0 {
+		pLinAddr = mapAddr
+	}
 	var errs []string
 	tryMapFD := func(target gpuMapTarget, mapFD int32, mapDevName, mapSource string, closeOnFail, dupOnSuccess bool) (int32, string, uint64, error) {
 		ioctlParams := nvgpu.IoctlNVOS33ParametersWithFD{
@@ -439,7 +443,7 @@ func (fd *frontendFD) prepareGPUVMA(ctx context.Context, addr, alignedStart, ali
 				HMemory:        mapping.hMemory,
 				Offset:         mapping.offset + delta,
 				Length:         alignedLen,
-				PLinearAddress: nvgpu.P64(alignedStart),
+				PLinearAddress: nvgpu.P64(pLinAddr),
 			},
 			FD: mapFD,
 		}

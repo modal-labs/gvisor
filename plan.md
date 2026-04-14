@@ -1,32 +1,63 @@
-# RDMA Plan - 2026-04-13 (updated)
+# RDMA Plan - 2026-04-14 (updated)
 
-## Current State (commit 8dede45cc)
+## Current State (commit f97e16e5f)
 
 Per-GPU agent architecture is implemented. 8 agents spawn via
 clone(CLONE_FILES|SIGCHLD), futex-based signaling, dry-run RM_MAP_MEMORY
-params forwarded to agent. The agent calls RM_MAP_MEMORY (errno=0) then
-mmap (EINVAL). All 32 GPU-backed MR_REG forwards fail with errno=2022
-(mmap EINVAL).
+params forwarded to agent.
 
-### Next diagnostic step
+### Confirmed diagnosis (2026-04-14)
 
-Run 8-GPU test and check `rmStatus` in the sentry log (Warning level,
-no --debug needed, just --debug-log=/tmp/runsc-logs/). The log line is:
+**rmStatus = 0x23 (NV_ERR_INVALID_CLIENT)** on all agents.
 
+RM_MAP_MEMORY returns syscall errno=0 but nvidia-internal Status=0x23.
+The nvidia driver can't find the RM client handle (hClient) from the
+agent's process context. Even though CLONE_FILES shares the FD table
+(same struct file, same private_data), the nvidia driver's RM client
+lookup also checks process identity (pid/tgid). The agent is a
+different process from the sentry that created the RM client.
+
+Subsequent mmap fails with EINVAL (errno=22, reported as 2022 via +2000
+offset) because no mmap_context was created by RM_MAP_MEMORY.
+
+Example log line:
 ```
-rdmaproxy: agent result: dev="nvidia7" gpuVA=0x... n=-1 errno=2022 rmStatus=0x...
+rdmaproxy: agent result: dev="nvidia5" gpuVA=0xa1ca00000 n=-1 errno=2022
+  rmStatus=0x23 rmPLinAddr=0x23415da00000 rmLength=524288 agentLen=524288
 ```
 
-- If `rmStatus != 0`: RM_MAP_MEMORY failed logically in the agent's process
-  context. The nvidia driver likely can't find the RM client (hClient) in
-  the agent's process because the RM client was created by the sentry.
-  Fix: may need to share RM client context or use a different approach.
+### Root cause: nvidia RM client is process-bound
 
-- If `rmStatus == 0`: RM_MAP_MEMORY succeeded but mmap still fails. Check:
-  - Does the nvidia FD match the FD field in the RM_MAP_MEMORY params?
-  - Does the mmap length match the RM_MAP_MEMORY Length field?
-  - Does the nvidia driver require the mmap caller to be the same process
-    that opened the device FD (not just shared via CLONE_FILES)?
+The NVIDIA Resource Manager associates each RM client (created via
+NV_ESC_RM_ALLOC with NV01_ROOT_CLIENT class) with the calling process.
+RM_MAP_MEMORY looks up the client by hClient AND verifies the caller's
+process matches. CLONE_FILES shares the FD table but NOT the process
+identity, so the lookup fails with NV_ERR_INVALID_CLIENT.
+
+### Fix options
+
+1. **Agent creates its own RM client** — agent calls NV_ESC_RM_ALLOC to
+   create NV01_ROOT_CLIENT in its own process context, then uses
+   NV_ESC_RM_DUP_OBJECT to import the memory object (hMemory) from
+   the sentry's client. Agent then calls RM_MAP_MEMORY with its own
+   hClient. Complex but correct.
+
+2. **Sentry calls RM_MAP_MEMORY, agent only does mmap** — split the
+   two operations. The sentry creates the mmap_context (RM_MAP_MEMORY
+   succeeds with sentry's hClient). The agent then calls mmap on the
+   device FD. Risk: nvidia driver may associate mmap_context with the
+   sentry's mm_struct and reject the agent's mmap.
+
+3. **Agent opens its own nvidia control FD** — agent opens /dev/nvidiactl
+   independently (gets its own file private_data), creates its own RM
+   client, and does RM_MAP_MEMORY + mmap. Simplest if it works, but the
+   agent needs to replicate the full RM object hierarchy (client → device
+   → subdevice → memory).
+
+4. **Use CLONE_VM instead of separate mm_struct** — share address space
+   between all agents and sentry. Eliminates the VMA collision problem
+   differently (by relocating VMAs). Already have VMA relocation code.
+   Risk: VMA collisions at 8+ GPUs with non-identity-mapped addresses.
 
 ### Test procedure
 

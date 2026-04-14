@@ -105,18 +105,10 @@ func (fd *frontendFD) NVProxyMmapInfo() (hostFD int32, devName string, mmapLengt
 
 // NVProxyPrepareGPUVMA attempts to create a fresh host-side RM_MAP_MEMORY mmap
 // context for the GPU VA range containing addr, then returns a host FD that can
-// be mmapped by rdmaproxy to obtain a nvidia-backed VMA.
-func (fd *frontendFD) NVProxyPrepareGPUVMA(ctx context.Context, addr, alignedStart, alignedLen uint64) (hostFD int32, devName string, mmapLength uint64, err error) {
-	return fd.prepareGPUVMA(ctx, addr, alignedStart, alignedLen)
-}
-
-// NVProxyPrepareGPUVMADryRun finds the correct GPU allocation and device FDs
-// for a GPU VA range, builds the RM_MAP_MEMORY ioctl parameters, but does NOT
-// call the ioctl. Returns the raw params so rdmaproxy's GPU agent can call
-// RM_MAP_MEMORY in its own process context (required for per-process mmap
-// context tracking in the nvidia driver).
-func (fd *frontendFD) NVProxyPrepareGPUVMADryRun(ctx context.Context, addr, alignedStart, alignedLen uint64) (mapFD int32, devName string, ctrlFD int32, rmMapCmd uint32, rmMapParams []byte, err error) {
-	return fd.prepareGPUVMADryRun(ctx, addr, alignedStart, alignedLen)
+// be mmapped by rdmaproxy to obtain a nvidia-backed VMA. mapAddr overrides
+// PLinearAddress in RM_MAP_MEMORY (use 0 to default to alignedStart).
+func (fd *frontendFD) NVProxyPrepareGPUVMA(ctx context.Context, addr, alignedStart, alignedLen, mapAddr uint64) (hostFD int32, devName string, mmapLength uint64, err error) {
+	return fd.prepareGPUVMA(ctx, addr, alignedStart, alignedLen, mapAddr)
 }
 
 // NVProxyLastRMMapInfo returns the RM_MAP_MEMORY ioctl parameters from the
