@@ -939,20 +939,17 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 	// GPU device memory must be identity-mapped at the GPU VA for
 	// nvidia-peermem. Check BEFORE Pin because some GPU VAs have
 	// CPU-accessible UVM pages (Pin succeeds) but still need GPU VA.
-	tgid := int32(t.TGIDInRoot())
-	if len(lookupAllGPUVA(tgid, addr)) > 0 {
-		mp, sentryVA, err := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
-		if err == nil {
-			return mp, sentryVA, nil
-		}
-		log.Debugf("rdmaproxy: GPU mirror for %#x failed (%v), falling through to Pin", addr, err)
+	mp, sentryVA, gpuErr := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
+	if gpuErr == nil {
+		return mp, sentryVA, nil
 	}
 
 	at := hostarch.ReadWrite
 	prs, pinErr := t.MemoryManager().Pin(t, appAR, at, false /* ignorePermissions */)
 	if pinErr != nil {
-		// Pin fails and not in GPU registry → try GPU mirror as last resort.
-		return mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
+		// Pin fails → must be GPU device memory. GPU mirror already
+		// failed above, so return that error.
+		return nil, 0, fmt.Errorf("GPU mirror failed (%v) and Pin failed (%v) for %#x", gpuErr, pinErr, addr)
 	}
 
 	cu := cleanup.Make(func() { mm.Unpin(prs) })
@@ -1011,58 +1008,31 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 	return mp, sentryVA, nil
 }
 
-// mirrorProxyDevicePages handles pages backed by proxy devices (e.g. GPU/UVM
-// memory) where mm.Pin fails. Uses the MM's internal mapping mechanism which
-// resolves proxy device pages via Translate + MapInternal on the host FD.
-func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint64, alignedStart hostarch.Addr, alignedLen uint64, at hostarch.AccessType) (*mirroredPages, uintptr, error) {
-	blocks, err := t.MemoryManager().InternalMappingsForRange(t, appAR, at)
-	if err != nil {
-		return nil, 0, fmt.Errorf("InternalMappingsForRange: %w", err)
-	}
-	if len(blocks) == 0 {
-		return nil, 0, fmt.Errorf("InternalMappingsForRange returned no blocks")
-	}
-
-	// Fast path: single contiguous block.
-	if len(blocks) == 1 && blocks[0].Len == alignedLen {
-		log.Debugf("rdmaproxy: proxy device mirror: single block at sentry %#x len %d", blocks[0].Addr, blocks[0].Len)
-		m := blocks[0].Addr
-		sentryVA := m + uintptr(addr-uint64(alignedStart))
-		// No prs (not pinned via Pin), no owned mapping (using MM's internal cache).
-		return &mirroredPages{}, sentryVA, nil
-	}
-
-	// Slow path: multiple blocks — mremap into a contiguous region.
-	log.Debugf("rdmaproxy: proxy device mirror: %d blocks, building contiguous mapping", len(blocks))
-	m, _, errno := unix.RawSyscall6(unix.SYS_MMAP, 0, uintptr(alignedLen), unix.PROT_NONE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS, ^uintptr(0), 0)
-	if errno != 0 {
-		return nil, 0, fmt.Errorf("mmap anon %d bytes: %w", alignedLen, errno)
-	}
-	sentryAddr := m
-	for _, blk := range blocks {
-		if _, _, errno := unix.RawSyscall6(unix.SYS_MREMAP, blk.Addr, 0, uintptr(blk.Len), linux.MREMAP_MAYMOVE|linux.MREMAP_FIXED, sentryAddr, 0); errno != 0 {
-			unix.RawSyscall(unix.SYS_MUNMAP, m, uintptr(alignedLen), 0)
-			return nil, 0, fmt.Errorf("mremap %#x→%#x len %d: %w", blk.Addr, sentryAddr, blk.Len, errno)
-		}
-		sentryAddr += uintptr(blk.Len)
-	}
-
-	unix.Syscall(unix.SYS_MADVISE, m, uintptr(alignedLen), unix.MADV_POPULATE_WRITE)
-
-	sentryVA := m + uintptr(addr-uint64(alignedStart))
-	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
-}
-
-// mirrorGPUDeviceMemory creates an ephemeral nvidia-backed VMA in the sentry
-// at the exact GPU VA. The frontendFD is looked up via the global GPU VA
-// registry populated at UVM_MAP_EXTERNAL_ALLOCATION time — no FD scanning.
-// mirrorGPUDeviceMemory tries all registered frontendFDs for the given GPU VA.
+// mirrorGPUDeviceMemory creates an ephemeral nvidia-backed VMA at the GPU VA.
+// First tries frontendFDs from the GPU VA registry (direct lookup). If the
+// registry has no entry (e.g. CUDA pool sub-allocations), speculatively tries
+// all frontendFDs in the task's FD table until RM_MAP_MEMORY succeeds.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
 	tgid := int32(t.TGIDInRoot())
+
+	// Collect frontends to try: registry first, then FD table scan.
 	frontends := lookupAllGPUVA(tgid, addr)
 	if len(frontends) == 0 {
-		return nil, 0, fmt.Errorf("no registered GPU allocation for VA %#x tgid=%d", addr, tgid)
+		// Not in registry — speculatively try all frontendFDs.
+		// This handles CUDA pool sub-allocations that bypass UVM ioctls.
+		seen := make(map[GPUVAFrontend]bool)
+		t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
+			if fe, ok := file.Impl().(GPUVAFrontend); ok && !seen[fe] {
+				seen[fe] = true
+				frontends = append(frontends, fe)
+			}
+			return true
+		})
 	}
+	if len(frontends) == 0 {
+		return nil, 0, fmt.Errorf("no frontendFD for GPU VA %#x", addr)
+	}
+
 	var lastErr error
 	for _, fe := range frontends {
 		mapFD, devName, _, err := fe.NVProxyPrepareGPUVMA(t, addr, uint64(alignedStart), alignedLen, uint64(alignedStart))
