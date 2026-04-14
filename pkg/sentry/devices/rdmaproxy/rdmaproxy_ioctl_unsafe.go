@@ -81,7 +81,6 @@ func ioctlDirect(fd int32, cmd uint32, arg unsafe.Pointer) (uintptr, unix.Errno)
 	return n, errno
 }
 
-
 // writeInHostNetns runs write(2) on the uverbs fd in the host network namespace.
 // Legacy ibv_modify_qp uses the write() command path (IB_USER_VERBS_CMD_MODIFY_QP);
 // it needs the same netns as ioctl MODIFY_QP for RoCE GID resolution.
@@ -1208,9 +1207,10 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		}
 	}
 
-	// Map GPU device memory directly in the sentry's address space.
-	// Reserve a free VA first, then pass it as PLinearAddress to
-	// RM_MAP_MEMORY so each GPU gets a unique non-colliding address.
+	// Map GPU device memory in the sentry at the exact GPU VA. CUDA UVA
+	// gives each GPU a unique VA range, so no collisions in the sentry's
+	// address space. The sentry owns the RM client so RM_MAP_MEMORY
+	// succeeds, and identity-mapped VAs let nvidia-peermem resolve pages.
 	var lastErr error
 	for _, candidate := range candidates {
 		if candidate.prepare == nil {
@@ -1225,9 +1225,8 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			return &mirroredPages{sharedGPUVMA: existing}, existing.mappedStart, nil
 		}
 
-		// Call RM_MAP_MEMORY (PLinearAddress is informational; the actual
-		// VMA address is determined by the subsequent mmap).
-		mapFD, preparedDevName, preparedLen, prepErr := candidate.prepare(t, addr, uint64(alignedStart), alignedLen, 0)
+		// RM_MAP_MEMORY with PLinearAddress = GPU VA (identity mapped).
+		mapFD, preparedDevName, _, prepErr := candidate.prepare(t, addr, uint64(alignedStart), alignedLen, uint64(alignedStart))
 		if prepErr != nil {
 			log.Debugf("rdmaproxy: GPU VMA prepare failed via sandboxFD=%d hostFD=%d dev=%q at %#x len %d: %v",
 				candidate.sandboxFD, candidate.hostFD, candidate.devName, alignedStart, alignedLen, prepErr)
@@ -1235,19 +1234,15 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			continue
 		}
 
-		// mmap the nvidia FD — let the kernel choose a free address.
-		// nvidia_mmap_helper matches by vm_pgoff==0 and size==mmap_context.
-		mmapLen := alignedLen
-		if preparedLen > 0 && preparedLen != alignedLen {
-			mmapLen = preparedLen
-		}
+		// mmap at the GPU VA (identity mapped). nvidia-peermem needs the
+		// VMA at the exact GPU VA to resolve GPU physical pages.
 		mapped, _, mmapErrno := unix.RawSyscall6(unix.SYS_MMAP,
-			0, uintptr(mmapLen),
+			uintptr(alignedStart), uintptr(alignedLen),
 			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
+			unix.MAP_SHARED|unix.MAP_FIXED,
 			uintptr(mapFD), 0)
 		if mmapErrno != 0 {
-			log.Warningf("rdmaproxy: mmap nvidia FD failed: %v (mapFD=%d dev=%q len=%d)", mmapErrno, mapFD, preparedDevName, mmapLen)
+			log.Warningf("rdmaproxy: mmap nvidia FD at GPU VA %#x failed: %v (mapFD=%d dev=%q)", alignedStart, mmapErrno, mapFD, preparedDevName)
 			lastErr = fmt.Errorf("mmap nvidia FD: %v", mmapErrno)
 			continue
 		}
@@ -1261,14 +1256,14 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		vma := &sharedGPUVMA{
 			key:         key,
 			mappedStart: mapped,
-			mappedLen:   uintptr(mmapLen),
+			mappedLen:   uintptr(alignedLen),
 			refs:        1,
 		}
 		sharedGPUVMAs.byKey[key] = vma
 		sharedGPUVMAs.mu.Unlock()
 
-		log.Infof("rdmaproxy: GPU VMA mapped in sentry dev=%q gpu=%#x-%#x sentry=%#x-%#x mapFD=%d mmapLen=%d (%s)",
-			preparedDevName, alignedStart, uint64(alignedStart)+alignedLen, mapped, mapped+uintptr(mmapLen), mapFD, mmapLen, taskFields)
+		log.Infof("rdmaproxy: GPU VMA mapped in sentry dev=%q gpu=%#x-%#x mapFD=%d (%s)",
+			preparedDevName, alignedStart, uint64(alignedStart)+alignedLen, mapFD, taskFields)
 		return &mirroredPages{sharedGPUVMA: vma}, mapped, nil
 	}
 
