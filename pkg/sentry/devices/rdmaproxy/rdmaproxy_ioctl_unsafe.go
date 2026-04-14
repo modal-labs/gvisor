@@ -166,11 +166,14 @@ func forwardIoctlToAgent(mp *mirroredPages, uverbsFD int32, ioctlCmd uint32, buf
 	resultN := *(*int64)(unsafe.Pointer(sp + agentOffResultN))
 	resultErrno := *(*int32)(unsafe.Pointer(sp + agentOffErrno))
 
-	// Read RM_MAP_MEMORY Status from the shared page (nvidia-internal
-	// error code at offset 36 within NVOS33_PARAMETERS).
-	rmStatus := *(*uint32)(unsafe.Pointer(sp + agentOffRmMapParams + 36))
-	log.Warningf("rdmaproxy: agent result: dev=%q gpuVA=%#x n=%d errno=%d rmStatus=%#x",
-		agent.devName, mp.gpuVA, resultN, resultErrno, rmStatus)
+	// Read RM_MAP_MEMORY Status from the shared page.
+	// NVOS33_PARAMETERS layout: HClient(4) HDevice(4) HMemory(4) Pad(4) Offset(8) Length(8) PLinearAddress(8) Status(4) Flags(4)
+	// Status is at offset 40 within NVOS33_PARAMETERS.
+	rmStatus := *(*uint32)(unsafe.Pointer(sp + agentOffRmMapParams + 40))
+	rmPLinAddr := *(*uint64)(unsafe.Pointer(sp + agentOffRmMapParams + 32))
+	rmLength := *(*uint64)(unsafe.Pointer(sp + agentOffRmMapParams + 24))
+	log.Warningf("rdmaproxy: agent result: dev=%q gpuVA=%#x n=%d errno=%d rmStatus=%#x rmPLinAddr=%#x rmLength=%d agentLen=%d nvidiaFD=%d",
+		agent.devName, mp.gpuVA, resultN, resultErrno, rmStatus, rmPLinAddr, rmLength, mp.gpuLen, mp.nvidiaFD)
 
 	// Do NOT close nvidiaFD — with CLONE_FILES, closing it here would
 	// close it in the agent too. The FD is shared and may be reused
