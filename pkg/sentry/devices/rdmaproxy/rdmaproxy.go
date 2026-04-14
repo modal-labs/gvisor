@@ -139,14 +139,18 @@ func (mp *mirroredPages) release(ctx context.Context) {
 	mm.Unpin(mp.prs)
 }
 
-// gpuVMARef is a refcounted nvidia-backed VMA at a GPU VA. Multiple MRs
-// can share the same VMA — it's only munmapped when the last MR releases.
-// This prevents MAP_FIXED clobbering: a second MR_REG for the same GPU VA
-// reuses the existing VMA instead of creating a new RM_MAP_MEMORY context.
+// gpuVMARef is a refcounted nvidia-backed VMA at a GPU VA, bound to a
+// specific tgid's RM context. Only MRs from the same tgid can reuse it.
 type gpuVMARef struct {
 	va   uintptr
 	len  uintptr
+	tgid int32
 	refs int32
+}
+
+type gpuVMAKey struct {
+	va   uintptr
+	tgid int32
 }
 
 func (v *gpuVMARef) decRef() {
@@ -156,30 +160,33 @@ func (v *gpuVMARef) decRef() {
 	if v.refs > 0 {
 		return
 	}
-	delete(gpuVMACache.byVA, v.va)
+	delete(gpuVMACache.byKey, gpuVMAKey{va: v.va, tgid: v.tgid})
 	if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, v.va, v.len, 0); errno != 0 {
-		log.Warningf("rdmaproxy: munmap GPU VMA %#x-%#x: %v", v.va, v.va+v.len, errno)
+		log.Warningf("rdmaproxy: munmap GPU VMA %#x-%#x tgid=%d: %v", v.va, v.va+v.len, v.tgid, errno)
 	}
 }
 
-// gpuVMACache caches nvidia-backed VMAs so multiple MRs at the same GPU VA
-// reuse the same VMA instead of clobbering it with MAP_FIXED.
+// gpuVMACache caches nvidia-backed VMAs keyed by (VA, tgid). Different tgids
+// CANNOT share VMAs because the nvidia RM context is per-client. The cache
+// lock serializes RM_MAP_MEMORY + mmap to prevent clobbering.
 var gpuVMACache struct {
-	mu   sync.Mutex
-	byVA map[uintptr]*gpuVMARef
+	mu    sync.Mutex
+	byKey map[gpuVMAKey]*gpuVMARef
 }
 
-// acquireGPUVMA returns an existing cached VMA that contains [va, va+len),
-// incrementing its refcount. Checks both exact match and overlapping VMAs.
-// Returns nil if no cached VMA covers the requested range.
-func acquireGPUVMA(va uintptr, len uintptr) *gpuVMARef {
+// acquireGPUVMA returns a cached VMA for the given tgid that contains
+// [va, va+len). Returns nil if no matching VMA exists.
+func acquireGPUVMA(tgid int32, va uintptr, len uintptr) *gpuVMARef {
 	gpuVMACache.mu.Lock()
 	defer gpuVMACache.mu.Unlock()
-	if gpuVMACache.byVA == nil {
+	if gpuVMACache.byKey == nil {
 		return nil
 	}
 	reqEnd := va + len
-	for _, v := range gpuVMACache.byVA {
+	for key, v := range gpuVMACache.byKey {
+		if key.tgid != tgid {
+			continue
+		}
 		vEnd := v.va + v.len
 		if va >= v.va && reqEnd <= vEnd {
 			v.refs++
@@ -189,66 +196,9 @@ func acquireGPUVMA(va uintptr, len uintptr) *gpuVMARef {
 	return nil
 }
 
-// acquireOrCreateGPUVMA atomically checks the cache, and if no VMA exists
-// that covers [va, va+len), creates one via mmap(MAP_FIXED). The cache lock
-// is held across the entire check → mmap → register sequence to prevent
-// concurrent MR_REGs from clobbering each other's VMAs.
-func acquireOrCreateGPUVMA(va, length, mapFD uintptr) (v *gpuVMARef, mapped uintptr, mmapErrno unix.Errno) {
-	gpuVMACache.mu.Lock()
-	defer gpuVMACache.mu.Unlock()
-
-	// Check if any cached VMA already covers this range.
-	if gpuVMACache.byVA != nil {
-		reqEnd := va + length
-		for _, existing := range gpuVMACache.byVA {
-			vEnd := existing.va + existing.len
-			if va >= existing.va && reqEnd <= vEnd {
-				existing.refs++
-				return existing, existing.va, 0
-			}
-		}
-	}
-
-	// No cached VMA covers this range — create one.
-	mapped, _, mmapErrno = unix.RawSyscall6(unix.SYS_MMAP,
-		va, length,
-		unix.PROT_READ|unix.PROT_WRITE,
-		unix.MAP_SHARED|unix.MAP_FIXED,
-		mapFD, 0)
-	if mmapErrno != 0 {
-		return nil, 0, mmapErrno
-	}
-
-	if gpuVMACache.byVA == nil {
-		gpuVMACache.byVA = make(map[uintptr]*gpuVMARef)
-	}
-	if existing := gpuVMACache.byVA[mapped]; existing != nil {
-		if length > existing.len {
-			existing.len = length
-		}
-		existing.refs++
-		return existing, mapped, 0
-	}
-	v = &gpuVMARef{va: mapped, len: length, refs: 1}
-	gpuVMACache.byVA[mapped] = v
-	return v, mapped, 0
-}
-
-// createGPUVMA registers a new GPU VMA in the cache with refcount 1.
-// If a VMA already exists at the same start VA, extends it if needed.
+// createGPUVMA is unused — kept for compatibility.
 func createGPUVMA(va uintptr, len uintptr) *gpuVMARef {
-	gpuVMACache.mu.Lock()
-	defer gpuVMACache.mu.Unlock()
-	if gpuVMACache.byVA == nil {
-		gpuVMACache.byVA = make(map[uintptr]*gpuVMARef)
-	}
-	if existing := gpuVMACache.byVA[va]; existing != nil {
-		if len > existing.len {
-			existing.len = len
-		}
-		existing.refs++
-		return existing
-	}
+	// Should not be called — use the serialized path in mirrorGPUDeviceMemory.
 	v := &gpuVMARef{va: va, len: len, refs: 1}
 	gpuVMACache.byVA[va] = v
 	return v
