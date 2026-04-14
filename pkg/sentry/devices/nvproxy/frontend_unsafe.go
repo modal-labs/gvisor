@@ -479,16 +479,6 @@ func (fd *frontendFD) prepareGPUVMA(ctx context.Context, addr, alignedStart, ali
 			returnFD = int32(dupFD)
 		}
 
-		// Save the RM_MAP_MEMORY params so the GPU agent can replay them.
-		fd.lastRMMapMu.Lock()
-		fd.lastRMMapCtrlFD = fd.hostFD
-		fd.lastRMMapCmd = uint32(frontendIoctlCmd(nvgpu.NV_ESC_RM_MAP_MEMORY, nvgpu.SizeofIoctlNVOS33ParametersWithFD))
-		paramBytes := (*[64]byte)(unsafe.Pointer(&ioctlParams))
-		copy(fd.lastRMMapRaw[:], paramBytes[:])
-		fd.lastRMMapLen = int(unsafe.Sizeof(ioctlParams))
-		fd.lastRMMapValid = true
-		fd.lastRMMapMu.Unlock()
-
 		if ctx.IsLogging(log.Debug) {
 			ctx.Debugf("nvproxy: prepared RM_MAP_MEMORY for GPU VA %#x-%#x via ctrlHostFD=%d mapFD=%d mapDev=%q source=%s target=%s hClient=%v hDevice=%v class=%v hMemory=%v offset=%#x len=%d",
 				alignedStart, alignedStart+alignedLen, fd.hostFD, returnFD, mapDevName, mapSource, target.source, mapping.hClient, target.hDevice, target.hDeviceClass, mapping.hMemory, mapping.offset+delta, alignedLen)

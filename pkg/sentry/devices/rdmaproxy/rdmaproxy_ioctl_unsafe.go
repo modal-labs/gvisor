@@ -18,7 +18,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -389,16 +388,6 @@ const (
 	uverbsAttrRegMRLength = 5
 )
 
-// translatedRelocatedGPUVA rewrites an RDMA IOVA/HCA VA when the backing GPU
-// mapping had to move to a different sentry VA. This is a diagnostic path for
-// GPU-backed MRs only; CPU memory keeps the original IOVA.
-func translatedRelocatedGPUVA(mp *mirroredPages, sandboxVA uint64, sentryVA uintptr, iova uint64) (uint64, bool) {
-	if mp == nil || mp.sharedGPUVMA == nil || sentryVA == uintptr(sandboxVA) {
-		return 0, false
-	}
-	delta := int64(sentryVA) - int64(sandboxVA)
-	return uint64(int64(iova) + delta), true
-}
 
 // DESTROY_MR attr IDs.
 const (
@@ -873,21 +862,14 @@ func (fd *uverbsFD) prepareMRRegInvokeWrite(t *kernel.Task, buf []byte, numAttrs
 	}
 
 	oldHCAVA := binary.LittleEndian.Uint64(rw.sentry[regMROffHcaVA : regMROffHcaVA+8])
-	newHCAVA := oldHCAVA
-	if translatedHCAVA, relocated := translatedRelocatedGPUVA(mp, sandboxVA, sentryVA, oldHCAVA); relocated {
-		newHCAVA = translatedHCAVA
-		binary.LittleEndian.PutUint64(rw.sentry[regMROffHcaVA:regMROffHcaVA+8], newHCAVA)
-		log.Warningf("rdmaproxy: relocated GPU MR rewrote hca_va %#x → sentry %#x (start %#x → %#x)",
-			oldHCAVA, newHCAVA, sandboxVA, sentryVA)
-	}
 
-	// Rewrite start to sentry address. Most paths keep hca_va unchanged, but
-	// relocated GPU-backed MRs may also rewrite it via translatedRelocatedGPUVA.
+	// Rewrite start to sentry address. With identity-mapped GPU VAs,
+	// sentryVA == sandboxVA for GPU memory, so hca_va stays unchanged.
 	binary.LittleEndian.PutUint64(rw.sentry[regMROffStart:regMROffStart+8], uint64(sentryVA))
 	log.Debugf("rdmaproxy: MR REG rewrote start %#x → sentry %#x (hca_va=%#x)",
-		sandboxVA, sentryVA, binary.LittleEndian.Uint64(rw.sentry[regMROffHcaVA:regMROffHcaVA+8]))
+		sandboxVA, sentryVA, oldHCAVA)
 	if mp != nil {
-		mp.mrSummary = formatMRSummary(t, sandboxVA, length, sentryVA, oldHCAVA, newHCAVA, 0, 0)
+		mp.mrSummary = formatMRSummary(t, sandboxVA, length, sentryVA, oldHCAVA, oldHCAVA, 0, 0)
 	}
 
 	return mp, nil
@@ -925,23 +907,12 @@ func (fd *uverbsFD) prepareMRRegModern(t *kernel.Task, buf []byte, numAttrs int,
 		return nil, fmt.Errorf("mirrorSandboxPages: %w", err)
 	}
 
-	oldIOVA, newIOVA := sandboxVA, sandboxVA
-	if iovaRW := findRewrite(buf, numAttrs, rewrites, uverbsAttrRegMRIova); iovaRW != nil && len(iovaRW.sentry) >= 8 {
-		oldIOVA = binary.LittleEndian.Uint64(iovaRW.sentry[0:8])
-		newIOVA = oldIOVA
-		if translatedIOVA, relocated := translatedRelocatedGPUVA(mp, sandboxVA, sentryVA, oldIOVA); relocated {
-			newIOVA = translatedIOVA
-			binary.LittleEndian.PutUint64(iovaRW.sentry[0:8], newIOVA)
-			log.Warningf("rdmaproxy: relocated GPU MR rewrote iova %#x → sentry %#x (addr %#x → %#x)",
-				oldIOVA, newIOVA, sandboxVA, sentryVA)
-		}
-	}
-
-	// Rewrite ADDR to sentry address. IOVA attr (if present) stays as sandbox VA.
+	// Rewrite ADDR to sentry address. With identity-mapped GPU VAs,
+	// sentryVA == sandboxVA for GPU memory, so IOVA stays unchanged.
 	binary.LittleEndian.PutUint64(addrRW.sentry[0:8], uint64(sentryVA))
 	log.Debugf("rdmaproxy: MR REG (modern) rewrote addr %#x → sentry %#x", sandboxVA, sentryVA)
 	if mp != nil {
-		mp.mrSummary = formatMRSummary(t, sandboxVA, length, sentryVA, 0, 0, oldIOVA, newIOVA)
+		mp.mrSummary = formatMRSummary(t, sandboxVA, length, sentryVA, 0, 0, sandboxVA, sandboxVA)
 	}
 
 	return mp, nil
@@ -1093,163 +1064,46 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 // with an active mmap context matching the target length. The nvidia driver's
 // mmap handler attaches its vm_ops to the resulting VMA.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	type nvproxyMirrorCandidate struct {
-		sandboxFD      int32
-		hostFD         int32
-		devName        string
-		mmapLength     uint64
-		prepare        func(context.Context, uint64, uint64, uint64, uint64) (int32, string, uint64, error)
-		lastRMMapFn    func() (int32, uint32, []byte, bool)
+	// Find the nvproxy frontend FD that owns this GPU VA allocation.
+	type gpuFrontend interface {
+		NVProxyHasGPUAllocation(uint64) bool
+		NVProxyPrepareGPUVMA(context.Context, uint64, uint64, uint64, uint64) (int32, string, uint64, error)
 	}
-	taskFields := taskLogFields(t)
-
-	var candidates []nvproxyMirrorCandidate
-	seenHostFDs := make(map[int32]int)
+	var frontend gpuFrontend
 	t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
-		var prepare func(context.Context, uint64, uint64, uint64, uint64) (int32, string, uint64, error)
-		var lastRMMapFn func() (int32, uint32, []byte, bool)
-		if preparer, ok := file.Impl().(interface {
-			NVProxyPrepareGPUVMA(context.Context, uint64, uint64, uint64, uint64) (int32, string, uint64, error)
-		}); ok {
-			prepare = preparer.NVProxyPrepareGPUVMA
-		}
-		if rmMapper, ok := file.Impl().(interface {
-			NVProxyLastRMMapInfo() (int32, uint32, []byte, bool)
-		}); ok {
-			lastRMMapFn = rmMapper.NVProxyLastRMMapInfo
-		}
-		if mappable, ok := file.Impl().(interface {
-			NVProxyMmapInfo() (int32, string, uint64)
-		}); ok {
-			hostFD, devName, mmapLength := mappable.NVProxyMmapInfo()
-			if idx, ok := seenHostFDs[hostFD]; ok {
-				if candidates[idx].prepare == nil {
-					candidates[idx].prepare = prepare
-	
-					candidates[idx].lastRMMapFn = lastRMMapFn
-				}
-				return true
-			}
-			seenHostFDs[hostFD] = len(candidates)
-			candidates = append(candidates, nvproxyMirrorCandidate{
-				sandboxFD:     fd,
-				hostFD:        hostFD,
-				devName:       devName,
-				mmapLength:    mmapLength,
-				prepare:       prepare,
-
-				lastRMMapFn:   lastRMMapFn,
-			})
-			return true
-		}
-		if mappable, ok := file.Impl().(interface {
-			NVProxyHostFD() int32
-		}); ok {
-			hostFD := mappable.NVProxyHostFD()
-			if idx, ok := seenHostFDs[hostFD]; ok {
-				if candidates[idx].prepare == nil {
-					candidates[idx].prepare = prepare
-	
-					candidates[idx].lastRMMapFn = lastRMMapFn
-				}
-				return true
-			}
-			seenHostFDs[hostFD] = len(candidates)
-			candidates = append(candidates, nvproxyMirrorCandidate{
-				sandboxFD:     fd,
-				hostFD:        hostFD,
-				prepare:       prepare,
-
-				lastRMMapFn:   lastRMMapFn,
-			})
+		if f, ok := file.Impl().(gpuFrontend); ok && f.NVProxyHasGPUAllocation(addr) {
+			frontend = f
+			return false
 		}
 		return true
 	})
-
-	if len(candidates) == 0 {
-		return nil, 0, fmt.Errorf("no nvidia frontend host FD found for GPU VA %#x", addr)
+	if frontend == nil {
+		return nil, 0, fmt.Errorf("no nvproxy frontend found for GPU VA %#x", addr)
 	}
 
-	candidatePriority := func(c nvproxyMirrorCandidate) int {
-		switch {
-		case c.mmapLength == alignedLen && c.devName != "nvidiactl":
-			return 0
-		case c.mmapLength == alignedLen:
-			return 1
-		case c.mmapLength != 0 && c.devName != "nvidiactl":
-			return 2
-		case c.mmapLength != 0:
-			return 3
-		case c.devName != "nvidiactl":
-			return 4
-		default:
-			return 5
-		}
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		pi := candidatePriority(candidates[i])
-		pj := candidatePriority(candidates[j])
-		if pi != pj {
-			return pi < pj
-		}
-		if candidates[i].mmapLength != candidates[j].mmapLength {
-			return candidates[i].mmapLength > candidates[j].mmapLength
-		}
-		return candidates[i].sandboxFD < candidates[j].sandboxFD
-	})
-
-	if log.IsLogging(log.Debug) {
-		for _, candidate := range candidates {
-			log.Debugf("rdmaproxy: GPU VMA candidate sandboxFD=%d hostFD=%d dev=%q mmapLen=%d targetLen=%d canPrepare=%t",
-				candidate.sandboxFD, candidate.hostFD, candidate.devName, candidate.mmapLength, alignedLen, candidate.prepare != nil)
-		}
+	// RM_MAP_MEMORY with PLinearAddress = GPU VA (identity mapped).
+	mapFD, devName, _, err := frontend.NVProxyPrepareGPUVMA(t, addr, uint64(alignedStart), alignedLen, uint64(alignedStart))
+	if err != nil {
+		return nil, 0, fmt.Errorf("RM_MAP_MEMORY for GPU VA %#x: %w", addr, err)
 	}
 
-	// Ephemeral GPU VMA: map at the GPU VA, call REG_MR, then munmap.
-	// The VMA only needs to exist at the instant of the ioctl — peermem
-	// grabs GPU page references during pin_user_pages, and the MR stays
-	// valid after the VMA is torn down. Serializing GPU MR_REGs prevents
-	// VA collisions even if multiple GPUs allocate at the same address.
-	var lastErr error
-	for _, candidate := range candidates {
-		if candidate.prepare == nil {
-			continue
-		}
-
-		// RM_MAP_MEMORY with PLinearAddress = GPU VA (identity mapped).
-		mapFD, preparedDevName, _, prepErr := candidate.prepare(t, addr, uint64(alignedStart), alignedLen, uint64(alignedStart))
-		if prepErr != nil {
-			log.Debugf("rdmaproxy: GPU VMA prepare failed via sandboxFD=%d hostFD=%d dev=%q at %#x len %d: %v",
-				candidate.sandboxFD, candidate.hostFD, candidate.devName, alignedStart, alignedLen, prepErr)
-			lastErr = prepErr
-			continue
-		}
-
-		// mmap at the GPU VA (identity mapped). nvidia-peermem needs the
-		// VMA at the exact GPU VA to resolve GPU physical pages.
-		mapped, _, mmapErrno := unix.RawSyscall6(unix.SYS_MMAP,
-			uintptr(alignedStart), uintptr(alignedLen),
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED|unix.MAP_FIXED,
-			uintptr(mapFD), 0)
-		if mmapErrno != 0 {
-			log.Warningf("rdmaproxy: mmap nvidia FD at GPU VA %#x failed: %v (mapFD=%d dev=%q)", alignedStart, mmapErrno, mapFD, preparedDevName)
-			lastErr = fmt.Errorf("mmap nvidia FD: %v", mmapErrno)
-			continue
-		}
-
-		log.Debugf("rdmaproxy: ephemeral GPU VMA at %#x-%#x dev=%q mapFD=%d (%s)",
-			alignedStart, uint64(alignedStart)+alignedLen, preparedDevName, mapFD, taskFields)
-		// Return mirroredPages with m set so the VMA is munmapped after
-		// the REG_MR ioctl completes (MR holds pages independently).
-		return &mirroredPages{m: mapped, len: uintptr(alignedLen)}, mapped, nil
+	// Ephemeral mmap at GPU VA. nvidia-peermem needs the VMA at the exact
+	// GPU VA to resolve GPU physical pages via nvidia_p2p_get_pages.
+	// The VMA only needs to exist during the REG_MR ioctl — peermem grabs
+	// GPU page references during pin_user_pages, and the MR stays valid
+	// after the VMA is torn down.
+	mapped, _, mmapErrno := unix.RawSyscall6(unix.SYS_MMAP,
+		uintptr(alignedStart), uintptr(alignedLen),
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED|unix.MAP_FIXED,
+		uintptr(mapFD), 0)
+	if mmapErrno != 0 {
+		return nil, 0, fmt.Errorf("mmap nvidia FD at GPU VA %#x: %v (mapFD=%d dev=%q)", alignedStart, mmapErrno, mapFD, devName)
 	}
 
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no candidates with prepare capability")
-	}
-	return nil, 0, fmt.Errorf("all nvidia frontend attempts failed for GPU VA %#x len %d: %w",
-		addr, alignedLen, lastErr)
+	log.Infof("rdmaproxy: ephemeral GPU VMA at %#x-%#x dev=%q mapFD=%d (%s)",
+		alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, taskLogFields(t))
+	return &mirroredPages{ephemeralVA: mapped, ephemeralLen: uintptr(alignedLen)}, mapped, nil
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after
@@ -1506,20 +1360,13 @@ func (fd *uverbsFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.
 					}
 					mrMirror = mp
 					cu = cleanup.Make(func() { mp.release(t) })
-					oldHCAVA := binary.LittleEndian.Uint64(data[hcaVAOff : hcaVAOff+8])
-					newHCAVA := oldHCAVA
-					if translatedHCAVA, relocated := translatedRelocatedGPUVA(mp, sva, sentryVA, oldHCAVA); relocated {
-						newHCAVA = translatedHCAVA
-						binary.LittleEndian.PutUint64(data[hcaVAOff:hcaVAOff+8], newHCAVA)
-						log.Warningf("rdmaproxy: Write REG_MR relocated GPU hca_va %#x → sentry %#x (start %#x → %#x)",
-							oldHCAVA, newHCAVA, sva, sentryVA)
-					}
 					binary.LittleEndian.PutUint64(data[startOff:startOff+8], uint64(sentryVA))
 					log.Debugf("rdmaproxy: Write REG_MR rewrite start %#x → sentry %#x (hca_va=%#x)",
 						sva, sentryVA,
 						binary.LittleEndian.Uint64(data[hcaVAOff:hcaVAOff+8]))
 					if mp != nil {
-						mp.mrSummary = formatMRSummary(t, sva, length, sentryVA, oldHCAVA, newHCAVA, 0, 0)
+						hcaVA := binary.LittleEndian.Uint64(data[hcaVAOff : hcaVAOff+8])
+						mp.mrSummary = formatMRSummary(t, sva, length, sentryVA, hcaVA, hcaVA, 0, 0)
 					}
 				}
 			}

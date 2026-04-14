@@ -103,24 +103,26 @@ func (fd *frontendFD) NVProxyMmapInfo() (hostFD int32, devName string, mmapLengt
 	return fd.hostFD, fd.dev.basename(), fd.memmapFile.mmapLength
 }
 
+// NVProxyHasGPUAllocation returns true if this frontend FD has a tracked UVM
+// external allocation covering addr.
+func (fd *frontendFD) NVProxyHasGPUAllocation(addr uint64) bool {
+	fd.gpuMappingsMu.Lock()
+	defer fd.gpuMappingsMu.Unlock()
+	for i := len(fd.gpuMappings) - 1; i >= 0; i-- {
+		m := fd.gpuMappings[i]
+		if addr >= m.base && addr < m.base+m.length {
+			return true
+		}
+	}
+	return false
+}
+
 // NVProxyPrepareGPUVMA attempts to create a fresh host-side RM_MAP_MEMORY mmap
 // context for the GPU VA range containing addr, then returns a host FD that can
 // be mmapped by rdmaproxy to obtain a nvidia-backed VMA. mapAddr overrides
 // PLinearAddress in RM_MAP_MEMORY (use 0 to default to alignedStart).
 func (fd *frontendFD) NVProxyPrepareGPUVMA(ctx context.Context, addr, alignedStart, alignedLen, mapAddr uint64) (hostFD int32, devName string, mmapLength uint64, err error) {
 	return fd.prepareGPUVMA(ctx, addr, alignedStart, alignedLen, mapAddr)
-}
-
-// NVProxyLastRMMapInfo returns the RM_MAP_MEMORY ioctl parameters from the
-// most recent successful prepareGPUVMA call. This allows rdmaproxy's GPU
-// agent to replay the RM_MAP_MEMORY in its own process context.
-func (fd *frontendFD) NVProxyLastRMMapInfo() (ctrlFD int32, rmMapCmd uint32, rmMapParams []byte, ok bool) {
-	fd.lastRMMapMu.Lock()
-	defer fd.lastRMMapMu.Unlock()
-	if !fd.lastRMMapValid {
-		return 0, 0, nil, false
-	}
-	return fd.lastRMMapCtrlFD, fd.lastRMMapCmd, fd.lastRMMapRaw[:fd.lastRMMapLen], true
 }
 
 // frontendFD implements vfs.FileDescriptionImpl for /dev/nvidia# and
@@ -171,15 +173,6 @@ type frontendFD struct {
 	// frontend FD so rdmaproxy can lazily seed RM_MAP_MEMORY for GPU RDMA.
 	gpuMappingsMu sync.Mutex              `state:"nosave"`
 	gpuMappings   []gpuExternalAllocation `state:"nosave"`
-
-	// lastRMMap* record the most recent successful RM_MAP_MEMORY ioctl so
-	// rdmaproxy's GPU agent can replay it in its own process context.
-	lastRMMapMu    sync.Mutex `state:"nosave"`
-	lastRMMapValid bool       `state:"nosave"`
-	lastRMMapCtrlFD int32     `state:"nosave"`
-	lastRMMapCmd   uint32     `state:"nosave"`
-	lastRMMapRaw   [64]byte   `state:"nosave"`
-	lastRMMapLen   int        `state:"nosave"`
 
 	// registeredControl and registeredDeviceFDs track NV_ESC_REGISTER_FD
 	// associations so prepared RM_MAP_MEMORY can reuse device FDs that belong

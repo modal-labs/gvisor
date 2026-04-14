@@ -115,146 +115,29 @@ func openHostDevice(ctx context.Context, devRelPath string, flags uint32) (int, 
 type mirroredPages struct {
 	prs []mm.PinnedRange
 	// If m != 0, it's a sentry-side mmap we own and must munmap on release.
-	m uintptr
-	// If sharedGPUVMA != nil, the sentry mapping is refcounted and shared
-	// across multiple MRs for the same GPU VA range.
-	sharedGPUVMA *sharedGPUVMA
-	len          uintptr
+	m   uintptr
+	len uintptr
+	// GPU-backed ephemeral VMA: mapped at the GPU VA for the duration of
+	// the REG_MR ioctl, then munmapped. nvidia-peermem grabs GPU page
+	// references during pin_user_pages; the MR stays valid after munmap.
+	ephemeralVA  uintptr
+	ephemeralLen uintptr
 	// mrSummary is an optional compact registration summary emitted once the
 	// host returns an MR handle successfully.
 	mrSummary string
 }
 
 func (mp *mirroredPages) release(ctx context.Context) {
-	if mp.sharedGPUVMA != nil {
-		mp.sharedGPUVMA.release()
+	if mp.ephemeralVA != 0 {
+		if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, mp.ephemeralVA, mp.ephemeralLen, 0); errno != 0 {
+			log.Warningf("rdmaproxy: munmap ephemeral GPU VMA %#x-%#x: %v", mp.ephemeralVA, mp.ephemeralVA+mp.ephemeralLen, errno)
+		}
 	} else if mp.m != 0 {
 		if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, mp.m, mp.len, 0); errno != 0 {
 			log.Warningf("rdmaproxy: munmap %#x-%#x: %v", mp.m, mp.m+mp.len, errno)
 		}
 	}
 	mm.Unpin(mp.prs)
-}
-
-type sharedGPUVMAKey struct {
-	gpuStart uintptr
-	gpuLen   uintptr
-	devName  string // nvidia device that created this VMA (e.g. "nvidia0")
-}
-
-type sharedGPUVMA struct {
-	key         sharedGPUVMAKey
-	mappedStart uintptr
-	mappedLen   uintptr
-	refs        uint64
-}
-
-func (vma *sharedGPUVMA) release() {
-	sharedGPUVMAs.mu.Lock()
-	defer sharedGPUVMAs.mu.Unlock()
-
-	current, ok := sharedGPUVMAs.byKey[vma.key]
-	if !ok || current != vma {
-		log.Warningf("rdmaproxy: shared GPU VMA gpu=%#x-%#x already released", vma.key.gpuStart, vma.key.gpuStart+vma.key.gpuLen)
-		return
-	}
-	if current.refs == 0 {
-		log.Warningf("rdmaproxy: shared GPU VMA gpu=%#x-%#x has zero refcount", vma.key.gpuStart, vma.key.gpuStart+vma.key.gpuLen)
-		return
-	}
-	current.refs--
-	if current.refs != 0 {
-		return
-	}
-	delete(sharedGPUVMAs.byKey, vma.key)
-	if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, vma.mappedStart, vma.mappedLen, 0); errno != 0 {
-		log.Warningf("rdmaproxy: munmap shared GPU VMA gpu=%#x-%#x sentry=%#x-%#x: %v",
-			vma.key.gpuStart, vma.key.gpuStart+vma.key.gpuLen,
-			vma.mappedStart, vma.mappedStart+vma.mappedLen, errno)
-	}
-}
-
-var sharedGPUVMAs struct {
-	mu    sync.Mutex
-	byKey map[sharedGPUVMAKey]*sharedGPUVMA
-}
-
-func acquireSharedGPUVMA(start, len uintptr, devName string) *sharedGPUVMA {
-	sharedGPUVMAs.mu.Lock()
-	defer sharedGPUVMAs.mu.Unlock()
-
-	key := sharedGPUVMAKey{gpuStart: start, gpuLen: len, devName: devName}
-	if sharedGPUVMAs.byKey == nil {
-		sharedGPUVMAs.byKey = make(map[sharedGPUVMAKey]*sharedGPUVMA)
-	}
-	if vma := sharedGPUVMAs.byKey[key]; vma != nil {
-		vma.refs++
-		return vma
-	}
-	return nil
-}
-
-// evictConflictingGPUVMAs munmaps and removes cached VMAs from OTHER GPUs
-// whose sentry mappings overlap [start, start+len). This allows the current
-// GPU to map at its correct VA. Already-registered MRs are not affected
-// because the IB driver holds GPU page references independently of the VMA.
-//
-// Must be called with sharedGPUVMAs.mu held.
-func evictConflictingGPUVMAs(start, len uintptr, devName string) {
-	end := start + len
-	var toDelete []sharedGPUVMAKey
-	for key, vma := range sharedGPUVMAs.byKey {
-		if key.devName == devName {
-			continue // same GPU, don't evict
-		}
-		vmaEnd := vma.mappedStart + vma.mappedLen
-		if vma.mappedStart < end && vmaEnd > start {
-			// Overlapping VMA from a different GPU — evict it.
-			log.Infof("rdmaproxy: evicting conflicting GPU VMA dev=%q gpu=%#x-%#x sentry=%#x-%#x (refs=%d) to make room for dev=%q",
-				key.devName, key.gpuStart, key.gpuStart+key.gpuLen,
-				vma.mappedStart, vmaEnd, vma.refs, devName)
-			if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, vma.mappedStart, vma.mappedLen, 0); errno != 0 {
-				log.Warningf("rdmaproxy: munmap conflicting GPU VMA sentry=%#x-%#x: %v", vma.mappedStart, vmaEnd, errno)
-			}
-			toDelete = append(toDelete, key)
-		}
-	}
-	for _, key := range toDelete {
-		delete(sharedGPUVMAs.byKey, key)
-	}
-}
-
-func mapOrAcquireSharedGPUVMA(start, len uintptr, devName string, mapper func() (uintptr, unix.Errno)) (*sharedGPUVMA, uintptr, unix.Errno, bool) {
-	sharedGPUVMAs.mu.Lock()
-	defer sharedGPUVMAs.mu.Unlock()
-
-	key := sharedGPUVMAKey{gpuStart: start, gpuLen: len, devName: devName}
-	if sharedGPUVMAs.byKey == nil {
-		sharedGPUVMAs.byKey = make(map[sharedGPUVMAKey]*sharedGPUVMA)
-	}
-	if vma := sharedGPUVMAs.byKey[key]; vma != nil {
-		vma.refs++
-		return vma, vma.mappedStart, 0, true
-	}
-
-	mapped, errno := mapper()
-	if errno == unix.EEXIST {
-		// Another GPU's VMA occupies this address. Evict it and retry.
-		evictConflictingGPUVMAs(start, len, devName)
-		mapped, errno = mapper()
-	}
-	if errno != 0 {
-		return nil, 0, errno, false
-	}
-
-	vma := &sharedGPUVMA{
-		key:         key,
-		mappedStart: mapped,
-		mappedLen:   len,
-		refs:        1,
-	}
-	sharedGPUVMAs.byKey[key] = vma
-	return vma, mapped, 0, false
 }
 
 // pinnedDMABufs tracks the buf + doorbell mirrors for a single CQ or QP.
