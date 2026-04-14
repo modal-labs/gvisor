@@ -1054,6 +1054,24 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		return nil, 0, fmt.Errorf("no frontendFD for GPU VA %#x", addr)
 	}
 
+	// Serialize the entire RM_MAP_MEMORY → mmap → cache sequence.
+	// The nvidia driver only allows one pending mmap context per device FD;
+	// concurrent RM_MAP_MEMORY calls would replace each other's contexts.
+	gpuVMACache.mu.Lock()
+
+	// Re-check cache under lock.
+	if gpuVMACache.byVA != nil {
+		reqEnd := uintptr(alignedStart) + uintptr(alignedLen)
+		for _, existing := range gpuVMACache.byVA {
+			vEnd := existing.va + existing.len
+			if uintptr(alignedStart) >= existing.va && reqEnd <= vEnd {
+				existing.refs++
+				gpuVMACache.mu.Unlock()
+				return &mirroredPages{gpuVMA: existing}, existing.va, nil
+			}
+		}
+	}
+
 	var lastErr error
 	for _, fe := range frontends {
 		mapFD, devName, _, err := fe.NVProxyPrepareGPUVMA(t, addr, uint64(alignedStart), alignedLen, uint64(alignedStart))
@@ -1061,19 +1079,26 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			lastErr = err
 			continue
 		}
-		// Atomically check cache → mmap → register under the cache lock.
-		// This prevents concurrent MR_REGs from clobbering each other's VMAs.
-		v, mapped, mmapErrno := acquireOrCreateGPUVMA(uintptr(alignedStart), uintptr(alignedLen), uintptr(mapFD))
-		if v != nil {
-			if mmapErrno == 0 {
-				log.Infof("rdmaproxy: GPU VMA at %#x-%#x dev=%q mapFD=%d refs=%d (%s)",
-					alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, v.refs, taskLogFields(t))
-			}
-			return &mirroredPages{gpuVMA: v}, mapped, nil
+		mapped, _, mmapErrno := unix.RawSyscall6(unix.SYS_MMAP,
+			uintptr(alignedStart), uintptr(alignedLen),
+			unix.PROT_READ|unix.PROT_WRITE,
+			unix.MAP_SHARED|unix.MAP_FIXED,
+			uintptr(mapFD), 0)
+		if mmapErrno != 0 {
+			lastErr = fmt.Errorf("mmap at %#x: %v", alignedStart, mmapErrno)
+			continue
 		}
-		lastErr = fmt.Errorf("mmap at %#x: %v", alignedStart, mmapErrno)
-		continue
+		if gpuVMACache.byVA == nil {
+			gpuVMACache.byVA = make(map[uintptr]*gpuVMARef)
+		}
+		v := &gpuVMARef{va: mapped, len: uintptr(alignedLen), refs: 1}
+		gpuVMACache.byVA[mapped] = v
+		gpuVMACache.mu.Unlock()
+		log.Infof("rdmaproxy: GPU VMA at %#x-%#x dev=%q mapFD=%d refs=%d (%s)",
+			alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, v.refs, taskLogFields(t))
+		return &mirroredPages{gpuVMA: v}, mapped, nil
 	}
+	gpuVMACache.mu.Unlock()
 	return nil, 0, fmt.Errorf("all %d frontends failed for GPU VA %#x: %w", len(frontends), addr, lastErr)
 }
 
