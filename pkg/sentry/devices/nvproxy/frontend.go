@@ -190,7 +190,7 @@ func nvUUIDString(uuid nvgpu.NvUUID) string {
 		uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15])
 }
 
-func (fd *frontendFD) noteUVMExternalAllocation(base, length, offset uint64, hClient, hMemory nvgpu.Handle, gpuUUIDs []string) {
+func (fd *frontendFD) noteUVMExternalAllocation(tgid int32, base, length, offset uint64, hClient, hMemory nvgpu.Handle, gpuUUIDs []string) {
 	if base == 0 || length == 0 || hClient.Val == nvgpu.NV01_NULL_OBJECT || hMemory.Val == nvgpu.NV01_NULL_OBJECT {
 		return
 	}
@@ -216,7 +216,7 @@ func (fd *frontendFD) noteUVMExternalAllocation(base, length, offset uint64, hCl
 	})
 	// Register in rdmaproxy's global GPU VA registry for direct lookup
 	// at REG_MR time (no FD table scanning needed).
-	rdmaproxy.RegisterGPUVA(base, length, fd)
+	rdmaproxy.RegisterGPUVA(tgid, base, length, fd)
 	if log.IsLogging(log.Debug) {
 		log.Debugf("nvproxy: recorded UVM external allocation via %q hostFD=%d base=%#x len=%d offset=%#x hClient=%v hMemory=%v gpuUUIDs=%v",
 			fd.dev.basename(), fd.hostFD, base, length, offset, hClient, hMemory, gpuUUIDs)

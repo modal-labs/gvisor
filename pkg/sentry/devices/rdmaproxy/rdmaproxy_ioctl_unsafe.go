@@ -940,7 +940,8 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 	// nvidia-peermem. Check BEFORE Pin because some GPU allocations have
 	// CPU-accessible UVM pages (Pin succeeds) but nvidia-peermem still
 	// needs the VMA at the GPU VA to resolve GPU physical pages.
-	if lookupGPUVA(addr) != nil {
+	tgid := int32(t.TGIDInRoot())
+	if lookupGPUVA(tgid, addr) != nil {
 		mp, sentryVA, err := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
 		if err == nil {
 			return mp, sentryVA, nil
@@ -1059,9 +1060,9 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 // at the exact GPU VA. The frontendFD is looked up via the global GPU VA
 // registry populated at UVM_MAP_EXTERNAL_ALLOCATION time — no FD scanning.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	frontend := lookupGPUVA(addr)
+	frontend := lookupGPUVA(int32(t.TGIDInRoot()), addr)
 	if frontend == nil {
-		return nil, 0, fmt.Errorf("no registered GPU allocation for VA %#x", addr)
+		return nil, 0, fmt.Errorf("no registered GPU allocation for VA %#x tgid=%d", addr, t.TGIDInRoot())
 	}
 
 	// RM_MAP_MEMORY with PLinearAddress = GPU VA (identity mapped).

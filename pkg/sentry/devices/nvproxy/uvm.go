@@ -267,7 +267,7 @@ func uvmIoctlHasFrontendFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Param
 	ioctlParams.SetFrontendFD(ctlFile.hostFD)
 	n, err := uvmIoctlInvoke(ui, ioctlParams)
 	if err == nil && ui.cmd == nvgpu.UVM_MAP_EXTERNAL_ALLOCATION && ioctlParams.GetStatus() == nvgpu.NV_OK {
-		recordUVMExternalAllocation(ctlFile, any(ioctlParams))
+		recordUVMExternalAllocation(int32(ui.t.TGIDInRoot()), ctlFile, any(ioctlParams))
 	}
 	ioctlParams.SetFrontendFD(origFD)
 	if err != nil {
@@ -279,10 +279,11 @@ func uvmIoctlHasFrontendFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Param
 	return n, nil
 }
 
-func recordUVMExternalAllocation(fd *frontendFD, ioctlParams any) {
+func recordUVMExternalAllocation(tgid int32, fd *frontendFD, ioctlParams any) {
 	switch params := ioctlParams.(type) {
 	case *nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS:
 		fd.noteUVMExternalAllocation(
+			tgid,
 			params.Base,
 			params.Length,
 			params.Offset,
@@ -292,6 +293,7 @@ func recordUVMExternalAllocation(fd *frontendFD, ioctlParams any) {
 		)
 	case *nvgpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS_V550:
 		fd.noteUVMExternalAllocation(
+			tgid,
 			params.Base,
 			params.Length,
 			params.Offset,
