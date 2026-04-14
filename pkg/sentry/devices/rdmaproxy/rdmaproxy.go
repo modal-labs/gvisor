@@ -140,6 +140,58 @@ func (mp *mirroredPages) release(ctx context.Context) {
 	mm.Unpin(mp.prs)
 }
 
+// GPUVAFrontend is the interface that nvproxy frontendFDs implement for
+// GPU VA operations needed by rdmaproxy.
+type GPUVAFrontend interface {
+	NVProxyPrepareGPUVMA(context.Context, uint64, uint64, uint64, uint64) (int32, string, uint64, error)
+}
+
+// gpuVARegistry maps GPU VA ranges to the nvproxy frontendFD that owns them.
+// Populated at UVM_MAP_EXTERNAL_ALLOCATION time, queried at REG_MR time.
+// This is a direct lookup — no FD table scanning needed.
+var gpuVARegistry struct {
+	mu      sync.Mutex
+	entries []gpuVAEntry
+}
+
+type gpuVAEntry struct {
+	base, end uint64
+	frontend  GPUVAFrontend
+}
+
+// RegisterGPUVA records that the given frontendFD owns GPU memory at
+// [base, base+length). Called by nvproxy at UVM_MAP_EXTERNAL_ALLOCATION time.
+func RegisterGPUVA(base, length uint64, frontend GPUVAFrontend) {
+	gpuVARegistry.mu.Lock()
+	defer gpuVARegistry.mu.Unlock()
+	// Deduplicate.
+	end := base + length
+	for _, e := range gpuVARegistry.entries {
+		if e.base == base && e.end == end && e.frontend == frontend {
+			return
+		}
+	}
+	gpuVARegistry.entries = append(gpuVARegistry.entries, gpuVAEntry{
+		base:     base,
+		end:      end,
+		frontend: frontend,
+	})
+	log.Debugf("rdmaproxy: registered GPU VA %#x-%#x", base, end)
+}
+
+// lookupGPUVA returns the frontendFD that owns the GPU allocation containing
+// addr. Returns nil if no allocation covers addr.
+func lookupGPUVA(addr uint64) GPUVAFrontend {
+	gpuVARegistry.mu.Lock()
+	defer gpuVARegistry.mu.Unlock()
+	for _, e := range gpuVARegistry.entries {
+		if addr >= e.base && addr < e.end {
+			return e.frontend
+		}
+	}
+	return nil
+}
+
 // pinnedDMABufs tracks the buf + doorbell mirrors for a single CQ or QP.
 type pinnedDMABufs struct {
 	buf *mirroredPages

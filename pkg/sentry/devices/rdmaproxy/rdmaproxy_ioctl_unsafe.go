@@ -1056,29 +1056,13 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 	return &mirroredPages{m: m, len: uintptr(alignedLen)}, sentryVA, nil
 }
 
-// mirrorGPUDeviceMemory creates a nvidia-backed VMA in the sentry for GPU
-// device memory. nvidia-peermem requires VMAs with nvidia vm_ops to resolve
-// GPU physical pages via nvidia_p2p_get_pages().
-//
-// We scan the task's FD table for nvproxy frontend FDs and prefer the ones
-// with an active mmap context matching the target length. The nvidia driver's
-// mmap handler attaches its vm_ops to the resulting VMA.
+// mirrorGPUDeviceMemory creates an ephemeral nvidia-backed VMA in the sentry
+// at the exact GPU VA. The frontendFD is looked up via the global GPU VA
+// registry populated at UVM_MAP_EXTERNAL_ALLOCATION time — no FD scanning.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	// Find the nvproxy frontend FD that owns this GPU VA allocation.
-	type gpuFrontend interface {
-		NVProxyHasGPUAllocation(uint64) bool
-		NVProxyPrepareGPUVMA(context.Context, uint64, uint64, uint64, uint64) (int32, string, uint64, error)
-	}
-	var frontend gpuFrontend
-	t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
-		if f, ok := file.Impl().(gpuFrontend); ok && f.NVProxyHasGPUAllocation(addr) {
-			frontend = f
-			return false
-		}
-		return true
-	})
+	frontend := lookupGPUVA(addr)
 	if frontend == nil {
-		return nil, 0, fmt.Errorf("no nvproxy frontend found for GPU VA %#x", addr)
+		return nil, 0, fmt.Errorf("no registered GPU allocation for VA %#x", addr)
 	}
 
 	// RM_MAP_MEMORY with PLinearAddress = GPU VA (identity mapped).
