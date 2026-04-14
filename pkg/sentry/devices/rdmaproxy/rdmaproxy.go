@@ -182,12 +182,20 @@ func RegisterGPUVA(tgid int32, base, length uint64, frontend GPUVAFrontend) {
 }
 
 // lookupGPUVA returns the frontendFD that owns the GPU allocation containing
-// addr for the given TGID. Returns nil if no allocation covers addr.
+// addr. Prefers the given TGID; falls back to any TGID (for IPC memory
+// mapped from another process).
 func lookupGPUVA(tgid int32, addr uint64) GPUVAFrontend {
 	gpuVARegistry.mu.Lock()
 	defer gpuVARegistry.mu.Unlock()
+	// Prefer same-TGID match.
 	for _, e := range gpuVARegistry.entries {
 		if e.tgid == tgid && addr >= e.base && addr < e.end {
+			return e.frontend
+		}
+	}
+	// Fall back to any TGID — handles IPC memory mapped from another process.
+	for _, e := range gpuVARegistry.entries {
+		if addr >= e.base && addr < e.end {
 			return e.frontend
 		}
 	}
