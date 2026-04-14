@@ -18,7 +18,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -626,26 +625,16 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 				cached.decRef() // just checking, don't actually hold it
 			}
 			gpuCached := mrMirror != nil && mrMirror.gpuVMACached
-			// Dump /proc/self/maps for the failing VA to verify VMA existence and type.
-			var mapsInfo string
-			if sentryVA != 0 {
-				if f, err := unix.Open("/proc/self/maps", unix.O_RDONLY, 0); err == nil {
-					var buf [65536]byte
-					n, _ := unix.Read(f, buf[:])
-					unix.Close(f)
-					vaStr := fmt.Sprintf("%x", sentryVA)
-					for _, line := range strings.Split(string(buf[:n]), "\n") {
-						if strings.Contains(line, vaStr[:len(vaStr)-4]) {
-							mapsInfo += line + " | "
-						}
-					}
-					if mapsInfo == "" {
-						mapsInfo = "NO VMA FOUND"
-					}
-				}
+			// Log VMA cache entry details for debugging.
+			var cacheVA, cacheLen uintptr
+			var cacheRefs int32
+			if cached != nil {
+				cacheVA = cached.va
+				cacheLen = cached.len
+				cacheRefs = cached.refs
 			}
-			log.Warningf("rdmaproxy: EFAULT from host ioctl obj=0x%04x method=%d action=%d hostFD=%d sentryVA=%#x mrLen=%d cached=%v gpuCached=%v maps=[%s] (%s)",
-				objectID, methodID, action, fd.hostFD, sentryVA, mrLen, hasCached, gpuCached, mapsInfo, taskLogFields(t))
+			log.Warningf("rdmaproxy: EFAULT from host ioctl obj=0x%04x method=%d action=%d hostFD=%d sentryVA=%#x mrLen=%d cached=%v gpuCached=%v cacheVA=%#x cacheLen=%#x cacheRefs=%d (%s)",
+				objectID, methodID, action, fd.hostFD, sentryVA, mrLen, hasCached, gpuCached, cacheVA, cacheLen, cacheRefs, taskLogFields(t))
 		}
 	} else {
 		log.Debugf("rdmaproxy: host ioctl returned n=%d OK", n)
