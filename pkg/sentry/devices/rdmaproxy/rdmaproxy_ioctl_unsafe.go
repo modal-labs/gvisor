@@ -936,23 +936,24 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 		return nil, 0, linuxerr.EINVAL
 	}
 
+	// If this is a registered GPU VA, always use the identity-mapped GPU
+	// path. nvidia-peermem needs the VMA at the exact GPU VA — it can't
+	// use a Pin'd or proxy-device sentry VA. Check BEFORE Pin.
+	if lookupGPUVA(addr) != nil {
+		mp, sentryVA, err := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
+		if err != nil {
+			return nil, 0, fmt.Errorf("GPU device memory mirror for %#x: %w", addr, err)
+		}
+		return mp, sentryVA, nil
+	}
+
 	at := hostarch.ReadWrite
 	prs, pinErr := t.MemoryManager().Pin(t, appAR, at, false /* ignorePermissions */)
 	if pinErr != nil {
-		// Pin fails for proxy-device-backed pages (e.g. GPU/UVM memory).
-		// Try GPU device memory path first — it identity-maps the VMA at
-		// the GPU VA, which nvidia-peermem requires for page resolution.
-		mp, sentryVA, mmapErr := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
-		if mmapErr == nil {
-			log.Debugf("rdmaproxy: GPU device memory VMA at %#x len %d → sentry %#x", addr, length, sentryVA)
-			return mp, sentryVA, nil
-		}
-		// Fall back to proxy device internal mapping (for non-GPU memory
-		// that Pin can't handle, e.g. UVM system memory).
-		log.Debugf("rdmaproxy: mm.Pin failed (%v), GPU mirror failed (%v), trying proxy device", pinErr, mmapErr)
+		// Pin fails for proxy-device-backed pages (e.g. UVM system memory).
 		mp, sentryVA, err := mirrorProxyDevicePages(t, appAR, addr, alignedStart, alignedLen, at)
 		if err != nil {
-			log.Warningf("rdmaproxy: all mirror paths failed, raw VA passthrough for %#x len %d", addr, length)
+			log.Warningf("rdmaproxy: all mirror paths failed for %#x len %d (pin: %v, proxy: %v)", addr, length, pinErr, err)
 			return nil, uintptr(addr), nil
 		}
 		return mp, sentryVA, nil
