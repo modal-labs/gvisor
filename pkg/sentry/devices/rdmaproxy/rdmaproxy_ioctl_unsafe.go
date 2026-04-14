@@ -937,17 +937,14 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 	}
 
 	// GPU device memory must be identity-mapped at the GPU VA for
-	// nvidia-peermem. Check BEFORE Pin because some GPU allocations have
-	// CPU-accessible UVM pages (Pin succeeds) but nvidia-peermem still
-	// needs the VMA at the GPU VA to resolve GPU physical pages.
+	// nvidia-peermem. Check BEFORE Pin because some GPU VAs have
+	// CPU-accessible UVM pages (Pin succeeds) but still need GPU VA.
 	tgid := int32(t.TGIDInRoot())
-	if lookupGPUVA(tgid, addr) != nil {
+	if len(lookupAllGPUVA(tgid, addr)) > 0 {
 		mp, sentryVA, err := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
 		if err == nil {
 			return mp, sentryVA, nil
 		}
-		// Not mappable as GPU device memory (e.g. UVM managed memory
-		// that returns NV_ERR_NOT_SUPPORTED). Fall through to Pin.
 		log.Debugf("rdmaproxy: GPU mirror for %#x failed (%v), falling through to Pin", addr, err)
 	}
 
@@ -1059,35 +1056,34 @@ func mirrorProxyDevicePages(t *kernel.Task, appAR hostarch.AddrRange, addr uint6
 // mirrorGPUDeviceMemory creates an ephemeral nvidia-backed VMA in the sentry
 // at the exact GPU VA. The frontendFD is looked up via the global GPU VA
 // registry populated at UVM_MAP_EXTERNAL_ALLOCATION time — no FD scanning.
+// mirrorGPUDeviceMemory tries all registered frontendFDs for the given GPU VA.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	frontend := lookupGPUVA(int32(t.TGIDInRoot()), addr)
-	if frontend == nil {
-		return nil, 0, fmt.Errorf("no registered GPU allocation for VA %#x tgid=%d", addr, t.TGIDInRoot())
+	tgid := int32(t.TGIDInRoot())
+	frontends := lookupAllGPUVA(tgid, addr)
+	if len(frontends) == 0 {
+		return nil, 0, fmt.Errorf("no registered GPU allocation for VA %#x tgid=%d", addr, tgid)
 	}
-
-	// RM_MAP_MEMORY with PLinearAddress = GPU VA (identity mapped).
-	mapFD, devName, _, err := frontend.NVProxyPrepareGPUVMA(t, addr, uint64(alignedStart), alignedLen, uint64(alignedStart))
-	if err != nil {
-		return nil, 0, fmt.Errorf("RM_MAP_MEMORY for GPU VA %#x: %w", addr, err)
+	var lastErr error
+	for _, fe := range frontends {
+		mapFD, devName, _, err := fe.NVProxyPrepareGPUVMA(t, addr, uint64(alignedStart), alignedLen, uint64(alignedStart))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		mapped, _, mmapErrno := unix.RawSyscall6(unix.SYS_MMAP,
+			uintptr(alignedStart), uintptr(alignedLen),
+			unix.PROT_READ|unix.PROT_WRITE,
+			unix.MAP_SHARED|unix.MAP_FIXED,
+			uintptr(mapFD), 0)
+		if mmapErrno != 0 {
+			lastErr = fmt.Errorf("mmap at %#x: %v", alignedStart, mmapErrno)
+			continue
+		}
+		log.Infof("rdmaproxy: ephemeral GPU VMA at %#x-%#x dev=%q mapFD=%d (%s)",
+			alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, taskLogFields(t))
+		return &mirroredPages{ephemeralVA: mapped, ephemeralLen: uintptr(alignedLen)}, mapped, nil
 	}
-
-	// Ephemeral mmap at GPU VA. nvidia-peermem needs the VMA at the exact
-	// GPU VA to resolve GPU physical pages via nvidia_p2p_get_pages.
-	// The VMA only needs to exist during the REG_MR ioctl — peermem grabs
-	// GPU page references during pin_user_pages, and the MR stays valid
-	// after the VMA is torn down.
-	mapped, _, mmapErrno := unix.RawSyscall6(unix.SYS_MMAP,
-		uintptr(alignedStart), uintptr(alignedLen),
-		unix.PROT_READ|unix.PROT_WRITE,
-		unix.MAP_SHARED|unix.MAP_FIXED,
-		uintptr(mapFD), 0)
-	if mmapErrno != 0 {
-		return nil, 0, fmt.Errorf("mmap nvidia FD at GPU VA %#x: %v (mapFD=%d dev=%q)", alignedStart, mmapErrno, mapFD, devName)
-	}
-
-	log.Infof("rdmaproxy: ephemeral GPU VMA at %#x-%#x dev=%q mapFD=%d (%s)",
-		alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, taskLogFields(t))
-	return &mirroredPages{ephemeralVA: mapped, ephemeralLen: uintptr(alignedLen)}, mapped, nil
+	return nil, 0, fmt.Errorf("all %d frontends failed for GPU VA %#x: %w", len(frontends), addr, lastErr)
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after

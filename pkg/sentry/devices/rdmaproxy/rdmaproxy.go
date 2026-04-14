@@ -181,25 +181,25 @@ func RegisterGPUVA(tgid int32, base, length uint64, frontend GPUVAFrontend) {
 	log.Debugf("rdmaproxy: registered GPU VA %#x-%#x tgid=%d", base, end, tgid)
 }
 
-// lookupGPUVA returns the frontendFD that owns the GPU allocation containing
-// addr. Prefers the given TGID; falls back to any TGID (for IPC memory
-// mapped from another process).
-func lookupGPUVA(tgid int32, addr uint64) GPUVAFrontend {
+// lookupAllGPUVA returns all frontendFDs that have GPU allocations
+// containing addr. Same-TGID entries come first, then cross-TGID
+// entries (for IPC memory). Deduplicated by frontend pointer.
+func lookupAllGPUVA(tgid int32, addr uint64) []GPUVAFrontend {
 	gpuVARegistry.mu.Lock()
 	defer gpuVARegistry.mu.Unlock()
-	// Prefer same-TGID match.
+	var sameTGID, crossTGID []GPUVAFrontend
+	seen := make(map[GPUVAFrontend]bool)
 	for _, e := range gpuVARegistry.entries {
-		if e.tgid == tgid && addr >= e.base && addr < e.end {
-			return e.frontend
+		if addr >= e.base && addr < e.end && !seen[e.frontend] {
+			seen[e.frontend] = true
+			if e.tgid == tgid {
+				sameTGID = append(sameTGID, e.frontend)
+			} else {
+				crossTGID = append(crossTGID, e.frontend)
+			}
 		}
 	}
-	// Fall back to any TGID — handles IPC memory mapped from another process.
-	for _, e := range gpuVARegistry.entries {
-		if addr >= e.base && addr < e.end {
-			return e.frontend
-		}
-	}
-	return nil
+	return append(sameTGID, crossTGID...)
 }
 
 // pinnedDMABufs tracks the buf + doorbell mirrors for a single CQ or QP.
