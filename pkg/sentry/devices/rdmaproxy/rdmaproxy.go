@@ -117,27 +117,81 @@ type mirroredPages struct {
 	// If m != 0, it's a sentry-side mmap we own and must munmap on release.
 	m   uintptr
 	len uintptr
-	// GPU-backed ephemeral VMA: mapped at the GPU VA for the duration of
-	// the REG_MR ioctl, then munmapped. nvidia-peermem grabs GPU page
-	// references during pin_user_pages; the MR stays valid after munmap.
-	ephemeralVA  uintptr
-	ephemeralLen uintptr
+	// gpuVMA is a refcounted GPU VMA that persists across multiple MRs.
+	// Must not be munmapped while any MR using it is alive — nvidia-peermem
+	// holds references to the VMA's nvidia vm_ops for GPU page resolution.
+	gpuVMA *gpuVMARef
 	// mrSummary is an optional compact registration summary emitted once the
 	// host returns an MR handle successfully.
 	mrSummary string
 }
 
 func (mp *mirroredPages) release(ctx context.Context) {
-	if mp.ephemeralVA != 0 {
-		if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, mp.ephemeralVA, mp.ephemeralLen, 0); errno != 0 {
-			log.Warningf("rdmaproxy: munmap ephemeral GPU VMA %#x-%#x: %v", mp.ephemeralVA, mp.ephemeralVA+mp.ephemeralLen, errno)
-		}
+	if mp.gpuVMA != nil {
+		mp.gpuVMA.decRef()
 	} else if mp.m != 0 {
 		if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, mp.m, mp.len, 0); errno != 0 {
 			log.Warningf("rdmaproxy: munmap %#x-%#x: %v", mp.m, mp.m+mp.len, errno)
 		}
 	}
 	mm.Unpin(mp.prs)
+}
+
+// gpuVMARef is a refcounted nvidia-backed VMA at a GPU VA. Multiple MRs
+// can share the same VMA — it's only munmapped when the last MR releases.
+// This prevents MAP_FIXED clobbering: a second MR_REG for the same GPU VA
+// reuses the existing VMA instead of creating a new RM_MAP_MEMORY context.
+type gpuVMARef struct {
+	va   uintptr
+	len  uintptr
+	refs int32
+}
+
+func (v *gpuVMARef) decRef() {
+	gpuVMACache.mu.Lock()
+	defer gpuVMACache.mu.Unlock()
+	v.refs--
+	if v.refs > 0 {
+		return
+	}
+	delete(gpuVMACache.byVA, v.va)
+	if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, v.va, v.len, 0); errno != 0 {
+		log.Warningf("rdmaproxy: munmap GPU VMA %#x-%#x: %v", v.va, v.va+v.len, errno)
+	}
+}
+
+// gpuVMACache caches nvidia-backed VMAs so multiple MRs at the same GPU VA
+// reuse the same VMA instead of clobbering it with MAP_FIXED.
+var gpuVMACache struct {
+	mu   sync.Mutex
+	byVA map[uintptr]*gpuVMARef
+}
+
+// acquireGPUVMA returns an existing cached VMA if one exists at the given VA,
+// incrementing its refcount. Returns nil if no cached VMA exists.
+func acquireGPUVMA(va uintptr, len uintptr) *gpuVMARef {
+	gpuVMACache.mu.Lock()
+	defer gpuVMACache.mu.Unlock()
+	if gpuVMACache.byVA == nil {
+		return nil
+	}
+	if v := gpuVMACache.byVA[va]; v != nil && v.len >= len {
+		v.refs++
+		return v
+	}
+	return nil
+}
+
+// createGPUVMA registers a new GPU VMA in the cache with refcount 1.
+func createGPUVMA(va uintptr, len uintptr) *gpuVMARef {
+	gpuVMACache.mu.Lock()
+	defer gpuVMACache.mu.Unlock()
+	if gpuVMACache.byVA == nil {
+		gpuVMACache.byVA = make(map[uintptr]*gpuVMARef)
+	}
+	v := &gpuVMARef{va: va, len: len, refs: 1}
+	gpuVMACache.byVA[va] = v
+	return v
 }
 
 // GPUVAFrontend is the interface that nvproxy frontendFDs implement for

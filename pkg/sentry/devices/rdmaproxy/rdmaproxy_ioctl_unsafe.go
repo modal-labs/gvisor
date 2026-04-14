@@ -1009,18 +1009,24 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 	return mp, sentryVA, nil
 }
 
-// mirrorGPUDeviceMemory creates an ephemeral nvidia-backed VMA at the GPU VA.
-// First tries frontendFDs from the GPU VA registry (direct lookup). If the
-// registry has no entry (e.g. CUDA pool sub-allocations), speculatively tries
-// all frontendFDs in the task's FD table until RM_MAP_MEMORY succeeds.
+// mirrorGPUDeviceMemory creates a nvidia-backed VMA at the GPU VA. If a VMA
+// already exists at this address (from a previous MR_REG), reuse it to avoid
+// clobbering the nvidia mmap context with MAP_FIXED. Multiple MRs at the
+// same GPU VA share the VMA via refcounting.
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
+	// Check cache first — reuse existing VMA if one exists.
+	if v := acquireGPUVMA(uintptr(alignedStart), uintptr(alignedLen)); v != nil {
+		log.Debugf("rdmaproxy: reusing GPU VMA at %#x-%#x refs=%d (%s)",
+			alignedStart, uint64(alignedStart)+alignedLen, v.refs, taskLogFields(t))
+		return &mirroredPages{gpuVMA: v}, uintptr(alignedStart), nil
+	}
+
 	tgid := int32(t.TGIDInRoot())
 
 	// Collect frontends to try: registry first, then FD table scan.
 	frontends := lookupAllGPUVA(tgid, addr)
 	if len(frontends) == 0 {
 		// Not in registry — speculatively try all frontendFDs.
-		// This handles CUDA pool sub-allocations that bypass UVM ioctls.
 		seen := make(map[GPUVAFrontend]bool)
 		t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
 			if fe, ok := file.Impl().(GPUVAFrontend); ok && !seen[fe] {
@@ -1050,9 +1056,10 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			lastErr = fmt.Errorf("mmap at %#x: %v", alignedStart, mmapErrno)
 			continue
 		}
-		log.Infof("rdmaproxy: ephemeral GPU VMA at %#x-%#x dev=%q mapFD=%d (%s)",
-			alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, taskLogFields(t))
-		return &mirroredPages{ephemeralVA: mapped, ephemeralLen: uintptr(alignedLen)}, mapped, nil
+		v := createGPUVMA(mapped, uintptr(alignedLen))
+		log.Infof("rdmaproxy: GPU VMA at %#x-%#x dev=%q mapFD=%d refs=%d (%s)",
+			alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, v.refs, taskLogFields(t))
+		return &mirroredPages{gpuVMA: v}, mapped, nil
 	}
 	return nil, 0, fmt.Errorf("all %d frontends failed for GPU VA %#x: %w", len(frontends), addr, lastErr)
 }
