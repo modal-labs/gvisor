@@ -997,14 +997,14 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 	// Best-effort pre-fault to avoid mmap_lock contention.
 	unix.Syscall(unix.SYS_MADVISE, m, uintptr(alignedLen), unix.MADV_POPULATE_WRITE)
 
-	mp := &mirroredPages{prs: prs}
+	mp = &mirroredPages{prs: prs}
 	if mOwned {
 		mp.m = m
 		mp.len = uintptr(alignedLen)
 	}
 	cu.Release()
 
-	sentryVA := m + uintptr(addr-uint64(alignedStart))
+	sentryVA = m + uintptr(addr-uint64(alignedStart))
 	return mp, sentryVA, nil
 }
 
