@@ -624,8 +624,9 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 			if cached != nil {
 				cached.decRef() // just checking, don't actually hold it
 			}
-			log.Warningf("rdmaproxy: EFAULT from host ioctl obj=0x%04x method=%d action=%d hostFD=%d sentryVA=%#x mrLen=%d cached=%v (%s)",
-				objectID, methodID, action, fd.hostFD, sentryVA, mrLen, hasCached, taskLogFields(t))
+			gpuCached := mrMirror != nil && mrMirror.gpuVMACached
+			log.Warningf("rdmaproxy: EFAULT from host ioctl obj=0x%04x method=%d action=%d hostFD=%d sentryVA=%#x mrLen=%d cached=%v gpuCached=%v (%s)",
+				objectID, methodID, action, fd.hostFD, sentryVA, mrLen, hasCached, gpuCached, taskLogFields(t))
 		}
 	} else {
 		log.Debugf("rdmaproxy: host ioctl returned n=%d OK", n)
@@ -1033,7 +1034,9 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
 	// Check cache first — reuse existing VMA if one exists.
 	if v := acquireGPUVMA(uintptr(alignedStart), uintptr(alignedLen)); v != nil {
-		return &mirroredPages{gpuVMA: v}, uintptr(alignedStart), nil
+		log.Warningf("rdmaproxy: mirrorGPUDeviceMemory %#x: CACHED VMA refs=%d va=%#x len=%#x (%s)",
+			addr, v.refs, v.va, v.len, taskLogFields(t))
+		return &mirroredPages{gpuVMA: v, gpuVMACached: true}, uintptr(alignedStart), nil
 	}
 
 	tgid := int32(t.TGIDInRoot())
@@ -1067,7 +1070,9 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			if uintptr(alignedStart) >= existing.va && reqEnd <= vEnd {
 				existing.refs++
 				gpuVMACache.mu.Unlock()
-				return &mirroredPages{gpuVMA: existing}, existing.va, nil
+				log.Warningf("rdmaproxy: mirrorGPUDeviceMemory %#x: CACHED (under lock) refs=%d (%s)",
+					addr, existing.refs, taskLogFields(t))
+				return &mirroredPages{gpuVMA: existing, gpuVMACached: true}, existing.va, nil
 			}
 		}
 	}
@@ -1094,8 +1099,8 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 		v := &gpuVMARef{va: mapped, len: uintptr(alignedLen), refs: 1}
 		gpuVMACache.byVA[mapped] = v
 		gpuVMACache.mu.Unlock()
-		log.Infof("rdmaproxy: GPU VMA at %#x-%#x dev=%q mapFD=%d refs=%d (%s)",
-			alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, v.refs, taskLogFields(t))
+		log.Warningf("rdmaproxy: mirrorGPUDeviceMemory %#x: NEW VMA at %#x-%#x dev=%q mapFD=%d (%s)",
+			addr, alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, taskLogFields(t))
 		return &mirroredPages{gpuVMA: v}, mapped, nil
 	}
 	gpuVMACache.mu.Unlock()

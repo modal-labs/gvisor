@@ -124,6 +124,8 @@ type mirroredPages struct {
 	// mrSummary is an optional compact registration summary emitted once the
 	// host returns an MR handle successfully.
 	mrSummary string
+	// gpuVMACached is true if the GPU VMA was reused from cache (vs newly created).
+	gpuVMACached bool
 }
 
 func (mp *mirroredPages) release(ctx context.Context) {
