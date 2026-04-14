@@ -1052,6 +1052,13 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			lastErr = err
 			continue
 		}
+		// Re-check cache before mmap — another MR_REG may have created
+		// a VMA at this address while we were calling RM_MAP_MEMORY.
+		// Also catches overlapping VMAs that would be clobbered by MAP_FIXED.
+		if v := acquireGPUVMA(uintptr(alignedStart), uintptr(alignedLen)); v != nil {
+			log.Debugf("rdmaproxy: GPU VMA at %#x already cached (refs=%d), skipping mmap", alignedStart, v.refs)
+			return &mirroredPages{gpuVMA: v}, uintptr(alignedStart), nil
+		}
 		mapped, _, mmapErrno := unix.RawSyscall6(unix.SYS_MMAP,
 			uintptr(alignedStart), uintptr(alignedLen),
 			unix.PROT_READ|unix.PROT_WRITE,

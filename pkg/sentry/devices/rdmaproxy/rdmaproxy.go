@@ -167,27 +167,40 @@ var gpuVMACache struct {
 	byVA map[uintptr]*gpuVMARef
 }
 
-// acquireGPUVMA returns an existing cached VMA if one exists at the given VA,
-// incrementing its refcount. Returns nil if no cached VMA exists.
+// acquireGPUVMA returns an existing cached VMA that contains [va, va+len),
+// incrementing its refcount. Checks both exact match and overlapping VMAs.
+// Returns nil if no cached VMA covers the requested range.
 func acquireGPUVMA(va uintptr, len uintptr) *gpuVMARef {
 	gpuVMACache.mu.Lock()
 	defer gpuVMACache.mu.Unlock()
 	if gpuVMACache.byVA == nil {
 		return nil
 	}
-	if v := gpuVMACache.byVA[va]; v != nil && v.len >= len {
-		v.refs++
-		return v
+	reqEnd := va + len
+	for _, v := range gpuVMACache.byVA {
+		vEnd := v.va + v.len
+		if va >= v.va && reqEnd <= vEnd {
+			v.refs++
+			return v
+		}
 	}
 	return nil
 }
 
 // createGPUVMA registers a new GPU VMA in the cache with refcount 1.
+// If a VMA already exists at the same start VA, extends it if needed.
 func createGPUVMA(va uintptr, len uintptr) *gpuVMARef {
 	gpuVMACache.mu.Lock()
 	defer gpuVMACache.mu.Unlock()
 	if gpuVMACache.byVA == nil {
 		gpuVMACache.byVA = make(map[uintptr]*gpuVMARef)
+	}
+	if existing := gpuVMACache.byVA[va]; existing != nil {
+		if len > existing.len {
+			existing.len = len
+		}
+		existing.refs++
+		return existing
 	}
 	v := &gpuVMARef{va: va, len: len, refs: 1}
 	gpuVMACache.byVA[va] = v
