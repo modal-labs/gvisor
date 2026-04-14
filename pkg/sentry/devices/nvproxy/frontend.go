@@ -217,6 +217,7 @@ func (fd *frontendFD) noteUVMExternalAllocation(tgid int32, base, length, offset
 	// Register in rdmaproxy's global GPU VA registry for direct lookup
 	// at REG_MR time (no FD table scanning needed).
 	rdmaproxy.RegisterGPUVA(tgid, base, length, fd)
+	log.Warningf("nvproxy: UVM_MAP_EXTERNAL_ALLOCATION base=%#x len=%d tgid=%d hostFD=%d", base, length, tgid, fd.hostFD)
 	if log.IsLogging(log.Debug) {
 		log.Debugf("nvproxy: recorded UVM external allocation via %q hostFD=%d base=%#x len=%d offset=%#x hClient=%v hMemory=%v gpuUUIDs=%v",
 			fd.dev.basename(), fd.hostFD, base, length, offset, hClient, hMemory, gpuUUIDs)

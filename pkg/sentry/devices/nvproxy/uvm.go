@@ -304,6 +304,49 @@ func recordUVMExternalAllocation(tgid int32, fd *frontendFD, ioctlParams any) {
 	}
 }
 
+// uvmCreateExternalRange handles UVM_CREATE_EXTERNAL_RANGE. This ioctl creates
+// a GPU VA range that is later populated by UVM_MAP_EXTERNAL_ALLOCATION. Log
+// it so we can trace GPU VA origins.
+func uvmCreateExternalRange(ui *uvmIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.UVM_CREATE_EXTERNAL_RANGE_PARAMS
+	if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+	n, err := uvmIoctlInvoke(ui, &ioctlParams)
+	if err != nil {
+		return n, err
+	}
+	if ioctlParams.RMStatus == nvgpu.NV_OK {
+		log.Warningf("nvproxy: UVM_CREATE_EXTERNAL_RANGE base=%#x len=%d tgid=%d",
+			ioctlParams.Base, ioctlParams.Length, ui.t.TGIDInRoot())
+	}
+	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// uvmAllocSemaphorePool handles UVM_ALLOC_SEMAPHORE_POOL. Log it to trace
+// GPU VA origins.
+func uvmAllocSemaphorePool(ui *uvmIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.UVM_ALLOC_SEMAPHORE_POOL_PARAMS
+	if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+	n, err := uvmIoctlInvoke(ui, &ioctlParams)
+	if err != nil {
+		return n, err
+	}
+	if ioctlParams.RMStatus == nvgpu.NV_OK {
+		log.Warningf("nvproxy: UVM_ALLOC_SEMAPHORE_POOL base=%#x len=%d tgid=%d",
+			ioctlParams.Base, ioctlParams.Length, ui.t.TGIDInRoot())
+	}
+	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 func uvmGPUUUIDs(attrs []nvgpu.UvmGpuMappingAttributes, count uint64) []string {
 	if count > uint64(len(attrs)) {
 		count = uint64(len(attrs))

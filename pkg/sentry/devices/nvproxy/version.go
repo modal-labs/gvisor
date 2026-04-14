@@ -216,10 +216,10 @@ func Init() {
 					nvgpu.UVM_MIGRATE_RANGE_GROUP:            uvmHandler(uvmIoctlSimple[nvgpu.UVM_MIGRATE_RANGE_GROUP_PARAMS], compUtil),
 					nvgpu.UVM_MAP_DYNAMIC_PARALLELISM_REGION: uvmHandler(uvmIoctlSimple[nvgpu.UVM_MAP_DYNAMIC_PARALLELISM_REGION_PARAMS], compUtil),
 					nvgpu.UVM_UNMAP_EXTERNAL:                 uvmHandler(uvmIoctlSimple[nvgpu.UVM_UNMAP_EXTERNAL_PARAMS], compUtil),
-					nvgpu.UVM_ALLOC_SEMAPHORE_POOL:           uvmHandler(uvmIoctlSimple[nvgpu.UVM_ALLOC_SEMAPHORE_POOL_PARAMS], compUtil),
+					nvgpu.UVM_ALLOC_SEMAPHORE_POOL:           uvmHandler(uvmAllocSemaphorePool, compUtil),
 					nvgpu.UVM_PAGEABLE_MEM_ACCESS_ON_GPU:     uvmHandler(uvmIoctlSimple[nvgpu.UVM_PAGEABLE_MEM_ACCESS_ON_GPU_PARAMS], nvconf.CapVideo),
 					nvgpu.UVM_VALIDATE_VA_RANGE:              uvmHandler(uvmIoctlSimple[nvgpu.UVM_VALIDATE_VA_RANGE_PARAMS], compUtil),
-					nvgpu.UVM_CREATE_EXTERNAL_RANGE:          uvmHandler(uvmIoctlSimple[nvgpu.UVM_CREATE_EXTERNAL_RANGE_PARAMS], compUtil),
+					nvgpu.UVM_CREATE_EXTERNAL_RANGE:          uvmHandler(uvmCreateExternalRange, compUtil),
 					nvgpu.UVM_MM_INITIALIZE:                  uvmHandler(uvmMMInitialize, compUtil),
 				},
 				controlCmd: map[uint32]controlCmdHandler{
