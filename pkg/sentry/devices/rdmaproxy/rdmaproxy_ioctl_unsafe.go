@@ -1033,8 +1033,6 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
 	// Check cache first — reuse existing VMA if one exists.
 	if v := acquireGPUVMA(uintptr(alignedStart), uintptr(alignedLen)); v != nil {
-		log.Debugf("rdmaproxy: reusing GPU VMA at %#x-%#x refs=%d (%s)",
-			alignedStart, uint64(alignedStart)+alignedLen, v.refs, taskLogFields(t))
 		return &mirroredPages{gpuVMA: v}, uintptr(alignedStart), nil
 	}
 
@@ -1042,9 +1040,7 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 
 	// Collect frontends to try: registry first, then FD table scan.
 	frontends := lookupAllGPUVA(tgid, addr)
-	log.Warningf("rdmaproxy: mirrorGPUDeviceMemory %#x: lookupAllGPUVA(tgid=%d) returned %d frontends", addr, tgid, len(frontends))
 	if len(frontends) == 0 {
-		// Not in registry — speculatively try all frontendFDs.
 		seen := make(map[GPUVAFrontend]bool)
 		t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
 			if fe, ok := file.Impl().(GPUVAFrontend); ok && !seen[fe] {
@@ -1065,26 +1061,18 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			lastErr = err
 			continue
 		}
-		// Re-check cache before mmap — another MR_REG may have created
-		// a VMA at this address while we were calling RM_MAP_MEMORY.
-		// Also catches overlapping VMAs that would be clobbered by MAP_FIXED.
-		if v := acquireGPUVMA(uintptr(alignedStart), uintptr(alignedLen)); v != nil {
-			log.Debugf("rdmaproxy: GPU VMA at %#x already cached (refs=%d), skipping mmap", alignedStart, v.refs)
-			return &mirroredPages{gpuVMA: v}, uintptr(alignedStart), nil
+		// Atomically check cache → mmap → register under the cache lock.
+		// This prevents concurrent MR_REGs from clobbering each other's VMAs.
+		v, mapped, mmapErrno := acquireOrCreateGPUVMA(uintptr(alignedStart), uintptr(alignedLen), uintptr(mapFD))
+		if v != nil {
+			if mmapErrno == 0 {
+				log.Infof("rdmaproxy: GPU VMA at %#x-%#x dev=%q mapFD=%d refs=%d (%s)",
+					alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, v.refs, taskLogFields(t))
+			}
+			return &mirroredPages{gpuVMA: v}, mapped, nil
 		}
-		mapped, _, mmapErrno := unix.RawSyscall6(unix.SYS_MMAP,
-			uintptr(alignedStart), uintptr(alignedLen),
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED|unix.MAP_FIXED,
-			uintptr(mapFD), 0)
-		if mmapErrno != 0 {
-			lastErr = fmt.Errorf("mmap at %#x: %v", alignedStart, mmapErrno)
-			continue
-		}
-		v := createGPUVMA(mapped, uintptr(alignedLen))
-		log.Infof("rdmaproxy: GPU VMA at %#x-%#x dev=%q mapFD=%d refs=%d (%s)",
-			alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, v.refs, taskLogFields(t))
-		return &mirroredPages{gpuVMA: v}, mapped, nil
+		lastErr = fmt.Errorf("mmap at %#x: %v", alignedStart, mmapErrno)
+		continue
 	}
 	return nil, 0, fmt.Errorf("all %d frontends failed for GPU VA %#x: %w", len(frontends), addr, lastErr)
 }

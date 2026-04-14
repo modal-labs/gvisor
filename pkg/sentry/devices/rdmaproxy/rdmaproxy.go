@@ -187,6 +187,51 @@ func acquireGPUVMA(va uintptr, len uintptr) *gpuVMARef {
 	return nil
 }
 
+// acquireOrCreateGPUVMA atomically checks the cache, and if no VMA exists
+// that covers [va, va+len), creates one via mmap(MAP_FIXED). The cache lock
+// is held across the entire check → mmap → register sequence to prevent
+// concurrent MR_REGs from clobbering each other's VMAs.
+func acquireOrCreateGPUVMA(va, length, mapFD uintptr) (v *gpuVMARef, mapped uintptr, mmapErrno unix.Errno) {
+	gpuVMACache.mu.Lock()
+	defer gpuVMACache.mu.Unlock()
+
+	// Check if any cached VMA already covers this range.
+	if gpuVMACache.byVA != nil {
+		reqEnd := va + length
+		for _, existing := range gpuVMACache.byVA {
+			vEnd := existing.va + existing.len
+			if va >= existing.va && reqEnd <= vEnd {
+				existing.refs++
+				return existing, existing.va, 0
+			}
+		}
+	}
+
+	// No cached VMA covers this range — create one.
+	mapped, _, mmapErrno = unix.RawSyscall6(unix.SYS_MMAP,
+		va, length,
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_SHARED|unix.MAP_FIXED,
+		mapFD, 0)
+	if mmapErrno != 0 {
+		return nil, 0, mmapErrno
+	}
+
+	if gpuVMACache.byVA == nil {
+		gpuVMACache.byVA = make(map[uintptr]*gpuVMARef)
+	}
+	if existing := gpuVMACache.byVA[mapped]; existing != nil {
+		if length > existing.len {
+			existing.len = length
+		}
+		existing.refs++
+		return existing, mapped, 0
+	}
+	v = &gpuVMARef{va: mapped, len: length, refs: 1}
+	gpuVMACache.byVA[mapped] = v
+	return v, mapped, 0
+}
+
 // createGPUVMA registers a new GPU VMA in the cache with refcount 1.
 // If a VMA already exists at the same start VA, extends it if needed.
 func createGPUVMA(va uintptr, len uintptr) *gpuVMARef {
