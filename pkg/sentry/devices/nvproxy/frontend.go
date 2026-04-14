@@ -227,10 +227,42 @@ func (fd *frontendFD) noteUVMExternalAllocation(base, length, offset uint64, hCl
 		hMemory:  hMemory,
 		gpuUUIDs: append([]string(nil), gpuUUIDs...),
 	})
+	// Register in global GPU VA → frontendFD registry for direct lookup.
+	gpuVAFrontendRegistry.mu.Lock()
+	if gpuVAFrontendRegistry.byVA == nil {
+		gpuVAFrontendRegistry.byVA = make(map[uint64]*frontendFD)
+	}
+	gpuVAFrontendRegistry.byVA[base] = fd
+	gpuVAFrontendRegistry.mu.Unlock()
 	if log.IsLogging(log.Debug) {
 		log.Debugf("nvproxy: recorded UVM external allocation via %q hostFD=%d base=%#x len=%d offset=%#x hClient=%v hMemory=%v gpuUUIDs=%v",
 			fd.dev.basename(), fd.hostFD, base, length, offset, hClient, hMemory, gpuUUIDs)
 	}
+}
+
+// gpuVAFrontendRegistry maps GPU VA base addresses to frontendFDs for
+// direct lookup by rdmaproxy (no FD table scanning needed).
+var gpuVAFrontendRegistry struct {
+	mu   sync.Mutex
+	byVA map[uint64]*frontendFD // key = allocation base VA
+}
+
+// LookupGPUVAFrontend returns the frontendFD that owns the GPU allocation
+// containing addr. Returns nil if no allocation covers addr.
+func LookupGPUVAFrontend(addr uint64) *frontendFD {
+	gpuVAFrontendRegistry.mu.Lock()
+	defer gpuVAFrontendRegistry.mu.Unlock()
+	for base, fd := range gpuVAFrontendRegistry.byVA {
+		fd.gpuMappingsMu.Lock()
+		for _, m := range fd.gpuMappings {
+			if m.base == base && addr >= m.base && addr < m.base+m.length {
+				fd.gpuMappingsMu.Unlock()
+				return fd
+			}
+		}
+		fd.gpuMappingsMu.Unlock()
+	}
+	return nil
 }
 
 func (fd *frontendFD) findGPUExternalAllocation(addr, alignedStart, alignedLen uint64) (gpuExternalAllocation, bool) {
