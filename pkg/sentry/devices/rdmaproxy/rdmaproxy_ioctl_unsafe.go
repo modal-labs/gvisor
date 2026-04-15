@@ -170,7 +170,8 @@ func ioctlNeedsHostNetns(action ioctlAction, objectID uint16, writeCmdVal uint64
 	if objectID == uverbsObjectDevice && uverbsWriteCmdBase(writeCmdVal) == ibUserVerbsCmdModifyQP {
 		return true
 	}
-	// QP object operations other than create/destroy (i.e. MODIFY) need netns.
+	// QP object MODIFY (objectID=QP, action=actionNone since not create/destroy)
+	// needs host netns for RoCE GID→MAC resolution at INIT→RTR and RTR→RTS.
 	if objectID == uverbsObjectQP {
 		return true
 	}
@@ -267,6 +268,7 @@ const (
 	uverbsMethodRegDMABufMR = 4  // MR object (DMABUF path)
 	uverbsMethodRegMR       = 5  // MR object (modern path)
 	uverbsMethodCoreCreate  = 64 // UVERBS_API_METHOD_KEY_NUM_CORE — CREATE for CQ, QP, etc.
+	uverbsMethodQPDestroy   = 1  // QP object DESTROY (stable since kernel 4.20)
 )
 
 // INVOKE_WRITE attr IDs.
@@ -605,11 +607,13 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 		}
 	}
 
-	log.Debugf("rdmaproxy: forwarding ioctl to host (hostFD=%d, %d rewrites, action=%d)", fd.hostFD, len(rewrites), action)
+	needsNetns := ioctlNeedsHostNetns(action, objectID, writeCmdVal)
+	log.Debugf("rdmaproxy: forwarding ioctl to host (hostFD=%d, %d rewrites, action=%d needsNetns=%v obj=0x%04x method=%d)",
+		fd.hostFD, len(rewrites), action, needsNetns, objectID, methodID)
 
 	var n uintptr
 	var errno unix.Errno
-	if ioctlNeedsHostNetns(action, objectID, writeCmdVal) {
+	if needsNetns {
 		n, errno = ioctlInHostNetns(fd.hostFD, rdmaVerbsIoctl, unsafe.Pointer(&buf[0]))
 	} else {
 		n, errno = ioctlDirect(fd.hostFD, rdmaVerbsIoctl, unsafe.Pointer(&buf[0]))
@@ -793,7 +797,15 @@ func (fd *uverbsFD) classifyIoctl(buf []byte, numAttrs int, objectID, methodID u
 		if hasAttrID(buf, numAttrs, mlx5DriverAttrIn) {
 			return actionQPCreate, 0
 		}
-		return actionQPDestroy, 0
+		// Distinguish DESTROY (method=1) from MODIFY (method=2+).
+		// Returning actionNone for MODIFY lets ioctlNeedsHostNetns
+		// catch it via the objectID == uverbsObjectQP check, and
+		// prevents the actionQPDestroy post-ioctl page-release from
+		// firing incorrectly on MODIFY_QP.
+		if methodID == uverbsMethodQPDestroy {
+			return actionQPDestroy, 0
+		}
+		return actionNone, 0 // MODIFY_QP or unknown QP op
 	}
 
 	// Legacy path: INVOKE_WRITE on DEVICE object.
