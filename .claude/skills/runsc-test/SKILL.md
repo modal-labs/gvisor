@@ -17,7 +17,7 @@ Assumes `/node-setup` has been run and `/baseline` has generated a topo XML.
 
 $ARGUMENTS should start with two SSH hostnames, then optional flags:
 - `wo-abc123 wo-def456` — the two node hostnames
-- `--gpus N` — GPUs per node (default 2). **Known limitation:** GDR=3 EFAULTs at 3+.
+- `--gpus N` — GPUs per node (default 8).
 - `--gdr 0|3` — GDR level (default 3). Use 0 for CPU-staged RDMA fallback.
 - `--debug` — enable sentry debug logging for this run
 - `--build` — rebuild runsc from source before testing
@@ -242,7 +242,6 @@ Present results:
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `ibv_reg_mr_iova2 EFAULT` | GPU memory VMA not pinnable | Reduce GPUs to 2 or use `--gdr 0` |
 | `Could not find NET with id N` | Wrong topo/graph XML | Regenerate via `/baseline` on this hardware |
 | `Connection closed by remote peer` | Node 1 started alone, node 0 never launched | Check coordinated launch timing |
 | Zero port counter deltas | Crashed before data flowed | Check NCCL errors in output |
