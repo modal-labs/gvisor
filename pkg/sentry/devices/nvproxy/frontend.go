@@ -912,12 +912,18 @@ func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *front
 		return 0, linuxerr.EINVAL
 	}
 	defer ctlFileGeneric.DecRef(fi.ctx)
-	ctlFile, ok := ctlFileGeneric.Impl().(*frontendFD)
-	if !ok {
+	// Try frontendFD first (normal nvidia device fd), then hostFDWrapper
+	// (exported cuMem/DMA-BUF fd from cuMemExportToShareableHandle).
+	var hostFD int32
+	if ctlFile, ok := ctlFileGeneric.Impl().(*frontendFD); ok {
+		hostFD = ctlFile.hostFD
+	} else if hostFDer, ok := ctlFileGeneric.Impl().(interface{ NVProxyHostFD() int32 }); ok {
+		hostFD = hostFDer.NVProxyHostFD()
+	} else {
 		return 0, linuxerr.EINVAL
 	}
 
-	ctrlParams.SetFrontendFD(ctlFile.hostFD)
+	ctrlParams.SetFrontendFD(hostFD)
 	n, err := rmControlInvoke(fi, ioctlParams, ctrlParams)
 	ctrlParams.SetFrontendFD(origFD)
 	if err != nil {
