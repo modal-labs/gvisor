@@ -1045,7 +1045,10 @@ func ctrlExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARA
 }
 
 // ctrlExportObjectsToFD handles NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD.
-// Same as ctrlExportObjectToFD but for the plural (batch) export path.
+// The FD field is dual-purpose: on input it carries the target fd that the
+// driver writes the exported objects into; on output it may be updated.
+// We must translate the input fd from sandbox→host before the host ioctl,
+// then wrap the output fd from host→sandbox afterward.
 func ctrlExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	var ctrlParams nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
@@ -1055,17 +1058,27 @@ func ctrlExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PAR
 		return 0, err
 	}
 
-	log.Debugf("nvproxy: export objects: PRE fd=%d hDevice=%#x maxObj=%d numObj=%d index=%d objects[0]=%#x",
-		ctrlParams.FD, ctrlParams.HDevice, ctrlParams.MaxObjects, ctrlParams.NumObjects, ctrlParams.Index, ctrlParams.Objects[0])
+	// Translate input FD from sandbox to host. The driver needs the host fd
+	// to write the exported object data. If fd < 0 it's a "create new" hint.
+	sandboxInputFD := ctrlParams.FD
+	if sandboxInputFD >= 0 {
+		file, _ := fi.t.FDTable().Get(sandboxInputFD)
+		if file != nil {
+			if hostFDer, ok := file.Impl().(interface{ NVProxyHostFD() int32 }); ok {
+				ctrlParams.FD = hostFDer.NVProxyHostFD()
+				log.Debugf("nvproxy: export objects: input fd rewrite sandbox=%d → host=%d", sandboxInputFD, ctrlParams.FD)
+			}
+			file.DecRef(fi.ctx)
+		}
+	}
 
 	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
 	if err != nil {
 		return n, err
 	}
 
-	log.Debugf("nvproxy: export objects: POST status=%#x fd=%d numObj=%d index=%d",
-		ioctlParams.Status, ctrlParams.FD, ctrlParams.NumObjects, ctrlParams.Index)
-
+	// Wrap the output fd (host→sandbox). The driver may return a new fd
+	// or the same fd it was given.
 	hostFD := ctrlParams.FD
 	if hostFD >= 0 {
 		sandboxFD, wrapErr := newHostFDWrapper(fi.t, hostFD, "[nvidia-export]")
