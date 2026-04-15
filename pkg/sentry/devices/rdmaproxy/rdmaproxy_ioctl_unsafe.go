@@ -1159,7 +1159,7 @@ func (fd *uverbsFD) rewriteDMABufFD(t *kernel.Task, buf []byte, numAttrs int) {
 		off := ibUverbsIoctlHdrSize + i*ibUverbsAttrSize
 		attrID := binary.LittleEndian.Uint16(buf[off : off+2])
 		attrLen := binary.LittleEndian.Uint16(buf[off+2 : off+4])
-		if attrID != uverbsAttrRegDMABufMRFD || attrLen != 0 {
+		if attrID != uverbsAttrRegDMABufMRFD {
 			continue
 		}
 		sandboxFD := int32(binary.LittleEndian.Uint64(buf[off+8 : off+16]))
