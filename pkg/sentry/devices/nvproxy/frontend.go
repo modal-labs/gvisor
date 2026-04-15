@@ -28,14 +28,12 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
-	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -104,14 +102,6 @@ func (fd *frontendFD) NVProxyMmapInfo() (hostFD int32, devName string, mmapLengt
 	return fd.hostFD, fd.dev.basename(), fd.memmapFile.mmapLength
 }
 
-// NVProxyPrepareGPUVMA attempts to create a fresh host-side RM_MAP_MEMORY mmap
-// context for the GPU VA range containing addr, then returns a host FD that can
-// be mmapped by rdmaproxy to obtain a nvidia-backed VMA. mapAddr overrides
-// PLinearAddress in RM_MAP_MEMORY (use 0 to default to alignedStart).
-func (fd *frontendFD) NVProxyPrepareGPUVMA(ctx context.Context, addr, alignedStart, alignedLen, mapAddr uint64) (hostFD int32, devName string, mmapLength uint64, err error) {
-	return fd.prepareGPUVMA(ctx, addr, alignedStart, alignedLen, mapAddr)
-}
-
 // frontendFD implements vfs.FileDescriptionImpl for /dev/nvidia# and
 // /dev/nvidiactl.
 //
@@ -156,95 +146,12 @@ type frontendFD struct {
 	// protected by dev.nvp.clientsMu.
 	clients map[*rootClient]struct{}
 
-	// gpuMappings remembers UVM_MAP_EXTERNAL_ALLOCATION ranges seen through this
-	// frontend FD so rdmaproxy can lazily seed RM_MAP_MEMORY for GPU RDMA.
-	gpuMappingsMu sync.Mutex              `state:"nosave"`
-	gpuMappings   []gpuExternalAllocation `state:"nosave"`
-
 	// registeredControl and registeredDeviceFDs track NV_ESC_REGISTER_FD
 	// associations so prepared RM_MAP_MEMORY can reuse device FDs that belong
 	// to the same control-FD context instead of scanning every frontend in the
 	// sandbox.
 	registeredControl   *frontendFD              `state:"nosave"`
 	registeredDeviceFDs map[*frontendFD]struct{} `state:"nosave"`
-}
-
-type gpuExternalAllocation struct {
-	base     uint64
-	length   uint64
-	offset   uint64
-	hClient  nvgpu.Handle
-	hMemory  nvgpu.Handle
-	gpuUUIDs []string
-}
-
-func nvUUIDString(uuid nvgpu.NvUUID) string {
-	if uuid == (nvgpu.NvUUID{}) {
-		return ""
-	}
-	return fmt.Sprintf("GPU-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-		uuid[0], uuid[1], uuid[2], uuid[3],
-		uuid[4], uuid[5],
-		uuid[6], uuid[7],
-		uuid[8], uuid[9],
-		uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15])
-}
-
-func (fd *frontendFD) noteUVMExternalAllocation(tgid int32, base, length, offset uint64, hClient, hMemory nvgpu.Handle, gpuUUIDs []string) {
-	if base == 0 || length == 0 || hClient.Val == nvgpu.NV01_NULL_OBJECT || hMemory.Val == nvgpu.NV01_NULL_OBJECT {
-		return
-	}
-	gpuUUIDs = dedupeStrings(gpuUUIDs)
-	fd.gpuMappingsMu.Lock()
-	defer fd.gpuMappingsMu.Unlock()
-	for i := len(fd.gpuMappings) - 1; i >= 0; i-- {
-		existing := fd.gpuMappings[i]
-		if existing.base == base && existing.length == length && existing.offset == offset && existing.hClient == hClient && existing.hMemory == hMemory {
-			if len(existing.gpuUUIDs) == 0 && len(gpuUUIDs) != 0 {
-				fd.gpuMappings[i].gpuUUIDs = append([]string(nil), gpuUUIDs...)
-			}
-			return
-		}
-	}
-	fd.gpuMappings = append(fd.gpuMappings, gpuExternalAllocation{
-		base:     base,
-		length:   length,
-		offset:   offset,
-		hClient:  hClient,
-		hMemory:  hMemory,
-		gpuUUIDs: append([]string(nil), gpuUUIDs...),
-	})
-	// Register in rdmaproxy's global GPU VA registry for direct lookup
-	// at REG_MR time (no FD table scanning needed).
-	rdmaproxy.RegisterGPUVA(tgid, base, length, fd)
-	log.Warningf("nvproxy: UVM_MAP_EXTERNAL_ALLOCATION base=%#x len=%d offset=%#x tgid=%d hostFD=%d hClient=%v hMemory=%v", base, length, offset, tgid, fd.hostFD, hClient, hMemory)
-	if log.IsLogging(log.Debug) {
-		log.Debugf("nvproxy: recorded UVM external allocation via %q hostFD=%d base=%#x len=%d offset=%#x hClient=%v hMemory=%v gpuUUIDs=%v",
-			fd.dev.basename(), fd.hostFD, base, length, offset, hClient, hMemory, gpuUUIDs)
-	}
-}
-
-func (fd *frontendFD) findGPUExternalAllocation(addr, alignedStart, alignedLen uint64) (gpuExternalAllocation, bool) {
-	allocs := fd.findAllGPUExternalAllocations(addr)
-	if len(allocs) > 0 {
-		return allocs[0], true
-	}
-	return gpuExternalAllocation{}, false
-}
-
-// findAllGPUExternalAllocations returns all tracked allocations covering addr.
-func (fd *frontendFD) findAllGPUExternalAllocations(addr uint64) []gpuExternalAllocation {
-	fd.gpuMappingsMu.Lock()
-	defer fd.gpuMappingsMu.Unlock()
-	var result []gpuExternalAllocation
-	for i := len(fd.gpuMappings) - 1; i >= 0; i-- {
-		mapping := fd.gpuMappings[i]
-		rangeEnd := mapping.base + mapping.length
-		if addr >= mapping.base && addr < rangeEnd {
-			result = append(result, mapping)
-		}
-	}
-	return result
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.

@@ -626,10 +626,9 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 					mrLen = binary.LittleEndian.Uint64(rw.sentry[regMROffLength : regMROffLength+8])
 				}
 			}
-			gpuCached := mrMirror != nil && mrMirror.gpuVMACached
-			tgid := int32(t.TGIDInRoot())
-			log.Warningf("rdmaproxy: EFAULT from host ioctl obj=0x%04x method=%d action=%d hostFD=%d sentryVA=%#x mrLen=%d gpuCached=%v tgid=%d (%s)",
-				objectID, methodID, action, fd.hostFD, sentryVA, mrLen, gpuCached, tgid, taskLogFields(t))
+		tgid := int32(t.TGIDInRoot())
+		log.Warningf("rdmaproxy: EFAULT from host ioctl obj=0x%04x method=%d action=%d hostFD=%d sentryVA=%#x mrLen=%d tgid=%d (%s)",
+			objectID, methodID, action, fd.hostFD, sentryVA, mrLen, tgid, taskLogFields(t))
 		}
 	} else {
 		log.Debugf("rdmaproxy: host ioctl returned n=%d OK", n)
@@ -975,21 +974,10 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 		return nil, 0, linuxerr.EINVAL
 	}
 
-	// GPU device memory must be identity-mapped at the GPU VA for
-	// nvidia-peermem. Check BEFORE Pin because some GPU VAs have
-	// CPU-accessible UVM pages (Pin succeeds) but still need GPU VA.
-	mp, sentryVA, gpuErr := mirrorGPUDeviceMemory(t, addr, alignedStart, alignedLen)
-	if gpuErr == nil {
-		return mp, sentryVA, nil
-	}
-	log.Warningf("rdmaproxy: GPU mirror for %#x failed: %v (falling through to Pin)", addr, gpuErr)
-
 	at := hostarch.ReadWrite
 	prs, pinErr := t.MemoryManager().Pin(t, appAR, at, false /* ignorePermissions */)
 	if pinErr != nil {
-		// Pin fails → must be GPU device memory. GPU mirror already
-		// failed above, so return that error.
-		return nil, 0, fmt.Errorf("GPU mirror failed (%v) and Pin failed (%v) for %#x", gpuErr, pinErr, addr)
+		return nil, 0, fmt.Errorf("Pin: %w", pinErr)
 	}
 
 	cu := cleanup.Make(func() { mm.Unpin(prs) })
@@ -1046,85 +1034,6 @@ func mirrorSandboxPages(t *kernel.Task, addr, length uint64) (*mirroredPages, ui
 
 	sentryVA = m + uintptr(addr-uint64(alignedStart))
 	return mp, sentryVA, nil
-}
-
-// mirrorGPUDeviceMemory creates a nvidia-backed VMA at the GPU VA. If a VMA
-// already exists at this address (from a previous MR_REG), reuse it to avoid
-// clobbering the nvidia mmap context with MAP_FIXED. Multiple MRs at the
-// same GPU VA share the VMA via refcounting.
-func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Addr, alignedLen uint64) (*mirroredPages, uintptr, error) {
-	tgid := int32(t.TGIDInRoot())
-
-	// Check cache — only reuse VMAs from the SAME tgid (nvidia RM context
-	// is per-client, VMAs can't be shared across tgids).
-	if v := acquireGPUVMA(tgid, uintptr(alignedStart), uintptr(alignedLen)); v != nil {
-		return &mirroredPages{gpuVMA: v, gpuVMACached: true}, uintptr(alignedStart), nil
-	}
-
-	// Collect frontends: same-tgid first from registry, then cross-tgid, then FD scan.
-	frontends := lookupAllGPUVA(tgid, addr)
-	if len(frontends) == 0 {
-		seen := make(map[GPUVAFrontend]bool)
-		t.FDTable().ForEach(t, func(fd int32, file *vfs.FileDescription, _ kernel.FDFlags) bool {
-			if fe, ok := file.Impl().(GPUVAFrontend); ok && !seen[fe] {
-				seen[fe] = true
-				frontends = append(frontends, fe)
-			}
-			return true
-		})
-	}
-	if len(frontends) == 0 {
-		return nil, 0, fmt.Errorf("no frontendFD for GPU VA %#x", addr)
-	}
-
-	// Serialize RM_MAP_MEMORY → mmap → cache under lock.
-	gpuVMACache.mu.Lock()
-
-	// Re-check cache under lock (same tgid only).
-	if gpuVMACache.byKey != nil {
-		reqEnd := uintptr(alignedStart) + uintptr(alignedLen)
-		for key, existing := range gpuVMACache.byKey {
-			if key.tgid != tgid {
-				continue
-			}
-			vEnd := existing.va + existing.len
-			if uintptr(alignedStart) >= existing.va && reqEnd <= vEnd {
-				existing.refs++
-				gpuVMACache.mu.Unlock()
-				return &mirroredPages{gpuVMA: existing, gpuVMACached: true}, existing.va, nil
-			}
-		}
-	}
-
-	var lastErr error
-	for _, fe := range frontends {
-		mapFD, devName, _, err := fe.NVProxyPrepareGPUVMA(t, addr, uint64(alignedStart), alignedLen, uint64(alignedStart))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		mapped, _, mmapErrno := unix.RawSyscall6(unix.SYS_MMAP,
-			uintptr(alignedStart), uintptr(alignedLen),
-			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED|unix.MAP_FIXED,
-			uintptr(mapFD), 0)
-		if mmapErrno != 0 {
-			lastErr = fmt.Errorf("mmap at %#x: %v", alignedStart, mmapErrno)
-			continue
-		}
-		if gpuVMACache.byKey == nil {
-			gpuVMACache.byKey = make(map[gpuVMAKey]*gpuVMARef)
-		}
-		key := gpuVMAKey{va: mapped, tgid: tgid}
-		v := &gpuVMARef{va: mapped, len: uintptr(alignedLen), tgid: tgid, refs: 1}
-		gpuVMACache.byKey[key] = v
-		gpuVMACache.mu.Unlock()
-		log.Warningf("rdmaproxy: mirrorGPUDeviceMemory %#x: NEW VMA at %#x-%#x dev=%q mapFD=%d tgid=%d (%s)",
-			addr, alignedStart, uint64(alignedStart)+alignedLen, devName, mapFD, tgid, taskLogFields(t))
-		return &mirroredPages{gpuVMA: v}, mapped, nil
-	}
-	gpuVMACache.mu.Unlock()
-	return nil, 0, fmt.Errorf("all %d frontends failed for GPU VA %#x: %w", len(frontends), addr, lastErr)
 }
 
 // extractMRHandle reads the MR handle from the ioctl response after

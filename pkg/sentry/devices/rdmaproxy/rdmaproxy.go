@@ -117,145 +117,18 @@ type mirroredPages struct {
 	// If m != 0, it's a sentry-side mmap we own and must munmap on release.
 	m   uintptr
 	len uintptr
-	// gpuVMA is a refcounted GPU VMA that persists across multiple MRs.
-	// Must not be munmapped while any MR using it is alive — nvidia-peermem
-	// holds references to the VMA's nvidia vm_ops for GPU page resolution.
-	gpuVMA *gpuVMARef
 	// mrSummary is an optional compact registration summary emitted once the
 	// host returns an MR handle successfully.
 	mrSummary string
-	// gpuVMACached is true if the GPU VMA was reused from cache (vs newly created).
-	gpuVMACached bool
 }
 
 func (mp *mirroredPages) release(ctx context.Context) {
-	if mp.gpuVMA != nil {
-		mp.gpuVMA.decRef()
-	} else if mp.m != 0 {
+	if mp.m != 0 {
 		if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, mp.m, mp.len, 0); errno != 0 {
 			log.Warningf("rdmaproxy: munmap %#x-%#x: %v", mp.m, mp.m+mp.len, errno)
 		}
 	}
 	mm.Unpin(mp.prs)
-}
-
-// gpuVMARef is a refcounted nvidia-backed VMA at a GPU VA, bound to a
-// specific tgid's RM context. Only MRs from the same tgid can reuse it.
-type gpuVMARef struct {
-	va   uintptr
-	len  uintptr
-	tgid int32
-	refs int32
-}
-
-type gpuVMAKey struct {
-	va   uintptr
-	tgid int32
-}
-
-func (v *gpuVMARef) decRef() {
-	gpuVMACache.mu.Lock()
-	defer gpuVMACache.mu.Unlock()
-	v.refs--
-	if v.refs > 0 {
-		return
-	}
-	delete(gpuVMACache.byKey, gpuVMAKey{va: v.va, tgid: v.tgid})
-	if _, _, errno := unix.RawSyscall(unix.SYS_MUNMAP, v.va, v.len, 0); errno != 0 {
-		log.Warningf("rdmaproxy: munmap GPU VMA %#x-%#x tgid=%d: %v", v.va, v.va+v.len, v.tgid, errno)
-	}
-}
-
-// gpuVMACache caches nvidia-backed VMAs keyed by (VA, tgid). Different tgids
-// CANNOT share VMAs because the nvidia RM context is per-client. The cache
-// lock serializes RM_MAP_MEMORY + mmap to prevent clobbering.
-var gpuVMACache struct {
-	mu    sync.Mutex
-	byKey map[gpuVMAKey]*gpuVMARef
-}
-
-// acquireGPUVMA returns a cached VMA for the given tgid that contains
-// [va, va+len). Returns nil if no matching VMA exists.
-func acquireGPUVMA(tgid int32, va uintptr, len uintptr) *gpuVMARef {
-	gpuVMACache.mu.Lock()
-	defer gpuVMACache.mu.Unlock()
-	if gpuVMACache.byKey == nil {
-		return nil
-	}
-	reqEnd := va + len
-	for key, v := range gpuVMACache.byKey {
-		if key.tgid != tgid {
-			continue
-		}
-		vEnd := v.va + v.len
-		if va >= v.va && reqEnd <= vEnd {
-			v.refs++
-			return v
-		}
-	}
-	return nil
-}
-
-// GPUVAFrontend is the interface that nvproxy frontendFDs implement for
-// GPU VA operations needed by rdmaproxy.
-type GPUVAFrontend interface {
-	NVProxyPrepareGPUVMA(context.Context, uint64, uint64, uint64, uint64) (int32, string, uint64, error)
-}
-
-// gpuVARegistry maps (TGID, GPU VA) → frontendFD. Each worker process
-// (TGID) has its own RM client and GPU allocations. Populated at
-// UVM_MAP_EXTERNAL_ALLOCATION time, queried at REG_MR time.
-var gpuVARegistry struct {
-	mu      sync.Mutex
-	entries []gpuVAEntry
-}
-
-type gpuVAEntry struct {
-	tgid      int32
-	base, end uint64
-	frontend  GPUVAFrontend
-}
-
-// RegisterGPUVA records that the given frontendFD owns GPU memory at
-// [base, base+length) for the given TGID. Called by nvproxy at
-// UVM_MAP_EXTERNAL_ALLOCATION time.
-func RegisterGPUVA(tgid int32, base, length uint64, frontend GPUVAFrontend) {
-	gpuVARegistry.mu.Lock()
-	defer gpuVARegistry.mu.Unlock()
-	end := base + length
-	for _, e := range gpuVARegistry.entries {
-		if e.tgid == tgid && e.base == base && e.end == end && e.frontend == frontend {
-			return
-		}
-	}
-	gpuVARegistry.entries = append(gpuVARegistry.entries, gpuVAEntry{
-		tgid:     tgid,
-		base:     base,
-		end:      end,
-		frontend: frontend,
-	})
-	log.Debugf("rdmaproxy: registered GPU VA %#x-%#x tgid=%d", base, end, tgid)
-}
-
-// lookupAllGPUVA returns all frontendFDs that have GPU allocations
-// containing addr. Same-TGID entries come first, then cross-TGID
-// entries (for IPC memory). Deduplicated by frontend pointer.
-func lookupAllGPUVA(tgid int32, addr uint64) []GPUVAFrontend {
-	gpuVARegistry.mu.Lock()
-	defer gpuVARegistry.mu.Unlock()
-	var sameTGID, crossTGID []GPUVAFrontend
-	seen := make(map[GPUVAFrontend]bool)
-	for _, e := range gpuVARegistry.entries {
-		if addr >= e.base && addr < e.end && !seen[e.frontend] {
-			seen[e.frontend] = true
-			if e.tgid == tgid {
-				sameTGID = append(sameTGID, e.frontend)
-			} else {
-				crossTGID = append(crossTGID, e.frontend)
-			}
-		}
-	}
-	return append(sameTGID, crossTGID...)
 }
 
 // pinnedDMABufs tracks the buf + doorbell mirrors for a single CQ or QP.
