@@ -1022,6 +1022,87 @@ func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *front
 	return n, nil
 }
 
+// hostFDWrapper wraps a host file descriptor (e.g. a DMA-BUF fd returned by
+// nvidia's export operation) as a sentry FileDescription. It implements
+// NVProxyHostFD() so that rdmaproxy can translate it for ibv_reg_dmabuf_mr.
+type hostFDWrapper struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.DentryMetadataFileDescriptionImpl
+	vfs.NoLockFD
+
+	hostFD int32
+}
+
+// NVProxyHostFD implements the interface used by rdmaproxy for fd translation.
+func (fd *hostFDWrapper) NVProxyHostFD() int32 {
+	return fd.hostFD
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *hostFDWrapper) Release(ctx context.Context) {
+	unix.Close(int(fd.hostFD))
+}
+
+// newHostFDWrapper wraps a host fd in a sentry FileDescription and installs
+// it in the task's FD table. Returns the sandbox FD number.
+func newHostFDWrapper(t *kernel.Task, hostFD int32, name string) (int32, error) {
+	vfsObj := t.Kernel().VFS()
+	vd := vfsObj.NewAnonVirtualDentry(name)
+	defer vd.DecRef(t)
+
+	w := &hostFDWrapper{hostFD: hostFD}
+	if err := w.vfsfd.Init(w, linux.O_RDWR, t.Credentials(), vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
+		UseDentryMetadata: true,
+	}); err != nil {
+		return -1, err
+	}
+	sandboxFD, err := t.NewFDFrom(0, &w.vfsfd, kernel.FDFlags{CloseOnExec: true})
+	if err != nil {
+		w.vfsfd.DecRef(t)
+		return -1, err
+	}
+	return sandboxFD, nil
+}
+
+// ctrlExportObjectToFD handles NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECT_TO_FD.
+// Unlike ctrlHasFrontendFD, this treats the FD field as OUTPUT (newly created
+// by the host) rather than INPUT (an existing frontend fd to translate).
+func ctrlExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	var ctrlParams nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECT_TO_FD_PARAMS
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+
+	// Don't translate FD on input — it's -1 or a hint, not a frontend fd.
+	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
+	if err != nil {
+		return n, err
+	}
+
+	// The host kernel created a new fd (e.g. DMA-BUF). Install it in the
+	// sandbox's fd table so the app can pass it to ibv_reg_dmabuf_mr.
+	hostFD := ctrlParams.FD
+	if hostFD >= 0 {
+		sandboxFD, wrapErr := newHostFDWrapper(fi.t, hostFD, "[nvidia-export]")
+		if wrapErr != nil {
+			log.Warningf("nvproxy: export object: wrapping host fd %d failed: %v", hostFD, wrapErr)
+			unix.Close(int(hostFD))
+			return n, wrapErr
+		}
+		ctrlParams.FD = sandboxFD
+		log.Debugf("nvproxy: export object: host fd %d → sandbox fd %d", hostFD, sandboxFD)
+	}
+
+	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 func ctrlMemoryMulticastFabricAttachGPU(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	var ctrlParams nvgpu.NV00FD_CTRL_ATTACH_GPU_PARAMS
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
