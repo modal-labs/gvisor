@@ -1022,6 +1022,40 @@ func ctrlHasFrontendFD[Params any, PtrParams hasFrontendFDPtr[Params]](fi *front
 	return n, nil
 }
 
+// frontendExportToDMABufFD handles NV_ESC_EXPORT_TO_DMABUF_FD. CUDA uses this
+// to export GPU memory as a DMA-BUF fd for ibv_reg_dmabuf_mr. The ioctl returns
+// a new host fd in the FD field which we wrap and install in the sandbox fd table.
+func frontendExportToDMABufFD(fi *frontendIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.IoctlExportToDMABufFD
+	if _, err := ioctlParams.CopyIn(fi.t, fi.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+
+	n, err := frontendIoctlInvokeNoStatus(fi, &ioctlParams)
+	if err != nil {
+		return n, err
+	}
+
+	// Wrap the returned host DMA-BUF fd so the sandbox app can pass it to
+	// ibv_reg_dmabuf_mr and rdmaproxy can translate it.
+	hostFD := ioctlParams.FD
+	if hostFD >= 0 && ioctlParams.Status == 0 {
+		sandboxFD, wrapErr := newHostFDWrapper(fi.t, hostFD, "[nvidia-dmabuf]")
+		if wrapErr != nil {
+			log.Warningf("nvproxy: export to dmabuf fd: wrapping host fd %d failed: %v", hostFD, wrapErr)
+			unix.Close(int(hostFD))
+			return n, wrapErr
+		}
+		ioctlParams.FD = sandboxFD
+		log.Debugf("nvproxy: export to dmabuf fd: host fd %d → sandbox fd %d", hostFD, sandboxFD)
+	}
+
+	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 // hostFDWrapper wraps a host file descriptor (e.g. a DMA-BUF fd returned by
 // nvidia's export operation) as a sentry FileDescription. It implements
 // NVProxyHostFD() so that rdmaproxy can translate it for ibv_reg_dmabuf_mr.
