@@ -1087,15 +1087,6 @@ func mirrorGPUDeviceMemory(t *kernel.Task, addr uint64, alignedStart hostarch.Ad
 			lastErr = fmt.Errorf("mmap at %#x: %v", alignedStart, mmapErrno)
 			continue
 		}
-		// Mark the VMA as PROT_NONE so that pin_user_pages() fails.
-		// nvidia-peermem relies on this failure to trigger its fallback
-		// path, which resolves GPU pages directly via the nvidia driver
-		// instead of using the (wrong) host pages from the mmap.
-		_, _, mprotectErrno := unix.RawSyscall(unix.SYS_MPROTECT,
-			mapped, uintptr(alignedLen), 0 /* PROT_NONE */)
-		if mprotectErrno != 0 {
-			log.Warningf("rdmaproxy: mprotect PROT_NONE at %#x len %#x: %v", mapped, alignedLen, mprotectErrno)
-		}
 		if gpuVMACache.byKey == nil {
 			gpuVMACache.byKey = make(map[gpuVMAKey]*gpuVMARef)
 		}
