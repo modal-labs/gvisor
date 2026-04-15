@@ -1153,12 +1153,11 @@ func (fd *uverbsFD) extractMRHandle(buf []byte, numAttrs int, objectID uint16, r
 
 // rewriteDMABufFD translates the DMA-BUF fd in a DMABUF MR_REG ioctl
 // from the sandbox's fd number to the host fd. The fd is attr 5
-// (UVERBS_ATTR_REG_DMABUF_MR_FD), stored inline (attrLen == 0).
+// (UVERBS_ATTR_REG_DMABUF_MR_FD), stored inline.
 func (fd *uverbsFD) rewriteDMABufFD(t *kernel.Task, buf []byte, numAttrs int) {
 	for i := 0; i < numAttrs; i++ {
 		off := ibUverbsIoctlHdrSize + i*ibUverbsAttrSize
 		attrID := binary.LittleEndian.Uint16(buf[off : off+2])
-		attrLen := binary.LittleEndian.Uint16(buf[off+2 : off+4])
 		if attrID != uverbsAttrRegDMABufMRFD {
 			continue
 		}
