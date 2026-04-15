@@ -1137,6 +1137,40 @@ func ctrlExportObjectToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARA
 	return n, nil
 }
 
+// ctrlExportObjectsToFD handles NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD.
+// Same as ctrlExportObjectToFD but for the plural (batch) export path.
+func ctrlExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	var ctrlParams nvgpu.NV0000_CTRL_OS_UNIX_EXPORT_OBJECTS_TO_FD_PARAMS
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+
+	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
+	if err != nil {
+		return n, err
+	}
+
+	hostFD := ctrlParams.FD
+	if hostFD >= 0 {
+		sandboxFD, wrapErr := newHostFDWrapper(fi.t, hostFD, "[nvidia-export]")
+		if wrapErr != nil {
+			log.Warningf("nvproxy: export objects: wrapping host fd %d failed: %v", hostFD, wrapErr)
+			unix.Close(int(hostFD))
+			return n, wrapErr
+		}
+		ctrlParams.FD = sandboxFD
+		log.Debugf("nvproxy: export objects: host fd %d → sandbox fd %d", hostFD, sandboxFD)
+	}
+
+	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
 func ctrlMemoryMulticastFabricAttachGPU(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
 	var ctrlParams nvgpu.NV00FD_CTRL_ATTACH_GPU_PARAMS
 	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
