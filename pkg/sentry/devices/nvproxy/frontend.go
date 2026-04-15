@@ -1055,10 +1055,16 @@ func ctrlExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PAR
 		return 0, err
 	}
 
+	log.Debugf("nvproxy: export objects: PRE fd=%d hDevice=%#x maxObj=%d numObj=%d index=%d objects[0]=%#x",
+		ctrlParams.FD, ctrlParams.HDevice, ctrlParams.MaxObjects, ctrlParams.NumObjects, ctrlParams.Index, ctrlParams.Objects[0])
+
 	n, err := rmControlInvoke(fi, ioctlParams, &ctrlParams)
 	if err != nil {
 		return n, err
 	}
+
+	log.Debugf("nvproxy: export objects: POST status=%#x fd=%d numObj=%d index=%d",
+		ioctlParams.Status, ctrlParams.FD, ctrlParams.NumObjects, ctrlParams.Index)
 
 	hostFD := ctrlParams.FD
 	if hostFD >= 0 {
