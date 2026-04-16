@@ -72,13 +72,11 @@ type uverbsDevice struct {
 // Open implements vfs.Device.Open.
 func (dev *uverbsDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	devRelPath := filepath.Join("infiniband", dev.devName)
-	log.Infof("rdmaproxy: opening %s (flags=0x%x)", devRelPath, opts.Flags)
 	hostFD, err := openHostDevice(ctx, devRelPath, opts.Flags)
 	if err != nil {
 		log.Warningf("rdmaproxy: open host device %s: %v", devRelPath, err)
 		return nil, err
 	}
-	log.Infof("rdmaproxy: opened %s → hostFD=%d", devRelPath, hostFD)
 	fd := &uverbsFD{
 		hostFD: int32(hostFD),
 	}
@@ -101,10 +99,8 @@ func (dev *uverbsDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Den
 // falling back to a direct open. devRelPath is relative to /dev/.
 func openHostDevice(ctx context.Context, devRelPath string, flags uint32) (int, error) {
 	if client := devutil.GoferClientFromContext(ctx); client != nil {
-		log.Debugf("rdmaproxy: using dev gofer to open %s", devRelPath)
 		return client.OpenAt(ctx, devRelPath, flags)
 	}
-	log.Debugf("rdmaproxy: no dev gofer, falling back to direct open for %s", devRelPath)
 	devPath := filepath.Join("/dev", devRelPath)
 	openFlags := int(flags&unix.O_ACCMODE | unix.O_NOFOLLOW)
 	return unix.Openat(-1, devPath, openFlags, 0)
@@ -170,24 +166,20 @@ type uverbsFD struct {
 // Release implements vfs.FileDescriptionImpl.Release.
 func (fd *uverbsFD) Release(ctx context.Context) {
 	fd.mu.Lock()
-	for handle, mp := range fd.pinnedMRs {
-		log.Infof("rdmaproxy: releasing pinned MR handle=%d on fd close", handle)
+	for _, mp := range fd.pinnedMRs {
 		mp.release(ctx)
 	}
 	fd.pinnedMRs = nil
-	for handle, p := range fd.pinnedCQs {
-		log.Infof("rdmaproxy: releasing pinned CQ handle=%d on fd close", handle)
+	for _, p := range fd.pinnedCQs {
 		p.release(ctx)
 	}
 	fd.pinnedCQs = nil
-	for handle, p := range fd.pinnedQPs {
-		log.Infof("rdmaproxy: releasing pinned QP handle=%d on fd close", handle)
+	for _, p := range fd.pinnedQPs {
 		p.release(ctx)
 	}
 	fd.pinnedQPs = nil
 	fd.mu.Unlock()
 
-	log.Infof("rdmaproxy: closing hostFD=%d", fd.hostFD)
 	fdnotifier.RemoveFD(fd.hostFD)
 	unix.Close(int(fd.hostFD))
 }
