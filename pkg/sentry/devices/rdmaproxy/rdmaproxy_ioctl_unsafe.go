@@ -67,7 +67,7 @@ func ioctlInHostNetns(fd int32, cmd uint32, arg unsafe.Pointer) (uintptr, unix.E
 	n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(arg))
 
 	if restoreErr := unix.Setns(int(containerNetnsFD), unix.CLONE_NEWNET); restoreErr != nil {
-		log.Warningf("rdmaproxy: restore container netns: %v", restoreErr)
+		panic(fmt.Sprintf("rdmaproxy: failed to restore container netns: %v", restoreErr))
 	}
 
 	return n, errno
@@ -121,7 +121,7 @@ func writeInHostNetns(fd int32, p []byte) (uintptr, unix.Errno) {
 		uintptr(len(p)))
 
 	if restoreErr := unix.Setns(int(containerNetnsFD), unix.CLONE_NEWNET); restoreErr != nil {
-		log.Warningf("rdmaproxy: restore container netns (write): %v", restoreErr)
+		panic(fmt.Sprintf("rdmaproxy: failed to restore container netns (write): %v", restoreErr))
 	}
 
 	return n, errno
