@@ -146,12 +146,6 @@ type frontendFD struct {
 	// protected by dev.nvp.clientsMu.
 	clients map[*rootClient]struct{}
 
-	// registeredControl and registeredDeviceFDs track NV_ESC_REGISTER_FD
-	// associations so prepared RM_MAP_MEMORY can reuse device FDs that belong
-	// to the same control-FD context instead of scanning every frontend in the
-	// sandbox.
-	registeredControl   *frontendFD              `state:"nosave"`
-	registeredDeviceFDs map[*frontendFD]struct{} `state:"nosave"`
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
@@ -160,16 +154,6 @@ func (fd *frontendFD) Release(ctx context.Context) {
 	fd.appQueue.Notify(waiter.EventHUp)
 
 	fd.dev.nvp.fdsMu.Lock()
-	if fd.registeredControl != nil {
-		delete(fd.registeredControl.registeredDeviceFDs, fd)
-		fd.registeredControl = nil
-	}
-	for deviceFD := range fd.registeredDeviceFDs {
-		if deviceFD.registeredControl == fd {
-			deviceFD.registeredControl = nil
-		}
-	}
-	fd.registeredDeviceFDs = nil
 	delete(fd.dev.nvp.frontendFDs, fd)
 	fd.dev.nvp.fdsMu.Unlock()
 
@@ -401,22 +385,6 @@ func frontendRegisterFD(fi *frontendIoctlState) (uintptr, error) {
 	n, err := frontendIoctlInvokeNoStatus(fi, &ioctlParams)
 	if err != nil {
 		return n, err
-	}
-	if fi.fd != ctlFile {
-		fi.fd.dev.nvp.fdsMu.Lock()
-		if oldCtl := fi.fd.registeredControl; oldCtl != nil && oldCtl != ctlFile {
-			delete(oldCtl.registeredDeviceFDs, fi.fd)
-		}
-		fi.fd.registeredControl = ctlFile
-		if ctlFile.registeredDeviceFDs == nil {
-			ctlFile.registeredDeviceFDs = make(map[*frontendFD]struct{})
-		}
-		ctlFile.registeredDeviceFDs[fi.fd] = struct{}{}
-		fi.fd.dev.nvp.fdsMu.Unlock()
-		if fi.ctx.IsLogging(log.Debug) {
-			fi.ctx.Debugf("nvproxy: REGISTER_FD dev=%q hostFD=%d ctlDev=%q ctlHostFD=%d",
-				fi.fd.dev.basename(), fi.fd.hostFD, ctlFile.dev.basename(), ctlFile.hostFD)
-		}
 	}
 	return n, nil
 }
