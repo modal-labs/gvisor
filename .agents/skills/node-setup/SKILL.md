@@ -76,10 +76,12 @@ May fail with EINVAL if already loaded — that's fine. Run on both in parallel.
 
 ### 7. Discover network and IB
 ```
-ssh ... modal@<node> 'echo IFNAME=$(ip -4 addr show ens7 &>/dev/null && echo ens7 || echo eth0) && echo MASTER_IP=$(ip -4 addr show eth0 2>/dev/null | grep inet | awk "{print \$2}" | cut -d/ -f1 || ip -4 addr show ens7 | grep inet | awk "{print \$2}" | cut -d/ -f1) && echo NCCL_IB_HCA=$(for dev in /sys/class/infiniband/mlx5_*; do d=$(basename $dev); grep -q "4: ACTIVE" $dev/ports/1/state 2>/dev/null && echo -n "$d,"; done | sed "s/,$//") && for dev in /sys/class/infiniband/mlx5_*; do d=$(basename $dev); state=$(cat $dev/ports/1/state); echo "$d: $state"; done'
+ssh ... modal@<node> 'echo IFNAME=$(ip -4 addr show ens7 &>/dev/null && echo ens7 || echo eth0) && echo MASTER_IP=$(ip -4 addr show eth0 2>/dev/null | grep inet | awk "{print \$2}" | cut -d/ -f1 || ip -4 addr show ens7 | grep inet | awk "{print \$2}" | cut -d/ -f1) && echo NCCL_IB_HCA=$(ibdev2netdev | awk "\$5 !~ /^(eth|ens)/ && \$6 == \"(Up)\" {print \$1}" | sort -V | paste -sd, -) && for dev in /sys/class/infiniband/mlx5_*; do d=$(basename $dev); state=$(cat $dev/ports/1/state); nets=$(ls $dev/device/net 2>/dev/null | tr "\n" "," | sed "s/,$//"); echo "$d: $state net=$nets"; done'
 ```
 Run on node 0. Parse IFNAME, MASTER_IP, NCCL_IB_HCA from the output.
-Report which HCAs are DOWN (e.g. mlx5_2, mlx5_8 — expected on some hardware).
+`NCCL_IB_HCA` must exclude mlx5 devices mapped to `eth*` or `ens*`; those are
+management devices. Report which HCAs are DOWN (e.g. mlx5_2, mlx5_8 — expected
+on some hardware) and which active HCAs map to `eth*` or `ens*`.
 
 ### 8. Verify cross-node connectivity
 ```

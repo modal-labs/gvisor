@@ -31,9 +31,12 @@ Run on node 0 and parse the output. All subsequent steps use these values.
 ```
 ssh modal@<node0> 'echo MASTER_IP=$(ip -4 addr show eth0 2>/dev/null | grep inet | awk "{print \$2}" | cut -d/ -f1 || ip -4 addr show ens7 | grep inet | awk "{print \$2}" | cut -d/ -f1); \
   echo IFNAME=$(ip -4 addr show ens7 &>/dev/null && echo ens7 || echo eth0); \
-  echo NCCL_IB_HCA=$(for dev in /sys/class/infiniband/mlx5_*; do d=$(basename $dev); grep -q "4: ACTIVE" $dev/ports/1/state 2>/dev/null && echo -n "$d,"; done | sed "s/,$//"); \
+  echo NCCL_IB_HCA=$(ibdev2netdev | awk "\$5 !~ /^(eth|ens)/ && \$6 == \"(Up)\" {print \$1}" | sort -V | paste -sd, -); \
   echo PYVER=$(python3 -c "import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")")'
 ```
+
+`NCCL_IB_HCA` must exclude any mlx5 device whose `ibdev2netdev` mapping starts
+with `eth` or `ens`; those are management devices on these Modal nodes.
 
 ## Coordinated launch
 

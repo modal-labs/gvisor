@@ -3,7 +3,7 @@ name: runsc-test
 description: Build runsc, deploy, run gVisor RDMA test with port counters and optional debug logging
 user-invocable: true
 allowed-tools: Bash
-argument-hint: [node0-host node1-host] [--gpus N] [--gdr 0|3] [--debug] [--build]
+argument-hint: "[node0-host node1-host] [--gpus N] [--gdr 0|3] [--debug] [--build]"
 ---
 
 # gVisor runsc-rdma Test
@@ -129,7 +129,7 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'fo
 # Launch node 1 (background via nohup on remote)
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 "bash -c '
 DEVS=\$(ls /dev/infiniband/uverbs* | sed \"s/^/--device=/\" | tr \"\n\" \" \")
-NCCL_IB_HCA=\$(for dev in /sys/class/infiniband/mlx5_*; do d=\$(basename \$dev); grep -q \"4: ACTIVE\" \$dev/ports/1/state 2>/dev/null && echo -n \"\$d,\"; done | sed \"s/,\$//\")
+NCCL_IB_HCA=\$(ibdev2netdev | awk \"\$5 !~ /^(eth|ens)/ && \$6 == \\\"(Up)\\\" {print \$1}\" | sort -V | paste -sd, -)
 nohup sudo docker run --runtime=runsc-rdma --name nccl-runsc --gpus all \$DEVS \
   --ulimit memlock=-1:-1 --shm-size=1g --network=host \
   -v \$HOME/.local/lib/python<PYVER>/site-packages:/usr/local/lib/python<PYVER>/dist-packages \
@@ -153,7 +153,7 @@ ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE1 'su
 echo "=== NODE 0 OUTPUT ==="
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null modal@$NODE0 "
 DEVS=\$(ls /dev/infiniband/uverbs* | sed 's/^/--device=/' | tr '\n' ' ')
-NCCL_IB_HCA=\$(for dev in /sys/class/infiniband/mlx5_*; do d=\$(basename \$dev); grep -q '4: ACTIVE' \$dev/ports/1/state 2>/dev/null && echo -n \"\$d,\"; done | sed 's/,$//')
+NCCL_IB_HCA=\$(ibdev2netdev | awk '\$5 !~ /^(eth|ens)/ && \$6 == \"(Up)\" {print \$1}' | sort -V | paste -sd, -)
 sudo docker run --runtime=runsc-rdma --rm --gpus all \$DEVS \
   --ulimit memlock=-1:-1 --shm-size=1g --network=host \
   -v \$HOME/.local/lib/python<PYVER>/site-packages:/usr/local/lib/python<PYVER>/dist-packages \
