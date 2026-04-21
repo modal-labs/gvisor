@@ -38,13 +38,13 @@ import (
 	"gvisor.dev/gvisor/pkg/prometheus"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/syscalls/linux"
 	"gvisor.dev/gvisor/pkg/tcpip/nftables"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
-	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/profile"
@@ -190,10 +190,6 @@ type Boot struct {
 	// used to synchronize rootless user namespace initialization.
 	syncUsernsFD int
 
-	// hostNetnsFD is a file descriptor to the host's network namespace,
-	// used by rdmaproxy for RoCE GID-to-netdev resolution.
-	hostNetnsFD int
-
 	// nvidiaDriverVersion is the Nvidia driver version on the host.
 	nvidiaDriverVersion string
 
@@ -269,9 +265,6 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&b.finalMetricsFD, "final-metrics-log-fd", -1, "file descriptor to write metrics to upon sandbox termination.")
 	f.IntVar(&b.profilingMetricsFD, "profiling-metrics-fd", -1, "file descriptor to write sentry profiling metrics.")
 	f.BoolVar(&b.profilingMetricsLossy, "profiling-metrics-fd-lossy", false, "if true, treat the sentry profiling metrics FD as lossy and write a checksum to it.")
-
-	// RDMA properties.
-	f.IntVar(&b.hostNetnsFD, "host-netns-fd", -1, "FD to the host network namespace for RDMA GID resolution")
 
 	// Nvidia driver properties.
 	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver version on the host")
@@ -606,7 +599,6 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		RootfsUpperTarFD: b.rootfsUpperTarFD,
 		RDMADevices:      rdmaDevices,
 		PCIDevicesData:   pciDevicesData,
-		HostNetnsFD:      b.hostNetnsFD,
 	}
 	b.setBootArgsExtra(&bootArgs)
 	l, err := boot.New(bootArgs)

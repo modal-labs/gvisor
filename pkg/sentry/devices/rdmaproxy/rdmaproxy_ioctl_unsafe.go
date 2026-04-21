@@ -17,7 +17,6 @@ package rdmaproxy
 import (
 	"encoding/binary"
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,149 +39,9 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// ioctlInHostNetns executes an ioctl in the host's network namespace.
-// RoCE's ibv_modify_qp requires the calling thread's network namespace
-// to contain the physical NICs referenced by GIDs. Both FDs are saved
-// at startup (before seccomp) so no open() is needed here.
-func ioctlInHostNetns(fd int32, cmd uint32, arg unsafe.Pointer) (uintptr, unix.Errno) {
-	if hostNetnsFD < 0 || containerNetnsFD < 0 {
-		n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(arg))
-		return n, errno
-	}
-
-	if netnsFDsSameInode(hostNetnsFD, containerNetnsFD) {
-		n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(arg))
-		return n, errno
-	}
-
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	if err := unix.Setns(int(hostNetnsFD), unix.CLONE_NEWNET); err != nil {
-		log.Warningf("rdmaproxy: setns to host netns: %v, falling back", err)
-		n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(arg))
-		return n, errno
-	}
-
-	n, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(arg))
-
-	if restoreErr := unix.Setns(int(containerNetnsFD), unix.CLONE_NEWNET); restoreErr != nil {
-		panic(fmt.Sprintf("rdmaproxy: failed to restore container netns: %v", restoreErr))
-	}
-
-	return n, errno
-}
-
-// ioctlDirect executes an ioctl without network namespace switching.
-// Used for operations that don't need the host netns (MR, CQ, QP ops).
-func ioctlDirect(fd int32, cmd uint32, arg unsafe.Pointer) (uintptr, unix.Errno) {
-	n, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(cmd), uintptr(arg))
-	return n, errno
-}
-
-// writeInHostNetns runs write(2) on the uverbs fd in the host network namespace.
-// Legacy ibv_modify_qp uses the write() command path (IB_USER_VERBS_CMD_MODIFY_QP);
-// it needs the same netns as ioctl MODIFY_QP for RoCE GID resolution.
-func writeInHostNetns(fd int32, p []byte) (uintptr, unix.Errno) {
-	if len(p) == 0 {
-		return 0, 0
-	}
-	if hostNetnsFD < 0 || containerNetnsFD < 0 {
-		n, _, errno := unix.RawSyscall(unix.SYS_WRITE,
-			uintptr(fd),
-			uintptr(unsafe.Pointer(&p[0])),
-			uintptr(len(p)))
-		return n, errno
-	}
-
-	if netnsFDsSameInode(hostNetnsFD, containerNetnsFD) {
-		n, _, errno := unix.RawSyscall(unix.SYS_WRITE,
-			uintptr(fd),
-			uintptr(unsafe.Pointer(&p[0])),
-			uintptr(len(p)))
-		return n, errno
-	}
-
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	if err := unix.Setns(int(hostNetnsFD), unix.CLONE_NEWNET); err != nil {
-		log.Warningf("rdmaproxy: setns to host netns (write): %v, falling back", err)
-		n, _, errno := unix.RawSyscall(unix.SYS_WRITE,
-			uintptr(fd),
-			uintptr(unsafe.Pointer(&p[0])),
-			uintptr(len(p)))
-		return n, errno
-	}
-
-	n, _, errno := unix.RawSyscall(unix.SYS_WRITE,
-		uintptr(fd),
-		uintptr(unsafe.Pointer(&p[0])),
-		uintptr(len(p)))
-
-	if restoreErr := unix.Setns(int(containerNetnsFD), unix.CLONE_NEWNET); restoreErr != nil {
-		panic(fmt.Sprintf("rdmaproxy: failed to restore container netns (write): %v", restoreErr))
-	}
-
-	return n, errno
-}
-
-// Legacy write / INVOKE_WRITE command for MODIFY_QP (enum ib_uverbs_write_cmds).
-// Needs host netns for RoCE GID resolution during QP state transitions.
-const ibUserVerbsCmdModifyQP = 26
-
-// uverbsWriteCmdBase strips IB_USER_VERBS_CMD_FLAG_EXTENDED (0x80000000) from
-// UVERBS_ATTR_WRITE_CMD values (see ib_user_verbs.h).
-func uverbsWriteCmdBase(w uint64) uint32 {
-	return uint32(w & 0x7fffffff)
-}
-
-// netnsFDsSameInode returns true if two /proc/.../ns/net fds refer to the same
-// namespace (same inode). Used to skip setns when the sandbox already shares
-// the host network namespace (e.g. Docker --network=host).
-func netnsFDsSameInode(a, b int32) bool {
-	if a < 0 || b < 0 {
-		return false
-	}
-	var sa, sb unix.Stat_t
-	if unix.Fstat(int(a), &sa) != nil {
-		return false
-	}
-	if unix.Fstat(int(b), &sb) != nil {
-		return false
-	}
-	return sa.Ino == sb.Ino && sa.Dev == sb.Dev
-}
-
-// ioctlNeedsHostNetns returns true if the ioctl requires the host
-// network namespace. Only QP MODIFY operations need it (for GID
-// resolution on RoCE). Everything else — QUERY_GID_ENTRY, MR ops,
-// CQ ops, QP CREATE/DESTROY — does not.
-func ioctlNeedsHostNetns(action ioctlAction, objectID uint16, writeCmdVal uint64) bool {
-	// Known safe actions never need netns.
-	switch action {
-	case actionMRReg, actionMRRegDMABuf, actionMRDereg,
-		actionCQCreate, actionCQDestroy,
-		actionQPCreate, actionQPDestroy:
-		return false
-	}
-	// INVOKE_WRITE with MODIFY_QP needs netns.
-	if objectID == uverbsObjectDevice && uverbsWriteCmdBase(writeCmdVal) == ibUserVerbsCmdModifyQP {
-		return true
-	}
-	// QP object MODIFY (objectID=QP, action=actionNone since not create/destroy)
-	// needs host netns for RoCE GID→MAC resolution at INIT→RTR and RTR→RTS.
-	if objectID == uverbsObjectQP {
-		return true
-	}
-	// Everything else (QUERY_GID_ENTRY, QUERY_PORT, ALLOC_PD, etc.) doesn't.
-	return false
-}
-
 // Performance counters for diagnosing throughput regressions.
 var (
 	globalIoctlCount     atomic.Uint64
-	globalWriteCount     atomic.Uint64
 	globalReadCount      atomic.Uint64
 	globalMRRegCount     atomic.Uint64
 	globalMRDeregCount   atomic.Uint64
@@ -196,14 +55,13 @@ var (
 func startPerfReporter() {
 	reporterOnce.Do(func() {
 		go func() {
-			var prevIoctl, prevWrite, prevRead uint64
+			var prevIoctl, prevRead uint64
 			var prevMRReg, prevMRDereg uint64
 			var prevCQCreate, prevCQDestroy uint64
 			var prevQPCreate, prevQPDestroy uint64
 			for {
 				time.Sleep(5 * time.Second)
 				curIoctl := globalIoctlCount.Load()
-				curWrite := globalWriteCount.Load()
 				curRead := globalReadCount.Load()
 				curMRReg := globalMRRegCount.Load()
 				curMRDereg := globalMRDeregCount.Load()
@@ -211,13 +69,13 @@ func startPerfReporter() {
 				curCQDestroy := globalCQDestroyCount.Load()
 				curQPCreate := globalQPCreateCount.Load()
 				curQPDestroy := globalQPDestroyCount.Load()
-				log.Warningf("rdmaproxy: PERF ioctl_rate=%d/5s write_rate=%d/5s read_rate=%d/5s mr_reg=%d mr_dereg=%d cq_create=%d cq_destroy=%d qp_create=%d qp_destroy=%d total_ioctls=%d",
-					curIoctl-prevIoctl, curWrite-prevWrite, curRead-prevRead,
+				log.Warningf("rdmaproxy: PERF ioctl_rate=%d/5s read_rate=%d/5s mr_reg=%d mr_dereg=%d cq_create=%d cq_destroy=%d qp_create=%d qp_destroy=%d total_ioctls=%d",
+					curIoctl-prevIoctl, curRead-prevRead,
 					curMRReg-prevMRReg, curMRDereg-prevMRDereg,
 					curCQCreate-prevCQCreate, curCQDestroy-prevCQDestroy,
 					curQPCreate-prevQPCreate, curQPDestroy-prevQPDestroy,
 					curIoctl)
-				prevIoctl, prevWrite, prevRead = curIoctl, curWrite, curRead
+				prevIoctl, prevRead = curIoctl, curRead
 				prevMRReg, prevMRDereg = curMRReg, curMRDereg
 				prevCQCreate, prevCQDestroy = curCQCreate, curCQDestroy
 				prevQPCreate, prevQPDestroy = curQPCreate, curQPDestroy
@@ -329,25 +187,6 @@ func countAction(action ioctlAction) {
 		globalQPCreateCount.Add(1)
 	case actionQPDestroy:
 		globalQPDestroyCount.Add(1)
-	}
-}
-
-func actionFromLegacyWriteCmd(cmdBase uint32) ioctlAction {
-	switch cmdBase {
-	case ibUserVerbsCmdRegMR:
-		return actionMRReg
-	case ibUserVerbsCmdDeregMR:
-		return actionMRDereg
-	case ibUserVerbsCmdCreateCQ:
-		return actionCQCreate
-	case ibUserVerbsCmdDestroyCQ:
-		return actionCQDestroy
-	case ibUserVerbsCmdCreateQP:
-		return actionQPCreate
-	case ibUserVerbsCmdDestroyQP:
-		return actionQPDestroy
-	default:
-		return actionNone
 	}
 }
 
@@ -585,15 +424,7 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 		}
 	}
 
-	needsNetns := ioctlNeedsHostNetns(action, objectID, writeCmdVal)
-
-	var n uintptr
-	var errno unix.Errno
-	if needsNetns {
-		n, errno = ioctlInHostNetns(fd.hostFD, rdmaVerbsIoctl, unsafe.Pointer(&buf[0]))
-	} else {
-		n, errno = ioctlDirect(fd.hostFD, rdmaVerbsIoctl, unsafe.Pointer(&buf[0]))
-	}
+	n, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd.hostFD), uintptr(rdmaVerbsIoctl), uintptr(unsafe.Pointer(&buf[0])))
 
 	if errno == unix.EFAULT {
 		// Extract the sentry VA that was passed to the host from the ioctl buffer.
@@ -780,10 +611,8 @@ func (fd *uverbsFD) classifyIoctl(buf []byte, numAttrs int, objectID, methodID u
 			return actionQPCreate, 0
 		}
 		// Distinguish DESTROY (method=1) from MODIFY (method=2+).
-		// Returning actionNone for MODIFY lets ioctlNeedsHostNetns
-		// catch it via the objectID == uverbsObjectQP check, and
-		// prevents the actionQPDestroy post-ioctl page-release from
-		// firing incorrectly on MODIFY_QP.
+		// Returning actionNone for MODIFY prevents the actionQPDestroy
+		// post-ioctl page-release from firing incorrectly on MODIFY_QP.
 		if methodID == uverbsMethodQPDestroy {
 			return actionQPDestroy, 0
 		}
@@ -807,8 +636,6 @@ func (fd *uverbsFD) classifyIoctl(buf []byte, numAttrs int, objectID, methodID u
 		case ibUserVerbsCmdDestroyQP:
 			return actionQPDestroy, writeCmdVal
 		default:
-			// Preserve writeCmdVal for ioctlNeedsHostNetns (e.g. MODIFY_QP with
-			// IB_USER_VERBS_CMD_FLAG_EXTENDED). Previously we returned (actionNone, 0).
 			return actionNone, writeCmdVal
 		}
 	}
@@ -1236,288 +1063,6 @@ func (fd *uverbsFD) proxyAsyncEventFD(t *kernel.Task, buf []byte, numAttrs int) 
 		return sentryFD, nil
 	}
 	return -1, fmt.Errorf("ASYNC_EVENT_ALLOC response missing FD attr")
-}
-
-// Write implements vfs.FileDescriptionImpl.Write.
-// This handles the legacy uverbs write() command interface where rdma-core
-// sends commands like ALLOC_PD, REG_MR, DEREG_MR via write() on the fd.
-func (fd *uverbsFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
-	globalWriteCount.Add(1)
-
-	t := kernel.TaskFromContext(ctx)
-	if t == nil {
-		return 0, linuxerr.EINVAL
-	}
-
-	size := src.NumBytes()
-	if size < 8 {
-		return 0, linuxerr.EINVAL
-	}
-
-	data := make([]byte, size)
-	if _, err := src.CopyIn(ctx, data); err != nil {
-		return 0, err
-	}
-
-	rawCmd := binary.LittleEndian.Uint32(data[0:4])
-	cmdBase := rawCmd & 0x7FFFFFFF
-	isExtended := rawCmd&0x80000000 != 0
-	outWords := binary.LittleEndian.Uint16(data[6:8])
-
-	startPerfReporter()
-	if !isExtended {
-		countAction(actionFromLegacyWriteCmd(cmdBase))
-	}
-
-	// Response pointer is always at byte offset 8 (first field of the
-	// command-specific struct for non-extended, or the ex_hdr for extended).
-	// Rewrite it to a sentry-side buffer so the host kernel's copy_to_user
-	// writes into our address space rather than the sandbox.
-	var origResp uint64
-	var respBuf []byte
-	if outWords > 0 && size >= 16 {
-		origResp = binary.LittleEndian.Uint64(data[8:16])
-		respLen := int(outWords) * 4
-		respBuf = make([]byte, respLen)
-		binary.LittleEndian.PutUint64(data[8:16],
-			uint64(uintptr(unsafe.Pointer(&respBuf[0]))))
-	}
-
-	// Mirror DMA pages for commands that need sentry-side pinning.
-	var mrMirror *mirroredPages
-	var cqqpMirror *pinnedDMABufs
-	var cu cleanup.Cleanup
-	defer cu.Clean()
-
-	if !isExtended {
-		switch cmdBase {
-		case ibUserVerbsCmdRegMR:
-			// Non-extended ib_uverbs_reg_mr layout after 8-byte cmd_hdr:
-			//   +0: response (8)  +8: start (8)  +16: length (8)  +24: hca_va (8)
-			const startOff, lengthOff, hcaVAOff = 16, 24, 32
-			if size >= hcaVAOff+8 {
-				sva := binary.LittleEndian.Uint64(data[startOff : startOff+8])
-				length := binary.LittleEndian.Uint64(data[lengthOff : lengthOff+8])
-
-				if length > 0 {
-					mp, sentryVA, err := mirrorSandboxPages(t, sva, length)
-					if err != nil {
-						log.Warningf("rdmaproxy: Write REG_MR mirrorSandboxPages: %v", err)
-						return 0, linuxerr.ENOMEM
-					}
-					mrMirror = mp
-					cu = cleanup.Make(func() { mp.release(t) })
-					binary.LittleEndian.PutUint64(data[startOff:startOff+8], uint64(sentryVA))
-					if mp != nil {
-						hcaVA := binary.LittleEndian.Uint64(data[hcaVAOff : hcaVAOff+8])
-						mp.mrSummary = formatMRSummary(t, sva, length, sentryVA, hcaVA, hcaVA, 0, 0)
-					}
-				}
-			}
-
-		case ibUserVerbsCmdCreateCQ, ibUserVerbsCmdCreateQP:
-			cqqpMirror = fd.prepareLegacyCQQPCreate(t, data, cmdBase)
-			if cqqpMirror != nil {
-				cu = cleanup.Make(func() { cqqpMirror.release(t) })
-			}
-		}
-	}
-
-	// Forward write to host fd.
-	var n uintptr
-	var errno unix.Errno
-	if !isExtended && cmdBase == ibUserVerbsCmdModifyQP {
-		n, errno = writeInHostNetns(fd.hostFD, data)
-	} else {
-		n, _, errno = unix.RawSyscall(unix.SYS_WRITE,
-			uintptr(fd.hostFD),
-			uintptr(unsafe.Pointer(&data[0])),
-			uintptr(size))
-	}
-	if errno != 0 {
-		log.Warningf("rdmaproxy: Write to host: n=%d errno=%d (%v)", n, errno, errno)
-		return 0, errno
-	}
-
-	// Copy response back to sandbox.
-	if respBuf != nil && origResp != 0 {
-		if _, err := t.CopyOutBytes(hostarch.Addr(origResp), respBuf); err != nil {
-			log.Warningf("rdmaproxy: Write response CopyOut to %#x: %v", origResp, err)
-		}
-		binary.LittleEndian.PutUint64(data[8:16], origResp)
-	}
-
-	// Post-write tracking for successful operations.
-	if errno == 0 && !isExtended {
-		switch cmdBase {
-		case ibUserVerbsCmdRegMR:
-			if mrMirror != nil && respBuf != nil && len(respBuf) >= 4 {
-				mrHandle := binary.LittleEndian.Uint32(respBuf[0:4])
-				fd.mu.Lock()
-				if fd.pinnedMRs == nil {
-					fd.pinnedMRs = make(map[uint32]*mirroredPages)
-				}
-				fd.pinnedMRs[mrHandle] = mrMirror
-				fd.mu.Unlock()
-				cu.Release()
-				if log.IsLogging(log.Debug) {
-					log.Debugf("rdmaproxy: Write REG_MR pinned handle=%d (%d ranges) %s", mrHandle, len(mrMirror.prs), mrMirror.mrSummary)
-				}
-			}
-
-		case ibUserVerbsCmdDeregMR:
-			if size >= 12 {
-				mrHandle := binary.LittleEndian.Uint32(data[8:12])
-				fd.mu.Lock()
-				if mp, ok := fd.pinnedMRs[mrHandle]; ok {
-					delete(fd.pinnedMRs, mrHandle)
-					fd.mu.Unlock()
-					mp.release(t)
-					if log.IsLogging(log.Debug) {
-						log.Debugf("rdmaproxy: Write DEREG_MR unpinned handle=%d", mrHandle)
-					}
-				} else {
-					fd.mu.Unlock()
-				}
-			}
-
-		case ibUserVerbsCmdCreateCQ:
-			if cqqpMirror != nil && respBuf != nil && len(respBuf) >= 4 {
-				handle := binary.LittleEndian.Uint32(respBuf[0:4])
-				fd.mu.Lock()
-				if fd.pinnedCQs == nil {
-					fd.pinnedCQs = make(map[uint32]*pinnedDMABufs)
-				}
-				fd.pinnedCQs[handle] = cqqpMirror
-				fd.mu.Unlock()
-				cu.Release()
-				if log.IsLogging(log.Debug) {
-					log.Debugf("rdmaproxy: Write CREATE_CQ pinned handle=%d", handle)
-				}
-			}
-
-		case ibUserVerbsCmdCreateQP:
-			if cqqpMirror != nil && respBuf != nil && len(respBuf) >= 4 {
-				handle := binary.LittleEndian.Uint32(respBuf[0:4])
-				fd.mu.Lock()
-				if fd.pinnedQPs == nil {
-					fd.pinnedQPs = make(map[uint32]*pinnedDMABufs)
-				}
-				fd.pinnedQPs[handle] = cqqpMirror
-				fd.mu.Unlock()
-				cu.Release()
-				if log.IsLogging(log.Debug) {
-					log.Debugf("rdmaproxy: Write CREATE_QP pinned handle=%d", handle)
-				}
-			}
-
-		case ibUserVerbsCmdDestroyCQ:
-			if size >= 12 {
-				handle := binary.LittleEndian.Uint32(data[8:12])
-				fd.mu.Lock()
-				if p, ok := fd.pinnedCQs[handle]; ok {
-					delete(fd.pinnedCQs, handle)
-					fd.mu.Unlock()
-					p.release(t)
-					if log.IsLogging(log.Debug) {
-						log.Debugf("rdmaproxy: Write DESTROY_CQ unpinned handle=%d", handle)
-					}
-				} else {
-					fd.mu.Unlock()
-				}
-			}
-
-		case ibUserVerbsCmdDestroyQP:
-			if size >= 12 {
-				handle := binary.LittleEndian.Uint32(data[8:12])
-				fd.mu.Lock()
-				if p, ok := fd.pinnedQPs[handle]; ok {
-					delete(fd.pinnedQPs, handle)
-					fd.mu.Unlock()
-					p.release(t)
-					if log.IsLogging(log.Debug) {
-						log.Debugf("rdmaproxy: Write DESTROY_QP unpinned handle=%d", handle)
-					}
-				} else {
-					fd.mu.Unlock()
-				}
-			}
-		}
-	}
-
-	return int64(n), nil
-}
-
-// prepareLegacyCQQPCreate handles CQ/QP CREATE via the legacy write() path.
-// The driver data (buf_addr + db_addr) is appended after the core struct in
-// the write buffer. Layout: [cmd_hdr (8)] [core_struct] [driver_data...].
-func (fd *uverbsFD) prepareLegacyCQQPCreate(t *kernel.Task, data []byte, cmdBase uint32) *pinnedDMABufs {
-	// Core struct sizes (after 8-byte cmd_hdr and 8-byte response field):
-	//   CREATE_CQ: response(8) + user_handle(8) + cqe(4) + comp_vector(4) + comp_channel(4) + reserved(4) = 32
-	//   CREATE_QP: response(8) + user_handle(8) + pd(4) + scq(4) + rcq(4) + srq(4) +
-	//              max_send_wr(4) + max_recv_wr(4) + max_send_sge(4) + max_recv_sge(4) +
-	//              max_inline(4) + sq_sig_all(1) + qp_type(1) + is_srq(1) + reserved(1) = 56
-	var coreSize int
-	var kind string
-	switch cmdBase {
-	case ibUserVerbsCmdCreateCQ:
-		coreSize = 32
-		kind = "CQ"
-	case ibUserVerbsCmdCreateQP:
-		coreSize = 56
-		kind = "QP"
-	default:
-		return nil
-	}
-
-	drvOff := 8 + coreSize // cmd_hdr + core struct
-	if int64(len(data)) < int64(drvOff)+int64(driverAttrMinLen) {
-		return nil
-	}
-
-	bufAddr := binary.LittleEndian.Uint64(data[drvOff : drvOff+8])
-	dbAddr := binary.LittleEndian.Uint64(data[drvOff+8 : drvOff+16])
-
-	var bufs pinnedDMABufs
-	var cu cleanup.Cleanup
-	defer cu.Clean()
-
-	if bufAddr != 0 {
-		vmaRange, err := t.MemoryManager().FindVMARange(hostarch.Addr(bufAddr))
-		if err != nil {
-			log.Warningf("rdmaproxy: Write CREATE_%s FindVMARange(buf %#x): %v", kind, bufAddr, err)
-			return nil
-		}
-		length := uint64(vmaRange.End) - bufAddr
-		mp, sentryVA, err := mirrorSandboxPages(t, bufAddr, length)
-		if err != nil {
-			log.Warningf("rdmaproxy: Write CREATE_%s mirrorSandboxPages buf: %v", kind, err)
-			return nil
-		}
-		bufs.buf = mp
-		cu.Add(func() { mp.release(t) })
-		binary.LittleEndian.PutUint64(data[drvOff:drvOff+8], uint64(sentryVA))
-	}
-
-	if dbAddr != 0 {
-		vmaRange, err := t.MemoryManager().FindVMARange(hostarch.Addr(dbAddr))
-		if err != nil {
-			log.Warningf("rdmaproxy: Write CREATE_%s FindVMARange(db %#x): %v", kind, dbAddr, err)
-			return nil
-		}
-		length := uint64(vmaRange.End) - dbAddr
-		mp, sentryVA, err := mirrorSandboxPages(t, dbAddr, length)
-		if err != nil {
-			log.Warningf("rdmaproxy: Write CREATE_%s mirrorSandboxPages db: %v", kind, err)
-			return nil
-		}
-		bufs.db = mp
-		cu.Add(func() { mp.release(t) })
-		binary.LittleEndian.PutUint64(data[drvOff+8:drvOff+16], uint64(sentryVA))
-	}
-
-	cu.Release()
-	return &bufs
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.

@@ -416,50 +416,6 @@ func (s *Sandbox) CreateSubcontainer(conf *config.Config, cid string, tty *os.Fi
 	return nil
 }
 
-// resolveExpectedIPoIB resolves the effective IPoIB wait count from the config
-// and OCI spec. When rdma-expected-ipoib is 0 (default), auto-detects from the
-// number of uverbs devices whose underlying HCA uses InfiniBand (not RoCE).
-// Returns 0 (no wait) when disabled or when all devices are RoCE/Ethernet.
-func resolveExpectedIPoIB(conf *config.Config, spec *specs.Spec) int {
-	if !conf.RDMAProxy || conf.RDMAExpectedIPoIB < 0 {
-		return 0
-	}
-	if conf.RDMAExpectedIPoIB > 0 {
-		return conf.RDMAExpectedIPoIB
-	}
-	if spec.Linux == nil {
-		return 0
-	}
-	count := 0
-	for _, dev := range spec.Linux.Devices {
-		if !strings.HasPrefix(dev.Path, "/dev/infiniband/uverbs") {
-			continue
-		}
-		if isUverbsNativeIB(filepath.Base(dev.Path)) {
-			count++
-		}
-	}
-	return count
-}
-
-// isUverbsNativeIB checks whether a uverbs device uses native InfiniBand
-// (as opposed to RoCE/Ethernet) by reading the link layer from sysfs.
-// Returns false for RoCE devices or if the sysfs entries can't be read.
-func isUverbsNativeIB(uverbsName string) bool {
-	ibdevPath := filepath.Join("/sys/class/infiniband_verbs", uverbsName, "ibdev")
-	data, err := os.ReadFile(ibdevPath)
-	if err != nil {
-		return false
-	}
-	ibdev := strings.TrimSpace(string(data))
-	linkLayerPath := filepath.Join("/sys/class/infiniband", ibdev, "ports/1/link_layer")
-	data, err = os.ReadFile(linkLayerPath)
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(string(data)) == "InfiniBand"
-}
-
 func getDisableIPv6(spec *specs.Spec) (bool, error) {
 	if spec.Linux == nil || spec.Linux.Sysctl == nil {
 		return false, nil
@@ -493,8 +449,6 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 	if err != nil {
 		return err
 	}
-	// Resolve auto-detected IPoIB count before network setup.
-	conf.RDMAExpectedIPoIB = resolveExpectedIPoIB(conf, spec)
 	// Configure the network.
 	if err := setupNetwork(conn, pid, conf, disableIPv6); err != nil {
 		return fmt.Errorf("setting up network: %w", err)
@@ -603,7 +557,6 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	if err != nil {
 		return err
 	}
-	conf.RDMAExpectedIPoIB = resolveExpectedIPoIB(conf, spec)
 	// Configure the network.
 	if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6); err != nil {
 		return fmt.Errorf("setting up network: %v", err)
@@ -1041,15 +994,6 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 		return fmt.Errorf("opening device file for platform %q: %v", conf.Platform, err)
 	} else if deviceFile != nil {
 		donations.DonateAndClose("device-fd", deviceFile.ReleaseToFile("device file"))
-	}
-
-	if conf.RDMAProxy {
-		netnsFD, err := unix.Open("/proc/self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
-		if err != nil {
-			log.Warningf("Failed to open host netns for RDMA: %v", err)
-		} else {
-			donations.DonateAndClose("host-netns-fd", os.NewFile(uintptr(netnsFD), "host netns"))
-		}
 	}
 
 	// TODO(b/151157106): syscall tests fail by timeout if asyncpreemptoff

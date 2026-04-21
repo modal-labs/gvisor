@@ -43,7 +43,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
-	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sys"
@@ -256,9 +255,6 @@ type Loader struct {
 	// pciDevicesData contains pre-collected PCI device topology data.
 	pciDevicesData *sys.PCIDevicesData
 
-	// hostNetnsFD is a FD to the host network namespace for RDMA.
-	hostNetnsFD int
-
 	hostTHP HostTHP
 
 	// mu guards the fields below.
@@ -439,11 +435,6 @@ type Args struct {
 	// topology (GPUs, NICs, bridges) used by NCCL for optimal algorithm
 	// selection.
 	PCIDevicesData *sys.PCIDevicesData
-
-	// HostNetnsFD is a file descriptor to the host's network namespace.
-	// Used by rdmaproxy to switch netns before ioctls that need GID
-	// resolution against host physical NICs.
-	HostNetnsFD int
 }
 
 // HostTHP holds host transparent hugepage settings.
@@ -520,10 +511,6 @@ func New(args Args) (*Loader, error) {
 		nvproxy.Init()
 	}
 
-	if args.HostNetnsFD >= 0 {
-		rdmaproxy.SetHostNetnsFD(args.HostNetnsFD)
-	}
-
 	kernel.IOUringEnabled = args.Conf.IOUring
 
 	eid := execID{cid: args.ID}
@@ -535,7 +522,6 @@ func New(args Args) (*Loader, error) {
 		productName:    args.ProductName,
 		rdmaDevices:    args.RDMADevices,
 		pciDevicesData: args.PCIDevicesData,
-		hostNetnsFD:    args.HostNetnsFD,
 		hostTHP:        args.HostTHP,
 		containerIDs:   make(map[string]string),
 		containerSpecs: make(map[string]*specs.Spec),
