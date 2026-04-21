@@ -188,11 +188,11 @@ func setUpChroot(spec *specs.Spec, conf *config.Config) error {
 		return fmt.Errorf("error configuring chroot for TPU devices: %w", err)
 	}
 
-	if err := rdmaProxyUpdateChroot(chroot, conf); err != nil {
+	if err := rdmaProxyUpdateChroot(chroot, spec, conf); err != nil {
 		return fmt.Errorf("error configuring chroot for RDMA devices: %w", err)
 	}
 
-	if err := pciDevicesUpdateChroot(chroot, conf); err != nil {
+	if err := pciDevicesUpdateChroot(chroot, spec, conf); err != nil {
 		return fmt.Errorf("error configuring chroot for PCI device topology: %w", err)
 	}
 
@@ -262,8 +262,8 @@ func tpuProxyUpdateChroot(hostRoot, chroot string, spec *specs.Spec, conf *confi
 	return err
 }
 
-func rdmaProxyUpdateChroot(chroot string, conf *config.Config) error {
-	if !specutils.RDMAProxyIsEnabled(conf) {
+func rdmaProxyUpdateChroot(chroot string, spec *specs.Spec, conf *config.Config) error {
+	if !specutils.RDMAFunctionalityRequested(spec, conf) {
 		return nil
 	}
 	// Collect RDMA device data from the real host sysfs (accessible now,
@@ -281,11 +281,11 @@ func rdmaProxyUpdateChroot(chroot string, conf *config.Config) error {
 	return nil
 }
 
-func pciDevicesUpdateChroot(chroot string, conf *config.Config) error {
+func pciDevicesUpdateChroot(chroot string, spec *specs.Spec, conf *config.Config) error {
 	// Collect PCI device topology when GPU or RDMA workloads are enabled.
 	// NCCL uses /sys/bus/pci/devices/ to discover NUMA/PCIe topology for
 	// optimal algorithm selection (NVLS Tree vs Ring).
-	if !conf.NVProxy && !specutils.RDMAProxyIsEnabled(conf) {
+	if !conf.NVProxy && !specutils.RDMAFunctionalityRequested(spec, conf) {
 		return nil
 	}
 	data := sys.CollectPCIDeviceData()

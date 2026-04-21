@@ -666,7 +666,7 @@ func (g *Gofer) setupDev(spec *specs.Spec, conf *config.Config, root, procPath s
 	}
 	nvproxyEnabled := specutils.NVProxyEnabled(spec, conf)
 	tpuproxyEnabled := specutils.TPUProxyIsEnabled(spec, conf)
-	rdmaproxyEnabled := specutils.RDMAProxyIsEnabled(conf)
+	rdmaproxyEnabled := specutils.RDMAProxyEnabled(spec, conf)
 	for _, dev := range spec.Linux.Devices {
 		shouldMount := (nvproxyEnabled && shouldExposeNvidiaDevice(dev.Path)) ||
 			(tpuproxyEnabled && shouldExposeTpuDevice(dev.Path)) ||

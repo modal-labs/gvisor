@@ -958,7 +958,7 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 	case sys.Name:
 		sysData := &sys.InternalData{
 			EnableTPUProxyPaths:  specutils.TPUProxyIsEnabled(spec, conf),
-			EnableRDMAProxyPaths: specutils.RDMAProxyIsEnabled(conf),
+			EnableRDMAProxyPaths: specutils.RDMAFunctionalityRequested(spec, conf),
 			RDMADevices:          rdmaDevices,
 			PCIDevicesData:       pciDevicesData,
 		}
