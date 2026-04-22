@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/devutil"
-	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsutil"
@@ -206,9 +205,6 @@ func MayRegisterDevicePath(path string) bool {
 	matched, _ := filepath.Match("/dev/infiniband/uverbs*", path)
 	return matched
 }
-
-// ErrNotUverbsDevice is returned when the device path doesn't match.
-var ErrNotUverbsDevice = linuxerr.ENODEV
 
 // Async event FD rewriting is done per-task by resolving sandbox FDs
 // through the task's FD table at ioctl time (see handleRDMAVerbsIoctl).

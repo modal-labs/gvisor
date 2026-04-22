@@ -9,6 +9,7 @@ go_library(
     name = "rdmaproxy",
     srcs = [
         "rdmaproxy.go",
+        "rdmaproxy_ioctl.go",
         "rdmaproxy_ioctl_unsafe.go",
         "seccomp_filter.go",
     ],
