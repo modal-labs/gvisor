@@ -288,8 +288,8 @@ func uvmCreateExternalRange(ui *uvmIoctlState) (uintptr, error) {
 	if err != nil {
 		return n, err
 	}
-	if ioctlParams.RMStatus == nvgpu.NV_OK && log.IsLogging(log.Debug) {
-		log.Debugf("nvproxy: UVM_CREATE_EXTERNAL_RANGE base=%#x len=%d tgid=%d",
+	if ioctlParams.RMStatus == nvgpu.NV_OK {
+		log.Warningf("nvproxy: UVM_CREATE_EXTERNAL_RANGE base=%#x len=%d tgid=%d",
 			ioctlParams.Base, ioctlParams.Length, ui.t.TGIDInRoot())
 	}
 	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
@@ -309,8 +309,8 @@ func uvmAllocSemaphorePool(ui *uvmIoctlState) (uintptr, error) {
 	if err != nil {
 		return n, err
 	}
-	if ioctlParams.RMStatus == nvgpu.NV_OK && log.IsLogging(log.Debug) {
-		log.Debugf("nvproxy: UVM_ALLOC_SEMAPHORE_POOL base=%#x len=%d tgid=%d",
+	if ioctlParams.RMStatus == nvgpu.NV_OK {
+		log.Warningf("nvproxy: UVM_ALLOC_SEMAPHORE_POOL base=%#x len=%d tgid=%d",
 			ioctlParams.Base, ioctlParams.Length, ui.t.TGIDInRoot())
 	}
 	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {

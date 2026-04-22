@@ -93,6 +93,15 @@ func (fd *frontendFD) NVProxyHostFD() int32 {
 	return fd.hostFD
 }
 
+// NVProxyMmapInfo returns metadata about this nvproxy frontend FD that helps
+// rdmaproxy pick the correct FD when synthesizing nvidia-backed VMAs for GPU
+// RDMA registration.
+func (fd *frontendFD) NVProxyMmapInfo() (hostFD int32, devName string, mmapLength uint64) {
+	fd.memmapFile.mmapMu.Lock()
+	defer fd.memmapFile.mmapMu.Unlock()
+	return fd.hostFD, fd.dev.basename(), fd.memmapFile.mmapLength
+}
+
 // frontendFD implements vfs.FileDescriptionImpl for /dev/nvidia# and
 // /dev/nvidiactl.
 //
@@ -136,6 +145,7 @@ type frontendFD struct {
 	// clients are handles of clients owned by this frontendFD. clients is
 	// protected by dev.nvp.clientsMu.
 	clients map[*rootClient]struct{}
+
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
@@ -372,7 +382,11 @@ func frontendRegisterFD(fi *frontendIoctlState) (uintptr, error) {
 	}
 	ioctlParams.CtlFD = ctlFile.hostFD
 	// The returned ctl_fd can't change, so skip copying out.
-	return frontendIoctlInvokeNoStatus(fi, &ioctlParams)
+	n, err := frontendIoctlInvokeNoStatus(fi, &ioctlParams)
+	if err != nil {
+		return n, err
+	}
+	return n, nil
 }
 
 func frontendIoctlHasFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Params]](fi *frontendIoctlState) (uintptr, error) {
@@ -1020,17 +1034,13 @@ func ctrlExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PAR
 
 	// Translate input FD from sandbox to host. The driver needs the host fd
 	// to write the exported object data. If fd < 0 it's a "create new" hint.
-	// Remember the translated host FD so we can detect the append-mode case
-	// below where the driver echoes the same FD back on output.
 	sandboxInputFD := ctrlParams.FD
-	inputHostFD := int32(-1)
 	if sandboxInputFD >= 0 {
 		file, _ := fi.t.FDTable().Get(sandboxInputFD)
 		if file != nil {
 			if hostFDer, ok := file.Impl().(interface{ NVProxyHostFD() int32 }); ok {
-				inputHostFD = hostFDer.NVProxyHostFD()
-				ctrlParams.FD = inputHostFD
-				log.Debugf("nvproxy: export objects: input fd rewrite sandbox=%d → host=%d", sandboxInputFD, inputHostFD)
+				ctrlParams.FD = hostFDer.NVProxyHostFD()
+				log.Debugf("nvproxy: export objects: input fd rewrite sandbox=%d → host=%d", sandboxInputFD, ctrlParams.FD)
 			}
 			file.DecRef(fi.ctx)
 		}
@@ -1041,19 +1051,10 @@ func ctrlExportObjectsToFD(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PAR
 		return n, err
 	}
 
-	// Translate output FD (host→sandbox). In append mode the driver echoes
-	// back the same host FD we passed in; in that case reuse the caller's
-	// existing sandbox FD instead of installing a second wrapper — two
-	// wrappers for one host FD would each unix.Close() it on Release,
-	// causing a double-close (and a use-after-close for the second one).
+	// Wrap the output fd (host→sandbox). The driver may return a new fd
+	// or the same fd it was given.
 	hostFD := ctrlParams.FD
-	switch {
-	case hostFD < 0:
-		// Driver returned no FD (error path the caller will surface via Status).
-	case hostFD == inputHostFD:
-		ctrlParams.FD = sandboxInputFD
-		log.Debugf("nvproxy: export objects: driver echoed host fd %d, reusing sandbox fd %d", hostFD, sandboxInputFD)
-	default:
+	if hostFD >= 0 {
 		sandboxFD, wrapErr := newHostFDWrapper(fi.t, hostFD, "[nvidia-export]")
 		if wrapErr != nil {
 			log.Warningf("nvproxy: export objects: wrapping host fd %d failed: %v", hostFD, wrapErr)
