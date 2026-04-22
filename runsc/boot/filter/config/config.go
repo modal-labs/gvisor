@@ -107,6 +107,7 @@ func Warnings(opt Options) []string {
 	}
 	if opt.RDMAProxy {
 		warnings = append(warnings, "RDMA device proxy enabled: syscall filters less restrictive!")
+		warnings = append(warnings, "RDMA passthrough enabled: host hardware identifiers (PCI BDFs, NIC GUIDs, MAC addresses, NUMA topology) are exposed to the sandbox")
 	}
 	if opt.CgoEnabled {
 		warnings = append(warnings, "CGO enabled: syscall filters less restrictive!")

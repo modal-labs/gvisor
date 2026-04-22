@@ -1505,6 +1505,15 @@ func createDeviceFiles(ctx context.Context, creds *auth.Credentials, info *conta
 // preRegisterRDMADevices registers RDMA devices with the VFS before sysfs is
 // mounted. This ensures the virtual sysfs "dev" files contain the correct
 // sentry-assigned dynamic major numbers rather than the host major numbers.
+//
+// TODO: If container startup fails after this call (e.g. mountAll returns an
+// error), the dynamic major allocations and device registrations performed
+// here are leaked — there is no corresponding UnregisterDevice on
+// vfs.VirtualFilesystem, and PutDynamicCharDevMajor alone would create a
+// stale entry in vfs.devices that would collide on the next
+// GetDynamicCharDevMajor reuse. A proper fix requires adding UnregisterDevice
+// to vfs and wiring cleanup here, in nvproxy, and in tpuproxy (all of which
+// leak the same way today). Sentry lifetimes bound the leak in practice.
 func (c *containerMounter) preRegisterRDMADevices(spec *specs.Spec) {
 	if c.rdmaDevices == nil || spec.Linux == nil {
 		return
@@ -1530,24 +1539,15 @@ func (c *containerMounter) preRegisterRDMADevices(spec *specs.Spec) {
 	// minor (e.g. 192), which matches the key in rdmaDynMajors.
 	for i := range c.rdmaDevices.Devices {
 		dev := &c.rdmaDevices.Devices[i]
-		kernMinor := extractMinorFromDev(dev.Dev)
+		kernMinor, ok := sys.ExtractMinorUint32(dev.Dev)
+		if !ok {
+			continue
+		}
 		if dynMajor, ok := c.rdmaDynMajors[kernMinor]; ok {
 			dev.DynMajor = dynMajor
 			log.Infof("rdma: patched sysfs %s dev=%s → dynMajor=%d", dev.Name, dev.Dev, dynMajor)
 		}
 	}
-}
-
-// extractMinorFromDev parses the kernel minor from a sysfs "dev" string
-// like "231:192" and returns 192.
-func extractMinorFromDev(dev string) uint32 {
-	if idx := strings.IndexByte(dev, ':'); idx >= 0 {
-		v, err := strconv.ParseUint(dev[idx+1:], 10, 32)
-		if err == nil {
-			return uint32(v)
-		}
-	}
-	return 0
 }
 
 func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *containerInfo, vfsObj *vfs.VirtualFilesystem, root vfs.VirtualDentry, devSpec specs.LinuxDevice, rdmaDynMajors map[uint32]uint32) error {

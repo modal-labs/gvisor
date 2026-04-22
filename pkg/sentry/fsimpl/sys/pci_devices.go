@@ -57,6 +57,12 @@ type PCIDevicesData struct {
 
 // pciClassRelevant returns true if the PCI class code is one that NCCL
 // needs for topology discovery.
+//
+// This allowlist is curated for NVIDIA GPU + Mellanox InfiniBand setups and
+// has only been tested against mlx5 InfiniBand devices. Other RDMA-capable
+// adapters (AWS EFA class 0207, Intel Gaudi class 1200, Broadcom bnxt_re,
+// Chelsio iWARP, etc.) are not currently surfaced to the sandbox. Extend
+// this switch when adding support for additional accelerator/NIC families.
 func pciClassRelevant(class string) bool {
 	c := strings.TrimPrefix(class, "0x")
 	if len(c) < 4 {
@@ -211,12 +217,6 @@ func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth
 	}
 	log.Infof("pci sysfs: building virtual sysfs for %d device(s)", len(data.Devices))
 
-	addFile := func(m map[string]kernfs.Inode, name, val string) {
-		if val != "" {
-			m[name] = fs.newStaticFile(ctx, creds, defaultSysMode, val+"\n")
-		}
-	}
-
 	// Build a nested map representing the /sys/devices/ tree.
 	// Key: path relative to /sys/ (e.g., "devices/pci0000:07/0000:07:01.0")
 	// Value: map of child name -> inode
@@ -366,7 +366,6 @@ func (fs *filesystem) newPCIDevicesSysfsEntries(ctx context.Context, creds *auth
 	for addr, target := range busPCIDevicesSymlinks {
 		busPCIDevicesSub[addr] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), target)
 	}
-	_ = addFile // used above in closure
 
 	log.Infof("pci sysfs: created %d device tree entries, %d pci_bus symlinks, %d bus/pci/devices symlinks",
 		len(devicesSub), len(pciBusSub), len(busPCIDevicesSub))

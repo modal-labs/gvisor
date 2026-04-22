@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -68,6 +69,7 @@ type RDMADeviceData struct {
 	// NCCL reads these (especially PCI_SLOT_NAME from uevent) to match
 	// NIC PCI bus IDs against GPU bus IDs in the topology XML.
 	PCISlotName     string `json:"pci_slot_name,omitempty"`
+	PCIDriver       string `json:"pci_driver,omitempty"`
 	PCIClass        string `json:"pci_class,omitempty"`
 	PCIVendor       string `json:"pci_vendor,omitempty"`
 	PCIDevice       string `json:"pci_device,omitempty"`
@@ -156,7 +158,8 @@ func CollectRDMADeviceData() *RDMAData {
 			SysImgGUID:      readSysfsFile(path.Join(ibDir, "sys_image_guid")),
 			FWVer:           readSysfsFile(path.Join(ibDir, "fw_ver")),
 			Modalias:        readSysfsFile(path.Join(deviceDir, "modalias")),
-			PCISlotName:     parsePCISlotName(path.Join(deviceDir, "uevent")),
+			PCISlotName:     parseUeventValue(path.Join(deviceDir, "uevent"), "PCI_SLOT_NAME"),
+			PCIDriver:       parseUeventValue(path.Join(deviceDir, "uevent"), "DRIVER"),
 			PCIClass:        readSysfsFile(path.Join(deviceDir, "class")),
 			PCIVendor:       readSysfsFile(path.Join(deviceDir, "vendor")),
 			PCIDevice:       readSysfsFile(path.Join(deviceDir, "device")),
@@ -306,6 +309,21 @@ func extractMinor(dev string) string {
 	return "0"
 }
 
+// ExtractMinorUint32 parses the minor portion from a sysfs "major:minor" dev
+// string (e.g. "231:192") and returns it as a uint32. Returns (0, false) if
+// the string is malformed.
+func ExtractMinorUint32(dev string) (uint32, bool) {
+	idx := strings.IndexByte(dev, ':')
+	if idx < 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseUint(dev[idx+1:], 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(v), true
+}
+
 // inferRoCEType returns the RoCE GID type based on GID table index.
 // The sandbox's restricted sysfs mount masks gid_attrs/types/ content,
 // so we infer from the well-known mlx5 kernel assignment:
@@ -320,16 +338,18 @@ func inferRoCEType(gidIndex string) string {
 	return "RoCE v2"
 }
 
-// parsePCISlotName reads a uevent file and extracts the PCI_SLOT_NAME value.
-// Returns empty string if the file doesn't exist or has no PCI_SLOT_NAME line.
-func parsePCISlotName(ueventPath string) string {
+// parseUeventValue reads a uevent file and extracts the value for the given
+// KEY (matched as "KEY="). Returns empty string if the file doesn't exist or
+// has no matching line.
+func parseUeventValue(ueventPath, key string) string {
 	data, err := os.ReadFile(ueventPath)
 	if err != nil {
 		return ""
 	}
+	prefix := key + "="
 	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "PCI_SLOT_NAME=") {
-			return strings.TrimPrefix(line, "PCI_SLOT_NAME=")
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
 		}
 	}
 	return ""
@@ -400,8 +420,15 @@ func (fs *filesystem) newRDMASysfsEntries(ctx context.Context, creds *auth.Crede
 		addFile(deviceEntries, "numa_node", dev.NUMANode)
 		addFile(deviceEntries, "local_cpulist", dev.LocalCPUList)
 		if dev.PCISlotName != "" {
-			// Reconstruct the uevent file from collected fields.
-			uevent := "DRIVER=mlx5_core\n"
+			// Reconstruct the uevent file from collected fields. DRIVER is
+			// read verbatim from the host uevent so we don't lie about the
+			// driver name for non-Mellanox adapters (bnxt_re, irdma, efa,
+			// cxgb4, ...). If the host uevent was missing for some reason,
+			// omit the DRIVER line rather than fabricating one.
+			uevent := ""
+			if dev.PCIDriver != "" {
+				uevent += "DRIVER=" + dev.PCIDriver + "\n"
+			}
 			if dev.PCIClass != "" {
 				uevent += "PCI_CLASS=" + strings.TrimPrefix(dev.PCIClass, "0x") + "\n"
 			}
