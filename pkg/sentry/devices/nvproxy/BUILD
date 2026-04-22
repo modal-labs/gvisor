@@ -86,7 +86,6 @@ go_library(
         "//pkg/seccomp",
         "//pkg/sentry/arch",
         "//pkg/sentry/devices/nvproxy/nvconf",
-        "//pkg/sentry/devices/rdmaproxy",
         "//pkg/sentry/fsutil",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",

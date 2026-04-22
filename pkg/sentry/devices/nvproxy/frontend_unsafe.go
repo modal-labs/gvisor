@@ -15,81 +15,15 @@
 package nvproxy
 
 import (
-	"fmt"
 	"runtime"
-	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/nvgpu"
-	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 )
-
-func (fd *frontendFD) queryCardInfo(ctx context.Context) ([]nvgpu.IoctlCardInfo, error) {
-	var cardInfo nvgpu.IoctlCardInfo
-	cardInfoSize := cardInfo.SizeBytes()
-	buf := make([]byte, nvgpu.NV_MAX_DEVICES*cardInfoSize)
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(fd.hostFD),
-		frontendIoctlCmd(nvgpu.NV_ESC_CARD_INFO, uint32(len(buf))),
-		uintptr(unsafe.Pointer(&buf[0])),
-	)
-	runtime.KeepAlive(buf)
-	if errno != 0 {
-		return nil, errno
-	}
-
-	cardInfos := make([]nvgpu.IoctlCardInfo, 0, nvgpu.NV_MAX_DEVICES)
-	for i := 0; i < nvgpu.NV_MAX_DEVICES; i++ {
-		var info nvgpu.IoctlCardInfo
-		info.UnmarshalBytes(buf[i*cardInfoSize : (i+1)*cardInfoSize])
-		if info.Valid == 0 {
-			continue
-		}
-		cardInfos = append(cardInfos, info)
-	}
-	if ctx.IsLogging(log.Debug) {
-		ctx.Debugf("nvproxy: queried %d GPU card infos via hostFD=%d", len(cardInfos), fd.hostFD)
-	}
-	return cardInfos, nil
-}
-
-func (fd *frontendFD) queryGPUUUIDFromGPUID(clientH nvgpu.Handle, gpuID uint32) (string, error) {
-	ctrlParams := nvgpu.NV0000_CTRL_GPU_GET_UUID_FROM_GPU_ID_PARAMS{
-		GPUID:      gpuID,
-		UUIDStrLen: nvgpu.NV0000_GPU_MAX_GID_LENGTH,
-	}
-	ioctlParams := nvgpu.NVOS54_PARAMETERS{
-		HClient:    clientH,
-		HObject:    clientH,
-		Cmd:        nvgpu.NV0000_CTRL_CMD_GPU_GET_UUID_FROM_GPU_ID,
-		Params:     p64FromPtr(unsafe.Pointer(&ctrlParams)),
-		ParamsSize: uint32(ctrlParams.SizeBytes()),
-	}
-	n, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(fd.hostFD),
-		frontendIoctlCmd(nvgpu.NV_ESC_RM_CONTROL, nvgpu.SizeofNVOS54Parameters),
-		uintptr(unsafe.Pointer(&ioctlParams)),
-	)
-	runtime.KeepAlive(&ctrlParams)
-	runtime.KeepAlive(&ioctlParams)
-	if errno != 0 {
-		return "", errno
-	}
-	if ioctlParams.Status != nvgpu.NV_OK {
-		return "", fmt.Errorf("status=%#x n=%#x", ioctlParams.Status, n)
-	}
-	gpuUUID := strings.TrimRight(string(ctrlParams.GPUUUID[:]), "\x00")
-	if gpuUUID == "" {
-		return "", fmt.Errorf("empty uuid for gpuID=%#x", gpuID)
-	}
-	return gpuUUID, nil
-}
 
 func frontendIoctlInvoke[Params any, PtrParams hasStatusPtr[Params]](fi *frontendIoctlState, ioctlParams PtrParams) (uintptr, error) {
 	n, err := frontendIoctlInvokeNoStatus(fi, ioctlParams)
