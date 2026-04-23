@@ -231,6 +231,16 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
     return;
   }
 
+  // Stub-side fast-path for trivial syscalls that don't need the sentry.
+  // sched_yield is a scheduling hint with no security implications. NCCL's
+  // IB proxy threads call it ~192K/sec during spin-wait loops; each full
+  // sentry round-trip costs ~5µs. Handling it here avoids the context
+  // switch to the sentry entirely.
+  if (signo == SIGSYS && siginfo->si_syscall == __NR_sched_yield) {
+    ucontext->uc_mcontext.gregs[REG_RAX] = 0;
+    return;
+  }
+
   fs_base = get_fsbase();
 
   ctx->signo = signo;
@@ -359,6 +369,14 @@ void __syshandler() {
   if (state != THREAD_STATE_PREP) panic(STUB_ERROR_BAD_THREAD_STATE, 0);
 
   struct thread_context *ctx = sysmsg->context;
+
+  // Stub-side fast-path for sched_yield via the patched-syscall (usertrap)
+  // path. Same rationale as the SIGSYS fast-path in __export_sighandler.
+  if (ctx->ptregs.rax == __NR_sched_yield) {
+    ctx->ptregs.rax = 0;
+    atomic_store(&sysmsg->state, THREAD_STATE_NONE);
+    return;
+  }
 
   enum context_state ctx_state = CONTEXT_STATE_SYSCALL_TRAP;
   ctx->signo = SIGSYS;

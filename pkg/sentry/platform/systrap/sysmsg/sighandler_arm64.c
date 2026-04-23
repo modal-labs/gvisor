@@ -116,6 +116,14 @@ void __export_sighandler(int signo, siginfo_t *siginfo, void *_ucontext) {
   ctx = sysmsg->context;
   old_ctx = sysmsg->context;
 
+  // Stub-side fast-path for sched_yield. Same rationale as the amd64
+  // SIGSYS fast-path: avoids a full sentry round-trip for a trivial
+  // scheduling hint. On ARM64, x0 is the return register.
+  if (signo == SIGSYS && siginfo->si_syscall == __NR_sched_yield) {
+    ucontext->uc_mcontext.regs[0] = 0;
+    return;
+  }
+
   ctx->signo = signo;
 
   gregs_to_ptregs(ucontext, &ctx->ptregs);
