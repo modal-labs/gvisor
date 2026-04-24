@@ -98,6 +98,7 @@ const (
 const (
 	ibUserVerbsCmdCreateCQ  = 6
 	ibUserVerbsCmdCreateQP  = 8
+	ibUserVerbsCmdModifyQP  = 26
 	ibUserVerbsCmdRegMR     = 9
 	ibUserVerbsCmdDestroyCQ = 11
 	ibUserVerbsCmdDeregMR   = 13
@@ -180,6 +181,10 @@ func taskLogFields(t *kernel.Task) string {
 		return "tid=0 tgid_root=0"
 	}
 	return fmt.Sprintf("tid=%d tgid_root=%d", t.ThreadID(), t.TGIDInRoot())
+}
+
+func uverbsWriteCmdBase(w uint64) uint32 {
+	return uint32(w & 0x7fffffff)
 }
 
 func formatMRSummary(t *kernel.Task, sandboxVA, length uint64, sentryVA uintptr, oldHCAVA, newHCAVA, oldIOVA, newIOVA uint64) string {
@@ -325,6 +330,12 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 
 	// Classify and prepare DMA page mirroring before forwarding.
 	action, writeCmdVal := fd.classifyIoctl(buf, int(numAttrs), objectID, methodID)
+	isQPModify := (objectID == uverbsObjectQP &&
+		!hasAttrID(buf, int(numAttrs), mlx5DriverAttrIn) &&
+		methodID != uverbsMethodQPDestroy) ||
+		(objectID == uverbsObjectDevice &&
+			methodID == uverbsMethodInvokeWrite &&
+			uverbsWriteCmdBase(writeCmdVal) == ibUserVerbsCmdModifyQP)
 
 	var mrMirror *mirroredPages
 	var cqqpMirror *pinnedDMABufs
@@ -359,7 +370,15 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 		}
 	}
 
+	if isQPModify && log.IsLogging(log.Debug) {
+		log.Debugf("rdmaproxy: forwarding MODIFY_QP obj=0x%04x method=%d write_cmd=%d hostFD=%d %s",
+			objectID, methodID, uverbsWriteCmdBase(writeCmdVal), fd.hostFD, taskLogFields(t))
+	}
 	n, errno := invokeUverbsIoctl(fd.hostFD, buf)
+	if isQPModify && log.IsLogging(log.Debug) {
+		log.Debugf("rdmaproxy: MODIFY_QP returned n=%d errno=%d hostFD=%d %s",
+			n, errno, fd.hostFD, taskLogFields(t))
+	}
 
 	if errno == unix.EFAULT {
 		// Extract the sentry VA that was passed to the host from the ioctl buffer.
@@ -936,6 +955,14 @@ func (fd *uverbsFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.R
 	}
 	written, err := dst.CopyOut(ctx, buf[:n])
 	return int64(written), err
+}
+
+// Write logs unexpected direct writes to /dev/infiniband/uverbs*.
+// Behavior intentionally matches FileDescriptionDefaultImpl.Write.
+func (fd *uverbsFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
+	log.Warningf("rdmaproxy: direct write() on uverbs fd is unsupported size=%d hostFD=%d %s",
+		src.NumBytes(), fd.hostFD, taskLogFields(kernel.TaskFromContext(ctx)))
+	return 0, linuxerr.EINVAL
 }
 
 // Read implements vfs.FileDescriptionImpl.Read for asyncEventFD.

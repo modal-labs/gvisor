@@ -298,27 +298,6 @@ func uvmCreateExternalRange(ui *uvmIoctlState) (uintptr, error) {
 	return n, nil
 }
 
-// uvmAllocSemaphorePool handles UVM_ALLOC_SEMAPHORE_POOL. Log it to trace
-// GPU VA origins.
-func uvmAllocSemaphorePool(ui *uvmIoctlState) (uintptr, error) {
-	var ioctlParams nvgpu.UVM_ALLOC_SEMAPHORE_POOL_PARAMS
-	if _, err := ioctlParams.CopyIn(ui.t, ui.ioctlParamsAddr); err != nil {
-		return 0, err
-	}
-	n, err := uvmIoctlInvoke(ui, &ioctlParams)
-	if err != nil {
-		return n, err
-	}
-	if ioctlParams.RMStatus == nvgpu.NV_OK {
-		log.Warningf("nvproxy: UVM_ALLOC_SEMAPHORE_POOL base=%#x len=%d tgid=%d",
-			ioctlParams.Base, ioctlParams.Length, ui.t.TGIDInRoot())
-	}
-	if _, err := ioctlParams.CopyOut(ui.t, ui.ioctlParamsAddr); err != nil {
-		return n, err
-	}
-	return n, nil
-}
-
 func uvmFailWithStatus[Params any, PtrParams hasStatusPtr[Params]](ui *uvmIoctlState, ioctlParams PtrParams, status uint32) error {
 	return failWithStatus(ui.ctx, ui.t, ui.ioctlParamsAddr, ioctlParams, status)
 }
