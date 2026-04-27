@@ -61,10 +61,15 @@ RUNSC_STRACE_SYSCALLS="${RUNSC_STRACE_SYSCALLS:-}"
 RUNSC_STRACE_LOG_SIZE="${RUNSC_STRACE_LOG_SIZE:-}"
 RUNSC_EXTRA_ANNOTATIONS="${RUNSC_EXTRA_ANNOTATIONS:-}"
 RUNSC_NVPROXY_ALLOWED_DRIVER_CAPABILITIES="${RUNSC_NVPROXY_ALLOWED_DRIVER_CAPABILITIES:-compute,utility,video}"
+RUNSC_RDMA_EXPECTED_IPOIB="${RUNSC_RDMA_EXPECTED_IPOIB:-}"
+PEER_SSH="${PEER_SSH:-}"
+PEER_FULL_IB_PARTITIONS="${PEER_FULL_IB_PARTITIONS:-}"
+REQUIRE_COMMON_FULL_IB_PKEY="${REQUIRE_COMMON_FULL_IB_PKEY:-0}"
+ALLOW_DIFFERENT_IB_PARTITIONS="${ALLOW_DIFFERENT_IB_PARTITIONS:-0}"
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [--roce|--no-roce] [--host-network|--gre] <subcommand> [args]
+Usage: $(basename "$0") [--roce|--no-roce] [--host-network|--gre] [--rdma-expected-ipoib N|--legacy-no-ipoib-wait] <subcommand> [args]
 
 Per-node helper for the TCP bootstrap + RDMA test harness.
 Assumes LOCAL_IP and REMOTE_IP are exported on each node for GRE or host-network mode.
@@ -73,9 +78,11 @@ Subcommands:
   preflight A|B             Validate Docker/runtime/RDMA candidates before setup.
   runtime-show              Show Docker's configured ${RUNTIME} runtime.
   runtime-install           Install/update ${RUNTIME} with annotation-friendly base args.
+  ib-full-pkeys             Print local full-member InfiniBand partition IDs.
+  check-ib-peer             Compare local and peer full InfiniBand partitions when PEER_SSH is set.
   setup-net A|B             Create the GRE bridge/docker network for node A or B.
   cleanup-net               Remove the GRE bridge/docker network on this node.
-  inspect-rdma              Show RDMA HCA link layers and RoCE netdev candidates.
+  inspect-rdma              Show RDMA HCA link layers, IB fabric IDs, and RoCE netdev candidates.
   snapshot-rdma             Snapshot RoCE netdev IPv4/MTU to ${RDMA_SNAPSHOT_PATH}.
   start-container A|B       Start the detached test container for node A or B.
   start-app-container A|B   Start only the runsc app container (holder mode).
@@ -120,13 +127,23 @@ Environment:
     RUNSC_STRACE            Add dev.gvisor.flag.strace=true annotation (default: ${RUNSC_STRACE})
     RUNSC_STRACE_SYSCALLS   Optional comma-separated strace allowlist.
     RUNSC_EXTRA_ANNOTATIONS Space-separated key=value OCI annotations.
+    RUNSC_RDMA_EXPECTED_IPOIB
+                            Explicit value for old --rdma-expected-ipoib runtime arg.
+                            Empty means omit the arg (default: empty).
+    PEER_SSH                Peer SSH command used to compare InfiniBand PKeys.
+    PEER_FULL_IB_PARTITIONS Comma/space-separated peer full partition IDs when peer SSH is unavailable.
+    REQUIRE_COMMON_FULL_IB_PKEY
+                            If 1, fail preflight unless PEER_SSH confirms a shared full PKey.
+    ALLOW_DIFFERENT_IB_PARTITIONS
+                            If 1, warn instead of failing on peer partition mismatch.
     BOOTSTRAP_IFNAME        Container bootstrap NIC for NCCL/Gloo (default: ${BOOTSTRAP_IFNAME})
     REQUIRE_RDMA_IPV4       Require every moved RoCE netdev to have IPv4 (default: ${REQUIRE_RDMA_IPV4})
     RESTORE_RDMA_ROUTES     Restore/infer connected RDMA routes after moving links (default: ${RESTORE_RDMA_ROUTES})
     RDMA_ROUTE_PREFIX_LEN   Prefix to infer for /32 RDMA IPs if no route snapshot exists (default: ${RDMA_ROUTE_PREFIX_LEN})
     ALLOW_BOOTSTRAP_RDMA_IFACE
                             Allow moving the host iface used for LOCAL_IP/REMOTE_IP (default: 0)
-    NCCL_DEBUG, NCCL_DEBUG_SUBSYS, TORCH_DISTRIBUTED_DEBUG, NCCL_IB_GID_INDEX
+    NCCL_DEBUG, NCCL_DEBUG_SUBSYS, TORCH_DISTRIBUTED_DEBUG, NCCL_IB_GID_INDEX,
+    NCCL_IB_PKEY, NCCL_IB_SL, NCCL_IB_TC, NCCL_IB_TIMEOUT, NCCL_IB_RETRY_CNT
 
 Examples:
   # Node A
@@ -261,11 +278,17 @@ PY
 runtime_install() {
   require_cmd sudo python3 systemctl
 
+  local rdma_expected_ipoib_arg=""
+  if [[ -n "${RUNSC_RDMA_EXPECTED_IPOIB}" ]]; then
+    rdma_expected_ipoib_arg="--rdma-expected-ipoib=${RUNSC_RDMA_EXPECTED_IPOIB}"
+  fi
+
   sudo env \
     DOCKER_DAEMON_JSON="${DOCKER_DAEMON_JSON}" \
     RUNTIME="${RUNTIME}" \
     RUNSC_PATH="${RUNSC_PATH}" \
     RUNSC_NVPROXY_ALLOWED_DRIVER_CAPABILITIES="${RUNSC_NVPROXY_ALLOWED_DRIVER_CAPABILITIES}" \
+    RUNSC_RDMA_EXPECTED_IPOIB_ARG="${rdma_expected_ipoib_arg}" \
     python3 - <<'PY'
 import json
 import os
@@ -278,6 +301,9 @@ args = [
     "--allow-flag-override",
     "--nvproxy-allowed-driver-capabilities=" + os.environ["RUNSC_NVPROXY_ALLOWED_DRIVER_CAPABILITIES"],
 ]
+rdma_expected_ipoib_arg = os.environ.get("RUNSC_RDMA_EXPECTED_IPOIB_ARG", "")
+if rdma_expected_ipoib_arg:
+    args.append(rdma_expected_ipoib_arg)
 cfg.setdefault("runtimes", {})[os.environ["RUNTIME"]] = {
     "path": os.environ["RUNSC_PATH"],
     "runtimeArgs": args,
@@ -472,6 +498,151 @@ print_hca_link_layers() {
   shopt -u nullglob
 }
 
+format_pkey() {
+  local idx="$1"
+  local value="$2"
+  local dec part membership
+
+  [[ -n "${value}" && "${value}" != "0x0000" ]] || return 0
+  dec=$((value))
+  part="$(printf '0x%04x' "$((dec & 0x7fff))")"
+  if (( (dec & 0x8000) != 0 )); then
+    membership="full"
+  else
+    membership="limited"
+  fi
+  printf '%s:%s(%s,part=%s)' "${idx}" "${value}" "${membership}" "${part}"
+}
+
+print_ib_fabric_summary() {
+  local d p pkey_file
+  local ibdev state lid sm_lid sm_sl rate value item pkeys
+
+  shopt -s nullglob
+  for d in /sys/class/infiniband/*; do
+    ibdev="$(basename "${d}")"
+    hca_selected "${ibdev}" || continue
+    for p in "${d}"/ports/*; do
+      [[ -e "${p}" ]] || continue
+      [[ "$(read_sysfs "${p}/link_layer")" == "InfiniBand" ]] || continue
+
+      state="$(read_sysfs "${p}/state")"
+      lid="$(read_sysfs "${p}/lid")"
+      sm_lid="$(read_sysfs "${p}/sm_lid")"
+      sm_sl="$(read_sysfs "${p}/sm_sl")"
+      rate="$(read_sysfs "${p}/rate")"
+      pkeys=""
+      for pkey_file in "${p}"/pkeys/*; do
+        [[ -r "${pkey_file}" ]] || continue
+        value="$(read_sysfs "${pkey_file}")"
+        item="$(format_pkey "$(basename "${pkey_file}")" "${value}")"
+        [[ -n "${item}" ]] || continue
+        [[ -n "${pkeys}" ]] && pkeys+=","
+        pkeys+="${item}"
+      done
+      printf '  %s port %s state=%s lid=%s sm_lid=%s sm_sl=%s rate=%s pkeys=%s\n' \
+        "${ibdev}" "$(basename "${p}")" "${state}" "${lid}" "${sm_lid}" "${sm_sl}" "${rate}" "${pkeys:-none}"
+    done
+  done
+  shopt -u nullglob
+}
+
+ib_full_partition_ids() {
+  local d p pkey_file ibdev value dec
+
+  shopt -s nullglob
+  for d in /sys/class/infiniband/*; do
+    ibdev="$(basename "${d}")"
+    hca_selected "${ibdev}" || continue
+    for p in "${d}"/ports/*; do
+      [[ -e "${p}" ]] || continue
+      [[ "$(read_sysfs "${p}/link_layer")" == "InfiniBand" ]] || continue
+      for pkey_file in "${p}"/pkeys/*; do
+        [[ -r "${pkey_file}" ]] || continue
+        value="$(read_sysfs "${pkey_file}")"
+        [[ -n "${value}" && "${value}" != "0x0000" ]] || continue
+        dec=$((value))
+        (( (dec & 0x8000) != 0 )) || continue
+        printf '0x%04x\n' "$((dec & 0x7fff))"
+      done
+    done
+  done | sort -u
+  shopt -u nullglob
+}
+
+peer_ib_full_partition_ids() {
+  if [[ -n "${PEER_FULL_IB_PARTITIONS}" ]]; then
+    tr ', ' '\n\n' <<<"${PEER_FULL_IB_PARTITIONS}" | awk 'NF' | sort -u
+    return 0
+  fi
+
+  [[ -n "${PEER_SSH}" ]] || die "PEER_SSH or PEER_FULL_IB_PARTITIONS is required to compare peer InfiniBand partitions"
+
+  local -a peer_cmd=()
+  read -r -a peer_cmd <<<"${PEER_SSH}"
+  (( ${#peer_cmd[@]} > 0 )) || die "PEER_SSH did not parse into a command"
+
+  "${peer_cmd[@]}" 'bash -s' <<'REMOTE'
+set -euo pipefail
+shopt -s nullglob
+for d in /sys/class/infiniband/*; do
+  [ -d "$d" ] || continue
+  for p in "$d"/ports/*; do
+    [ -d "$p" ] || continue
+    [ "$(cat "$p/link_layer" 2>/dev/null || true)" = "InfiniBand" ] || continue
+    for f in "$p"/pkeys/*; do
+      [ -r "$f" ] || continue
+      value="$(cat "$f" 2>/dev/null || true)"
+      [ -n "$value" ] && [ "$value" != "0x0000" ] || continue
+      dec=$((value))
+      [ $((dec & 0x8000)) -ne 0 ] || continue
+      printf '0x%04x\n' "$((dec & 0x7fff))"
+    done
+  done
+done | sort -u
+REMOTE
+}
+
+check_ib_peer_partitions() {
+  if rdma_move_netdevs_enabled; then
+    echo "ROCE=${ROCE}; skipping native InfiniBand peer partition check"
+    return 0
+  fi
+
+  if [[ -z "${PEER_SSH}" ]]; then
+    if [[ -n "${PEER_FULL_IB_PARTITIONS}" ]]; then
+      :
+    elif truthy "${REQUIRE_COMMON_FULL_IB_PKEY}"; then
+      die "REQUIRE_COMMON_FULL_IB_PKEY=1 requires PEER_SSH or PEER_FULL_IB_PARTITIONS"
+    else
+      warn "PEER_SSH and PEER_FULL_IB_PARTITIONS are not set; cannot compare peer InfiniBand partitions"
+      return 0
+    fi
+  fi
+
+  local local_tmp peer_tmp common_tmp
+  local_tmp="$(mktemp)"
+  peer_tmp="$(mktemp)"
+  common_tmp="$(mktemp)"
+  trap "rm -f -- '${local_tmp}' '${peer_tmp}' '${common_tmp}'; trap - RETURN" RETURN
+
+  ib_full_partition_ids >"${local_tmp}"
+  peer_ib_full_partition_ids >"${peer_tmp}"
+  comm -12 "${local_tmp}" "${peer_tmp}" >"${common_tmp}"
+
+  echo "local_full_ib_partitions=$(paste -sd, "${local_tmp}" || true)"
+  echo "peer_full_ib_partitions=$(paste -sd, "${peer_tmp}" || true)"
+  echo "common_full_ib_partitions=$(paste -sd, "${common_tmp}" || true)"
+
+  if [[ ! -s "${common_tmp}" ]]; then
+    if truthy "${ALLOW_DIFFERENT_IB_PARTITIONS}"; then
+      warn "no common full InfiniBand partition with peer; native IB/NCCL traffic is expected to fail"
+      return 0
+    fi
+    die "no common full InfiniBand partition with peer; native IB/NCCL traffic is not possible with this node pair"
+  fi
+}
+
 native_ib_hcas_csv() {
   local d p ibdev layer
   local -a hcas=()
@@ -653,6 +824,10 @@ inspect_rdma() {
 
   echo "RDMA HCA link layers:"
   print_hca_link_layers | awk '{print "  " $0}'
+
+  echo
+  echo "InfiniBand fabric summary:"
+  print_ib_fabric_summary
 
   local records_tmp
   records_tmp="$(mktemp)"
@@ -882,6 +1057,12 @@ start_app_container() {
   if [[ -n "${NCCL_IB_GID_INDEX:-}" ]]; then
     env_args+=(-e "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX}")
   fi
+  local name
+  for name in NCCL_IB_PKEY NCCL_IB_SL NCCL_IB_TC NCCL_IB_TIMEOUT NCCL_IB_RETRY_CNT; do
+    if [[ -n "${!name:-}" ]]; then
+      env_args+=(-e "${name}=${!name}")
+    fi
+  done
 
   local -a network_args=()
   if bootstrap_host_mode; then
@@ -1288,6 +1469,8 @@ preflight() {
   if rdma_move_netdevs_enabled; then
     [[ -s "${records_tmp}" ]] || die "ROCE=1 requires RDMA netdev candidates, but none were found"
     guard_not_moving_bootstrap "${records_tmp}"
+  elif [[ -n "${PEER_SSH}" || -n "${PEER_FULL_IB_PARTITIONS}" ]] || truthy "${REQUIRE_COMMON_FULL_IB_PKEY}"; then
+    check_ib_peer_partitions
   fi
 
   if ! sudo docker info --format '{{range $name, $_ := .Runtimes}}{{println $name}}{{end}}' | grep -Fxq "${RUNTIME}"; then
@@ -1367,7 +1550,7 @@ run_test() {
 
   local -a exec_args=(sudo docker exec)
   local name
-  for name in NCCL_DEBUG NCCL_DEBUG_SUBSYS TORCH_DISTRIBUTED_DEBUG NCCL_IB_GID_INDEX BW_ONLY OMP_NUM_THREADS; do
+  for name in NCCL_DEBUG NCCL_DEBUG_SUBSYS TORCH_DISTRIBUTED_DEBUG NCCL_IB_GID_INDEX NCCL_IB_PKEY NCCL_IB_SL NCCL_IB_TC NCCL_IB_TIMEOUT NCCL_IB_RETRY_CNT BW_ONLY OMP_NUM_THREADS; do
     if [[ -n "${!name:-}" ]]; then
       exec_args+=(-e "${name}=${!name}")
     fi
@@ -1576,6 +1759,19 @@ main() {
         BOOTSTRAP_MODE=gre
         shift
         ;;
+      --legacy-no-ipoib-wait|--no-ipoib-wait)
+        RUNSC_RDMA_EXPECTED_IPOIB="-1"
+        shift
+        ;;
+      --rdma-expected-ipoib)
+        (( $# >= 2 )) || die "--rdma-expected-ipoib requires a value"
+        RUNSC_RDMA_EXPECTED_IPOIB="$2"
+        shift 2
+        ;;
+      --rdma-expected-ipoib=*)
+        RUNSC_RDMA_EXPECTED_IPOIB="${1#*=}"
+        shift
+        ;;
       --)
         shift
         break
@@ -1595,6 +1791,12 @@ main() {
       ;;
     runtime-install)
       runtime_install
+      ;;
+    ib-full-pkeys)
+      ib_full_partition_ids
+      ;;
+    check-ib-peer)
+      check_ib_peer_partitions
       ;;
     preflight)
       shift
