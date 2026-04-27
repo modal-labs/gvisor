@@ -796,6 +796,9 @@ runsc_annotation_args() {
   elif falsey "${RUNSC_STRACE}"; then
     out+=(--annotation "dev.gvisor.flag.strace=false")
   fi
+  if bootstrap_host_mode; then
+    out+=(--annotation "dev.gvisor.flag.network=host")
+  fi
   if [[ -n "${RUNSC_STRACE_SYSCALLS}" ]]; then
     out+=(--annotation "dev.gvisor.flag.strace-syscalls=${RUNSC_STRACE_SYSCALLS}")
   fi
