@@ -7,7 +7,10 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 RUN_DIR="$(pwd -P)"
 
 CONTAINER_NAME="${CONTAINER_NAME:-nccl-test}"
-USE_NETNS_HOLDER="${USE_NETNS_HOLDER:-1}"
+ROCE="${ROCE:-0}"
+RDMA_MOVE_NETDEVS="${RDMA_MOVE_NETDEVS:-${ROCE}}"
+USE_NETNS_HOLDER_EXPLICIT="${USE_NETNS_HOLDER+x}"
+USE_NETNS_HOLDER="${USE_NETNS_HOLDER:-${RDMA_MOVE_NETDEVS}}"
 NETNS_HOLDER_NAME="${NETNS_HOLDER_NAME:-${CONTAINER_NAME}-netns}"
 NETNS_HOLDER_RUNTIME="${NETNS_HOLDER_RUNTIME:-runc}"
 NETWORK_NAME="${NETWORK_NAME:-gre-net}"
@@ -43,6 +46,7 @@ ALLOW_BOOTSTRAP_RDMA_IFACE="${ALLOW_BOOTSTRAP_RDMA_IFACE:-0}"
 RESTORE_RDMA_ROUTES="${RESTORE_RDMA_ROUTES:-1}"
 RDMA_ROUTE_PREFIX_LEN="${RDMA_ROUTE_PREFIX_LEN:-24}"
 REQUIRE_SANDBOX_RDMA_GIDS="${REQUIRE_SANDBOX_RDMA_GIDS:-1}"
+REQUIRE_SANDBOX_RDMA_NDEVS="${REQUIRE_SANDBOX_RDMA_NDEVS:-auto}"
 
 RUNSC_RDMA_PROXY="${RUNSC_RDMA_PROXY:-1}"
 RUNSC_NVPROXY="${RUNSC_NVPROXY:-1}"
@@ -57,9 +61,9 @@ RUNSC_NVPROXY_ALLOWED_DRIVER_CAPABILITIES="${RUNSC_NVPROXY_ALLOWED_DRIVER_CAPABI
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") <subcommand> [args]
+Usage: $(basename "$0") [--roce|--no-roce] <subcommand> [args]
 
-Per-node helper for the GRE bootstrap + moved-RDMA-netdev test harness.
+Per-node helper for the GRE bootstrap + RDMA test harness.
 Assumes LOCAL_IP and REMOTE_IP are already exported on each node.
 
 Subcommands:
@@ -68,18 +72,18 @@ Subcommands:
   runtime-install           Install/update ${RUNTIME} with annotation-friendly base args.
   setup-net A|B             Create the GRE bridge/docker network for node A or B.
   cleanup-net               Remove the GRE bridge/docker network on this node.
-  inspect-rdma              Show RDMA netdev candidates from gid_attrs/ndevs.
-  snapshot-rdma             Snapshot RoCE/RDMA netdev IPv4/MTU to ${RDMA_SNAPSHOT_PATH}.
+  inspect-rdma              Show RDMA HCA link layers and RoCE netdev candidates.
+  snapshot-rdma             Snapshot RoCE netdev IPv4/MTU to ${RDMA_SNAPSHOT_PATH}.
   start-container A|B       Start the detached test container for node A or B.
   start-app-container A|B   Start only the runsc app container (holder mode).
   move-rdma                 Move the snapped RDMA netdevs into the container netns.
   restore-rdma-config       Reapply RDMA IP addresses and routes in netns.
   fix-rdma-routes           Reinstall RDMA routes in an already prepared container.
-  validate-container        Validate moved RDMA netdevs in the container netns.
+  validate-container        Validate RDMA sysfs and, with ROCE=1, moved netdevs.
   ping-peer A|B             Ping the opposite container over the GRE bootstrap net.
   wait-master A|B           Wait for TORCH_MASTER_ADDR:MASTER_PORT from the container.
   diagnose A|B              Dump bootstrap network, workspace, and master reachability.
-  prepare A|B               Run preflight, setup-net, snapshot, start, move, validate.
+  prepare A|B               Run preflight, setup-net, start, and validate.
   run-test A|B              Run torchrun inside the detached container as node A or B.
   kill-test                 Stop torchrun/python test processes inside the container.
   counters                  Print per-HCA port counters in GB.
@@ -96,6 +100,8 @@ Environment:
     NCCL_IB_HCA             Passed through to NCCL and used as an RDMA HCA filter.
     RDMA_IB_DEVS            Explicit comma/space-separated HCA filter for snapshot-rdma.
     RDMA_IFACES             Explicit space-separated RoCE netdevs; bypasses sysfs autodetection.
+    ROCE                    Set to 1 to enable RoCE netdev snapshot/move/route setup (default: ${ROCE})
+    RDMA_MOVE_NETDEVS       Low-level override for ROCE netdev movement (default: ${RDMA_MOVE_NETDEVS})
     IMAGE                   Container image (default: ${IMAGE})
     RUNTIME                 Docker runtime (default: ${RUNTIME})
     USE_NETNS_HOLDER        Start app with --network=container:<holder> so runsc
@@ -111,7 +117,7 @@ Environment:
     RUNSC_STRACE_SYSCALLS   Optional comma-separated strace allowlist.
     RUNSC_EXTRA_ANNOTATIONS Space-separated key=value OCI annotations.
     BOOTSTRAP_IFNAME        Container bootstrap NIC for NCCL/Gloo (default: ${BOOTSTRAP_IFNAME})
-    REQUIRE_RDMA_IPV4       Require every moved RDMA netdev to have IPv4 (default: ${REQUIRE_RDMA_IPV4})
+    REQUIRE_RDMA_IPV4       Require every moved RoCE netdev to have IPv4 (default: ${REQUIRE_RDMA_IPV4})
     RESTORE_RDMA_ROUTES     Restore/infer connected RDMA routes after moving links (default: ${RESTORE_RDMA_ROUTES})
     RDMA_ROUTE_PREFIX_LEN   Prefix to infer for /32 RDMA IPs if no route snapshot exists (default: ${RDMA_ROUTE_PREFIX_LEN})
     ALLOW_BOOTSTRAP_RDMA_IFACE
@@ -126,6 +132,9 @@ Examples:
   # Node B
   $(basename "$0") prepare B
   $(basename "$0") run-test B
+
+  # RoCE nodes only: opt into netdev movement.
+  $(basename "$0") --roce prepare A
 
 Run run-test on node B first so it waits for node A's master.
 EOF
@@ -186,6 +195,20 @@ falsey() {
       return 1
       ;;
   esac
+}
+
+rdma_move_netdevs_enabled() {
+  truthy "${RDMA_MOVE_NETDEVS}"
+}
+
+apply_roce_mode_defaults() {
+  if [[ -z "${USE_NETNS_HOLDER_EXPLICIT}" ]]; then
+    if rdma_move_netdevs_enabled; then
+      USE_NETNS_HOLDER=1
+    else
+      USE_NETNS_HOLDER=0
+    fi
+  fi
 }
 
 runtime_show() {
@@ -384,6 +407,61 @@ hca_selected() {
   return "${matched}"
 }
 
+print_hca_link_layers() {
+  local d p
+  shopt -s nullglob
+  for d in /sys/class/infiniband/*; do
+    hca_selected "$(basename "${d}")" || continue
+    for p in "${d}"/ports/*; do
+      [[ -e "${p}" ]] || continue
+      printf '%s port %s link_layer=%s\n' \
+        "$(basename "${d}")" "$(basename "${p}")" "$(read_sysfs "${p}/link_layer")"
+    done
+  done
+  shopt -u nullglob
+}
+
+native_ib_hcas_csv() {
+  local d p ibdev layer
+  local -a hcas=()
+  shopt -s nullglob
+  for d in /sys/class/infiniband/*; do
+    ibdev="$(basename "${d}")"
+    hca_selected "${ibdev}" || continue
+    for p in "${d}"/ports/*; do
+      [[ -e "${p}" ]] || continue
+      layer="$(read_sysfs "${p}/link_layer")"
+      if [[ "${layer}" == "InfiniBand" ]]; then
+        hcas+=("${ibdev}")
+        break
+      fi
+    done
+  done
+  shopt -u nullglob
+  (( ${#hcas[@]} == 0 )) && return 0
+  local IFS=,
+  printf '%s' "${hcas[*]}"
+}
+
+derive_nccl_ib_hca() {
+  if rdma_move_netdevs_enabled && [[ -f "${RDMA_SNAPSHOT_PATH}" ]]; then
+    sudo awk -F'|' '
+      $1 !~ /^#/ && $5 != "" && $5 != "?" {
+        split($5, devs, ",")
+        for (i in devs) {
+          if (devs[i] != "" && !seen[devs[i]]++) {
+            out = out ? out "," devs[i] : devs[i]
+          }
+        }
+      }
+      END { print out }
+    ' "${RDMA_SNAPSHOT_PATH}"
+    return 0
+  fi
+
+  native_ib_hcas_csv
+}
+
 rdma_records_from_sysfs() {
   local f ibdev rest port idx ndev gid gid_type
   shopt -s nullglob
@@ -409,7 +487,7 @@ rdma_records_from_sysfs() {
 }
 
 rdma_records_from_ibdev2netdev() {
-  require_cmd ibdev2netdev
+  command -v ibdev2netdev >/dev/null 2>&1 || return 0
 
   local ibdev word port arrow netdev state rest
   while read -r ibdev word port arrow netdev state rest; do
@@ -510,13 +588,24 @@ ip_addrs_csv() {
 inspect_rdma() {
   require_cmd ip awk mktemp
 
+  echo "RDMA HCA link layers:"
+  print_hca_link_layers | awk '{print "  " $0}'
+
   local records_tmp
   records_tmp="$(mktemp)"
   trap "rm -f -- '${records_tmp}'; trap - RETURN" RETURN
 
   rdma_netdev_records >"${records_tmp}"
-  [[ -s "${records_tmp}" ]] || die "no RDMA netdev candidates found from gid_attrs/ndevs or ibdev2netdev"
+  if [[ ! -s "${records_tmp}" ]]; then
+    if rdma_move_netdevs_enabled; then
+      die "ROCE=1 requires RDMA netdev candidates, but none were found from gid_attrs/ndevs or ibdev2netdev"
+    fi
+    echo
+    echo "RDMA netdev candidates: none (ok for native InfiniBand; use ROCE=1 only for Ethernet/RoCE HCAs)"
+    return 0
+  fi
 
+  echo
   echo "RDMA netdev candidates:"
   printf '%-20s %-12s %-6s %-6s %-40s %s\n' "netdev" "ibdev" "port" "gid" "gid_value" "gid_type"
   awk -F'|' '{
@@ -705,8 +794,12 @@ start_app_container() {
     -e "BW_ONLY=${BW_ONLY:-1}"
     -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}"
   )
-  if [[ -n "${NCCL_IB_HCA:-}" ]]; then
-    env_args+=(-e "NCCL_IB_HCA=${NCCL_IB_HCA}")
+  local effective_nccl_ib_hca="${NCCL_IB_HCA:-}"
+  if [[ -z "${effective_nccl_ib_hca}" ]]; then
+    effective_nccl_ib_hca="$(derive_nccl_ib_hca)"
+  fi
+  if [[ -n "${effective_nccl_ib_hca}" ]]; then
+    env_args+=(-e "NCCL_IB_HCA=${effective_nccl_ib_hca}")
   fi
   if [[ -n "${NCCL_IB_GID_INDEX:-}" ]]; then
     env_args+=(-e "NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX}")
@@ -740,6 +833,9 @@ start_app_container() {
     echo "network=${NETWORK_NAME}"
   fi
   echo "workspace_mount=${WORKSPACE_MOUNT}:/workspace"
+  if [[ -n "${effective_nccl_ib_hca}" ]]; then
+    echo "NCCL_IB_HCA=${effective_nccl_ib_hca}"
+  fi
   if (( ${#annotation_args[@]} > 0 )); then
     echo "runsc_annotations=${annotation_args[*]}"
   fi
@@ -747,9 +843,12 @@ start_app_container() {
 
 start_container() {
   set_role "${1:-}"
-  if truthy "${USE_NETNS_HOLDER}"; then
+  if truthy "${USE_NETNS_HOLDER}" && rdma_move_netdevs_enabled; then
     start_netns_holder "${ROLE}"
     echo "holder ready; move RDMA netdevs, then run start-app-container ${ROLE} (prepare does this automatically)"
+  elif truthy "${USE_NETNS_HOLDER}"; then
+    start_netns_holder "${ROLE}"
+    start_app_container "${ROLE}"
   else
     start_app_container "${ROLE}"
   fi
@@ -963,8 +1062,78 @@ move_rdma() {
   validate_container
 }
 
+validate_sandbox_rdma_sysfs() {
+  require_cmd sudo docker
+
+  if ! container_running "${CONTAINER_NAME}"; then
+    echo
+    echo "sandbox RDMA sysfs view: skipped; ${CONTAINER_NAME} is not running yet"
+    return 0
+  fi
+
+  echo
+  echo "sandbox RDMA sysfs view:"
+  if ! sudo docker exec \
+    -e "REQUIRE_SANDBOX_RDMA_GIDS=${REQUIRE_SANDBOX_RDMA_GIDS}" \
+    -e "REQUIRE_SANDBOX_RDMA_NDEVS=${REQUIRE_SANDBOX_RDMA_NDEVS}" \
+    -e "RDMA_MOVE_NETDEVS=${RDMA_MOVE_NETDEVS}" \
+    "${CONTAINER_NAME}" \
+    bash -lc '
+    set -e
+    zero_gid="0000:0000:0000:0000:0000:0000:0000:0000"
+    nonzero=0
+    with_ndev=0
+    printed=0
+    if [ -d /sys/class/infiniband ]; then
+      for d in /sys/class/infiniband/*; do
+        [ -e "$d" ] || continue
+        printf "  hca=%s\n" "$(basename "$d")"
+      done
+    fi
+    for f in /sys/class/infiniband/*/ports/*/gids/*; do
+      [ -e "$f" ] || continue
+      gid="$(cat "$f" 2>/dev/null || true)"
+      [ -n "$gid" ] || continue
+      [ "$gid" != "$zero_gid" ] || continue
+      nonzero=$((nonzero + 1))
+      idx="${f##*/}"
+      port_dir="${f%/gids/*}"
+      type="$(cat "$port_dir/gid_attrs/types/$idx" 2>/dev/null || true)"
+      ndev="$(cat "$port_dir/gid_attrs/ndevs/$idx" 2>/dev/null || true)"
+      [ -z "$ndev" ] || with_ndev=$((with_ndev + 1))
+      if [ "$printed" -lt 32 ]; then
+        printf "  %s gid=%s type=%s ndev=%s\n" "$f" "$gid" "$type" "$ndev"
+        printed=$((printed + 1))
+      fi
+    done
+    printf "  nonzero_gids=%s with_ndev=%s\n" "$nonzero" "$with_ndev"
+    [ "${REQUIRE_SANDBOX_RDMA_GIDS:-1}" != "1" ] || [ "$nonzero" -gt 0 ]
+    require_ndev="${REQUIRE_SANDBOX_RDMA_NDEVS:-auto}"
+    if [ "$require_ndev" = "auto" ]; then
+      case "${RDMA_MOVE_NETDEVS:-0}" in
+        1|true|TRUE|yes|YES|on|ON) require_ndev=1 ;;
+        *) require_ndev=0 ;;
+      esac
+    fi
+    [ "$require_ndev" != "1" ] || [ "$with_ndev" -gt 0 ]
+  '; then
+    if [[ "${REQUIRE_SANDBOX_RDMA_GIDS}" == "1" ]]; then
+      return 1
+    fi
+    warn "could not validate sandbox RDMA sysfs via docker exec"
+  fi
+}
+
 validate_container() {
-  require_cmd sudo docker nsenter ip awk grep readlink
+  require_cmd sudo docker
+
+  if ! rdma_move_netdevs_enabled; then
+    echo "ROCE=${ROCE} RDMA_MOVE_NETDEVS=${RDMA_MOVE_NETDEVS}; skipping moved-netdev validation"
+    validate_sandbox_rdma_sysfs || die "sandbox RDMA sysfs validation failed"
+    return 0
+  fi
+
+  require_cmd nsenter ip awk grep readlink
   [[ -f "${RDMA_SNAPSHOT_PATH}" ]] || die "snapshot file not found: ${RDMA_SNAPSHOT_PATH}"
 
   local pid
@@ -1017,56 +1186,7 @@ validate_container() {
     fi
   done < <(sudo cat "${RDMA_SNAPSHOT_PATH}")
 
-  if ! container_running "${CONTAINER_NAME}"; then
-    echo
-    echo "sandbox RDMA sysfs view: skipped; ${CONTAINER_NAME} is not running yet"
-    (( failed == 0 )) || die "container RDMA netns validation failed"
-    return 0
-  fi
-
-  echo
-  echo "sandbox RDMA sysfs view:"
-  if ! sudo docker exec \
-    -e "REQUIRE_SANDBOX_RDMA_GIDS=${REQUIRE_SANDBOX_RDMA_GIDS}" \
-    "${CONTAINER_NAME}" \
-    bash -lc '
-    set -e
-    zero_gid="0000:0000:0000:0000:0000:0000:0000:0000"
-    nonzero=0
-    with_ndev=0
-    printed=0
-    if [ -d /sys/class/infiniband ]; then
-      for d in /sys/class/infiniband/*; do
-        [ -e "$d" ] || continue
-        printf "  hca=%s\n" "$(basename "$d")"
-      done
-    fi
-    for f in /sys/class/infiniband/*/ports/*/gids/*; do
-      [ -e "$f" ] || continue
-      gid="$(cat "$f" 2>/dev/null || true)"
-      [ -n "$gid" ] || continue
-      [ "$gid" != "$zero_gid" ] || continue
-      nonzero=$((nonzero + 1))
-      idx="${f##*/}"
-      port_dir="${f%/gids/*}"
-      type="$(cat "$port_dir/gid_attrs/types/$idx" 2>/dev/null || true)"
-      ndev="$(cat "$port_dir/gid_attrs/ndevs/$idx" 2>/dev/null || true)"
-      [ -z "$ndev" ] || with_ndev=$((with_ndev + 1))
-      if [ "$printed" -lt 32 ]; then
-        printf "  %s gid=%s type=%s ndev=%s\n" "$f" "$gid" "$type" "$ndev"
-        printed=$((printed + 1))
-      fi
-    done
-    printf "  nonzero_gids=%s with_ndev=%s\n" "$nonzero" "$with_ndev"
-    [ "${REQUIRE_SANDBOX_RDMA_GIDS:-1}" != "1" ] || [ "$nonzero" -gt 0 ]
-    [ "${REQUIRE_SANDBOX_RDMA_GIDS:-1}" != "1" ] || [ "$with_ndev" -gt 0 ]
-  '; then
-    if [[ "${REQUIRE_SANDBOX_RDMA_GIDS}" == "1" ]]; then
-      failed=1
-    else
-      warn "could not validate sandbox RDMA sysfs via docker exec"
-    fi
-  fi
+  validate_sandbox_rdma_sysfs || failed=1
 
   (( failed == 0 )) || die "container RDMA netns validation failed"
 }
@@ -1082,7 +1202,10 @@ preflight() {
   records_tmp="$(mktemp)"
   trap "rm -f -- '${records_tmp}'; trap - RETURN" RETURN
   rdma_netdev_records >"${records_tmp}"
-  guard_not_moving_bootstrap "${records_tmp}"
+  if rdma_move_netdevs_enabled; then
+    [[ -s "${records_tmp}" ]] || die "ROCE=1 requires RDMA netdev candidates, but none were found"
+    guard_not_moving_bootstrap "${records_tmp}"
+  fi
 
   if ! sudo docker info --format '{{range $name, $_ := .Runtimes}}{{println $name}}{{end}}' | grep -Fxq "${RUNTIME}"; then
     die "Docker runtime ${RUNTIME} is not registered"
@@ -1101,7 +1224,7 @@ preflight() {
   fi
 
   echo
-  echo "preflight ok for role=${ROLE} runtime=${RUNTIME} container_ip=${CONTAINER_IP}"
+  echo "preflight ok for role=${ROLE} runtime=${RUNTIME} container_ip=${CONTAINER_IP} roce=${ROCE} move_netdevs=${RDMA_MOVE_NETDEVS}"
 }
 
 prepare() {
@@ -1110,16 +1233,25 @@ prepare() {
   cleanup_container
   preflight "${role}"
   setup_net "${role}"
-  snapshot_rdma
-  if truthy "${USE_NETNS_HOLDER}"; then
-    start_netns_holder "${role}"
-    move_rdma
-    start_app_container "${role}"
-    restore_rdma_config
-    validate_container
+  if rdma_move_netdevs_enabled; then
+    snapshot_rdma
+    if truthy "${USE_NETNS_HOLDER}"; then
+      start_netns_holder "${role}"
+      move_rdma
+      start_app_container "${role}"
+      restore_rdma_config
+      validate_container
+    else
+      start_app_container "${role}"
+      move_rdma
+    fi
   else
+    echo "ROCE=${ROCE} RDMA_MOVE_NETDEVS=${RDMA_MOVE_NETDEVS}; skipping RDMA netdev snapshot/move"
+    if truthy "${USE_NETNS_HOLDER}"; then
+      start_netns_holder "${role}"
+    fi
     start_app_container "${role}"
-    move_rdma
+    validate_sandbox_rdma_sysfs
   fi
 }
 
@@ -1143,20 +1275,10 @@ run_test() {
   fi
 
   local effective_nccl_ib_hca="${NCCL_IB_HCA:-}"
-  if [[ -z "${effective_nccl_ib_hca}" && -f "${RDMA_SNAPSHOT_PATH}" ]]; then
-    effective_nccl_ib_hca="$(sudo awk -F'|' '
-      $1 !~ /^#/ && $5 != "" && $5 != "?" {
-        split($5, devs, ",")
-        for (i in devs) {
-          if (devs[i] != "" && !seen[devs[i]]++) {
-            out = out ? out "," devs[i] : devs[i]
-          }
-        }
-      }
-      END { print out }
-    ' "${RDMA_SNAPSHOT_PATH}")"
+  if [[ -z "${effective_nccl_ib_hca}" ]]; then
+    effective_nccl_ib_hca="$(derive_nccl_ib_hca)"
     if [[ -n "${effective_nccl_ib_hca}" ]]; then
-      echo "NCCL_IB_HCA=${effective_nccl_ib_hca} (derived from ${RDMA_SNAPSHOT_PATH})"
+      echo "NCCL_IB_HCA=${effective_nccl_ib_hca} (derived from RDMA link-layer state)"
     fi
   fi
 
@@ -1349,6 +1471,29 @@ open_shell() {
 }
 
 main() {
+  while (( $# > 0 )); do
+    case "${1:-}" in
+      --roce)
+        ROCE=1
+        RDMA_MOVE_NETDEVS=1
+        shift
+        ;;
+      --no-roce)
+        ROCE=0
+        RDMA_MOVE_NETDEVS=0
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  apply_roce_mode_defaults
+
   local subcommand="${1:-}"
   case "${subcommand}" in
     runtime-show)
