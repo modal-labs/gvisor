@@ -11,6 +11,7 @@ ROCE="${ROCE:-0}"
 RDMA_MOVE_NETDEVS="${RDMA_MOVE_NETDEVS:-${ROCE}}"
 USE_NETNS_HOLDER_EXPLICIT="${USE_NETNS_HOLDER+x}"
 USE_NETNS_HOLDER="${USE_NETNS_HOLDER:-${RDMA_MOVE_NETDEVS}}"
+BOOTSTRAP_MODE="${BOOTSTRAP_MODE:-gre}"
 NETNS_HOLDER_NAME="${NETNS_HOLDER_NAME:-${CONTAINER_NAME}-netns}"
 NETNS_HOLDER_RUNTIME="${NETNS_HOLDER_RUNTIME:-runc}"
 NETWORK_NAME="${NETWORK_NAME:-gre-net}"
@@ -20,6 +21,7 @@ IMAGE="${IMAGE:-atoniolo76/torch-ib-slim:latest}"
 RUNTIME="${RUNTIME:-runsc-rdma}"
 RUNSC_PATH="${RUNSC_PATH:-/usr/local/bin/runsc-rdma}"
 DOCKER_DAEMON_JSON="${DOCKER_DAEMON_JSON:-/etc/docker/daemon.json}"
+BOOTSTRAP_IFNAME_EXPLICIT="${BOOTSTRAP_IFNAME+x}"
 BOOTSTRAP_IFNAME="${BOOTSTRAP_IFNAME:-eth0}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 RDMA_SNAPSHOT_PATH="${RDMA_SNAPSHOT_PATH:-/etc/rdma-snapshot.txt}"
@@ -40,6 +42,7 @@ NODE_B_GW="${NODE_B_GW:-10.89.0.2}"
 NODE_B_IP_RANGE="${NODE_B_IP_RANGE:-10.89.0.128/26}"
 NODE_B_CONTAINER_IP="${NODE_B_CONTAINER_IP:-10.89.0.128}"
 
+TORCH_MASTER_ADDR_EXPLICIT="${TORCH_MASTER_ADDR+x}"
 TORCH_MASTER_ADDR="${TORCH_MASTER_ADDR:-$NODE_A_CONTAINER_IP}"
 REQUIRE_RDMA_IPV4="${REQUIRE_RDMA_IPV4:-1}"
 ALLOW_BOOTSTRAP_RDMA_IFACE="${ALLOW_BOOTSTRAP_RDMA_IFACE:-0}"
@@ -61,10 +64,10 @@ RUNSC_NVPROXY_ALLOWED_DRIVER_CAPABILITIES="${RUNSC_NVPROXY_ALLOWED_DRIVER_CAPABI
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [--roce|--no-roce] <subcommand> [args]
+Usage: $(basename "$0") [--roce|--no-roce] [--host-network|--gre] <subcommand> [args]
 
-Per-node helper for the GRE bootstrap + RDMA test harness.
-Assumes LOCAL_IP and REMOTE_IP are already exported on each node.
+Per-node helper for the TCP bootstrap + RDMA test harness.
+Assumes LOCAL_IP and REMOTE_IP are exported on each node for GRE or host-network mode.
 
 Subcommands:
   preflight A|B             Validate Docker/runtime/RDMA candidates before setup.
@@ -102,6 +105,7 @@ Environment:
     RDMA_IFACES             Explicit space-separated RoCE netdevs; bypasses sysfs autodetection.
     ROCE                    Set to 1 to enable RoCE netdev snapshot/move/route setup (default: ${ROCE})
     RDMA_MOVE_NETDEVS       Low-level override for ROCE netdev movement (default: ${RDMA_MOVE_NETDEVS})
+    BOOTSTRAP_MODE          gre or host. host skips br-gre/gretap and uses --network=host (default: ${BOOTSTRAP_MODE})
     IMAGE                   Container image (default: ${IMAGE})
     RUNTIME                 Docker runtime (default: ${RUNTIME})
     USE_NETNS_HOLDER        Start app with --network=container:<holder> so runsc
@@ -135,6 +139,9 @@ Examples:
 
   # RoCE nodes only: opt into netdev movement.
   $(basename "$0") --roce prepare A
+
+  # Native InfiniBand only: use host networking for torch/NCCL bootstrap.
+  $(basename "$0") --host-network prepare A
 
 Run run-test on node B first so it waits for node A's master.
 EOF
@@ -199,6 +206,25 @@ falsey() {
 
 rdma_move_netdevs_enabled() {
   truthy "${RDMA_MOVE_NETDEVS}"
+}
+
+bootstrap_host_mode() {
+  [[ "${BOOTSTRAP_MODE}" == "host" || "${BOOTSTRAP_MODE}" == "host-network" ]]
+}
+
+bootstrap_gre_mode() {
+  [[ "${BOOTSTRAP_MODE}" == "gre" ]]
+}
+
+validate_bootstrap_mode() {
+  if bootstrap_host_mode; then
+    BOOTSTRAP_MODE="host"
+    return 0
+  fi
+  if bootstrap_gre_mode; then
+    return 0
+  fi
+  die "BOOTSTRAP_MODE must be 'gre' or 'host', got ${BOOTSTRAP_MODE}"
 }
 
 apply_roce_mode_defaults() {
@@ -292,6 +318,19 @@ set_role() {
       die "role must be A or B"
       ;;
   esac
+
+  if bootstrap_host_mode; then
+    CONTAINER_IP="${LOCAL_IP:-host}"
+    PEER_CONTAINER_IP="${REMOTE_IP:-host}"
+    if [[ -z "${TORCH_MASTER_ADDR_EXPLICIT}" ]]; then
+      if [[ "${ROLE}" == "A" ]]; then
+        MASTER_ADDR="${LOCAL_IP:-}"
+      else
+        MASTER_ADDR="${REMOTE_IP:-}"
+      fi
+    fi
+    [[ -n "${MASTER_ADDR}" ]] || die "host bootstrap mode requires TORCH_MASTER_ADDR or LOCAL_IP/REMOTE_IP"
+  fi
 }
 
 read_sysfs() {
@@ -344,6 +383,18 @@ setup_net() {
   require_cmd sudo docker ip
   require_env LOCAL_IP REMOTE_IP
   set_role "${1:-}"
+
+  if bootstrap_host_mode; then
+    cat <<EOF
+bootstrap_mode=${BOOTSTRAP_MODE}
+role=${ROLE}
+host_local_ip=${LOCAL_IP}
+host_remote_ip=${REMOTE_IP}
+master_addr=${MASTER_ADDR}
+network=host
+EOF
+    return 0
+  fi
 
   cleanup_net
 
@@ -542,6 +593,18 @@ bootstrap_host_ifaces() {
         }
       }' || true
   fi
+}
+
+effective_bootstrap_ifname() {
+  if bootstrap_host_mode && [[ -z "${BOOTSTRAP_IFNAME_EXPLICIT}" ]]; then
+    local iface
+    iface="$(bootstrap_host_ifaces | awk 'NF {print; exit}')"
+    if [[ -n "${iface}" ]]; then
+      printf '%s\n' "${iface}"
+      return 0
+    fi
+  fi
+  printf '%s\n' "${BOOTSTRAP_IFNAME}"
 }
 
 guard_not_moving_bootstrap() {
@@ -748,7 +811,9 @@ start_netns_holder() {
   require_cmd sudo docker
   set_role "${1:-}"
 
-  sudo docker network inspect "${NETWORK_NAME}" >/dev/null
+  if bootstrap_gre_mode; then
+    sudo docker network inspect "${NETWORK_NAME}" >/dev/null
+  fi
   sudo docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
   sudo docker rm -f "${NETNS_HOLDER_NAME}" >/dev/null 2>&1 || true
 
@@ -757,14 +822,20 @@ start_netns_holder() {
     runtime_args+=(--runtime="${NETNS_HOLDER_RUNTIME}")
   fi
 
+  local -a network_args=()
+  if bootstrap_host_mode; then
+    network_args+=(--network host)
+  else
+    network_args+=(--network "${NETWORK_NAME}" --ip "${CONTAINER_IP}")
+  fi
+
   sudo docker run -d --name "${NETNS_HOLDER_NAME}" \
     "${runtime_args[@]}" \
-    --network "${NETWORK_NAME}" \
-    --ip "${CONTAINER_IP}" \
+    "${network_args[@]}" \
     "${IMAGE}" \
     sleep infinity >/dev/null
 
-  echo "netns_holder=${NETNS_HOLDER_NAME} runtime=${NETNS_HOLDER_RUNTIME:-default} role=${ROLE} ip=${CONTAINER_IP}"
+  echo "netns_holder=${NETNS_HOLDER_NAME} runtime=${NETNS_HOLDER_RUNTIME:-default} role=${ROLE} ip=${CONTAINER_IP} bootstrap_mode=${BOOTSTRAP_MODE}"
 }
 
 start_app_container() {
@@ -778,19 +849,23 @@ start_app_container() {
     warn "nccl_topo.xml not found under ${WORKSPACE_MOUNT}; generate it before performance runs"
   fi
 
-  sudo docker network inspect "${NETWORK_NAME}" >/dev/null
+  if bootstrap_gre_mode; then
+    sudo docker network inspect "${NETWORK_NAME}" >/dev/null
+  fi
   sudo docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 
   local -a dev_args=()
   auto_device_args dev_args
   local -a annotation_args=()
   runsc_annotation_args annotation_args
+  local bootstrap_ifname
+  bootstrap_ifname="$(effective_bootstrap_ifname)"
   local -a env_args=(
     -e "NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-3}"
     -e "NCCL_DMABUF_ENABLE=${NCCL_DMABUF_ENABLE:-1}"
     -e "NCCL_TOPO_FILE=${NCCL_TOPO_FILE:-/workspace/nccl_topo.xml}"
-    -e "NCCL_SOCKET_IFNAME=${BOOTSTRAP_IFNAME}"
-    -e "GLOO_SOCKET_IFNAME=${BOOTSTRAP_IFNAME}"
+    -e "NCCL_SOCKET_IFNAME=${bootstrap_ifname}"
+    -e "GLOO_SOCKET_IFNAME=${bootstrap_ifname}"
     -e "BW_ONLY=${BW_ONLY:-1}"
     -e "OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}"
   )
@@ -806,7 +881,9 @@ start_app_container() {
   fi
 
   local -a network_args=()
-  if truthy "${USE_NETNS_HOLDER}"; then
+  if bootstrap_host_mode; then
+    network_args+=(--network host)
+  elif truthy "${USE_NETNS_HOLDER}"; then
     if ! container_running "${NETNS_HOLDER_NAME}"; then
       die "netns holder ${NETNS_HOLDER_NAME} is not running; run start-container/move-rdma first or prepare ${ROLE}"
     fi
@@ -827,11 +904,14 @@ start_app_container() {
     sleep infinity >/dev/null
 
   echo "container=${CONTAINER_NAME} runtime=${RUNTIME} role=${ROLE} ip=${CONTAINER_IP}"
-  if truthy "${USE_NETNS_HOLDER}"; then
+  if bootstrap_host_mode; then
+    echo "network=host"
+  elif truthy "${USE_NETNS_HOLDER}"; then
     echo "network=container:${NETNS_HOLDER_NAME}"
   else
     echo "network=${NETWORK_NAME}"
   fi
+  echo "bootstrap_ifname=${bootstrap_ifname}"
   echo "workspace_mount=${WORKSPACE_MOUNT}:/workspace"
   if [[ -n "${effective_nccl_ib_hca}" ]]; then
     echo "NCCL_IB_HCA=${effective_nccl_ib_hca}"
@@ -1235,7 +1315,7 @@ prepare() {
   setup_net "${role}"
   if rdma_move_netdevs_enabled; then
     snapshot_rdma
-    if truthy "${USE_NETNS_HOLDER}"; then
+    if truthy "${USE_NETNS_HOLDER}" && ! bootstrap_host_mode; then
       start_netns_holder "${role}"
       move_rdma
       start_app_container "${role}"
@@ -1371,6 +1451,7 @@ diagnose() {
 
   cat <<EOF
 role=${ROLE}
+bootstrap_mode=${BOOTSTRAP_MODE}
 container=${CONTAINER_NAME}
 container_pid=${app_pid:-not-running}
 netns_pid=${pid}
@@ -1378,6 +1459,7 @@ netns_holder=$(truthy "${USE_NETNS_HOLDER}" && echo "${NETNS_HOLDER_NAME}" || ec
 container_ip=${CONTAINER_IP}
 peer_container_ip=${PEER_CONTAINER_IP}
 master=${MASTER_ADDR}:${MASTER_PORT}
+bootstrap_ifname=$(effective_bootstrap_ifname)
 workspace_source=${workspace_source:-unknown}
 EOF
 
@@ -1483,6 +1565,14 @@ main() {
         RDMA_MOVE_NETDEVS=0
         shift
         ;;
+      --host-network|--host-bootstrap)
+        BOOTSTRAP_MODE=host
+        shift
+        ;;
+      --gre)
+        BOOTSTRAP_MODE=gre
+        shift
+        ;;
       --)
         shift
         break
@@ -1492,6 +1582,7 @@ main() {
         ;;
     esac
   done
+  validate_bootstrap_mode
   apply_roce_mode_defaults
 
   local subcommand="${1:-}"
